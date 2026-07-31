@@ -18,12 +18,43 @@ dist/
 
 # Runtime outputs
 logs/
+log/
 wandb/
 wandb_*/
+wandb-*/
 tmp/
+temp/
 output/
+outputs/
+result/
+results/
+runs/
+artifacts/
+checkpoints/
+checkpoint/
+tensorboard/
+tb/
+mlruns/
+.slurm/
 *.out
 *.err
+*.log
+
+# Experiment payloads, traces, and model checkpoints
+examples/profile/
+profiles/
+profile_outputs/
+traces/
+trace/
+profiling/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.npz
+*.npy
+events.out.tfevents*
 
 # Local environments and offline packages
 rl_framework_env
