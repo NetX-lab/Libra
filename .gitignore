@@ -44,3 +44,4 @@ data/r2e_gym_v1/index.jsonl
 data/r2e_gym_v1/manifest.json
 search_r1_raw
 *.parquet
+*.analysis.md
