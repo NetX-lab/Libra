@@ -1,0 +1,14 @@
+# ============================================================
+
+#
+
+#   hardware_config: hardware/h100_80g.yaml
+# ============================================================
+
+flops_peak: 9.9e+14
+mem_bw: 3.35e+12
+mem_capacity: 8.0e+10       # 80 GB HBM
+bw_intra_node: 9.0e+11     # NVLink 4.0 ~900 GB/s
+bw_inter_node: 4.0e+11     # InfiniBand NDR 400 Gb/s
+gpus_per_node: 8
+tp_comm_overhead: 3.0e-6

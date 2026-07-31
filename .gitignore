@@ -1,0 +1,46 @@
+IMPLEMENTATION_SUMMARY.md
+
+# Python and test caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# macOS metadata
+.DS_Store
+._*
+
+# Runtime outputs
+logs/
+wandb/
+wandb_*/
+tmp/
+output/
+*.out
+*.err
+
+# Local environments and offline packages
+rl_framework_env
+my_offline_packages
+
+# Cluster-generated configuration overlays
+configs/.*.yaml
+
+# Large local artifacts
+model/
+data/**/*.parquet
+data/**/*.jsonl
+data/**/*.arrow
+data/**/*.log
+data/**/.cache/
+data/DAPO-Math-17K/
+data/r2e_gym_v1/index.jsonl
+data/r2e_gym_v1/manifest.json
+search_r1_raw
+*.parquet

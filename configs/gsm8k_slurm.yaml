@@ -1,0 +1,66 @@
+# ============================================================
+
+#
+
+
+
+
+#
+
+
+#   2. sbatch submit_slurm.slurm
+
+#   CONFIG_FILE=configs/gsm8k_slurm.yaml bash run_slurm_distributed.sh
+# ============================================================
+
+
+base_config: base.yaml
+
+
+hardware_config: hardware_config/a100_80g.yaml
+model_arch_config: model_arch_config/qwen2.5-3b.yaml
+
+
+model_path: "/path/to/your/model"
+
+
+num_nodes: 4
+train_gpus: 8
+rollout_gpus: 8
+train_gpus_per_node: 2
+rollout_gpus_per_node: 2
+vllm_tp_size: 1
+
+
+
+
+# vllm_endpoints: "node0:8000,node0:8001,node1:8002,node1:8003,node2:8004,node2:8005,node3:8006,node3:8007"
+vllm_host: "0.0.0.0"
+vllm_port: 8000
+vllm_num_instances: 0
+
+
+master_port: 29500
+
+
+max_concurrent_rollouts: 128
+max_head_offpolicyness: 4
+queue_size: 512
+batch_size: 64
+
+
+dataset_name: "openai/gsm8k"
+
+
+weight_sync_mode: "disk"
+
+sync_path: "/shared/storage/async_rl_weights"
+
+
+log_dir: "./logs"
+wandb_project: "rl_framework_slurm"
+wandb_run_name: "gsm8k_4node"
+
+
+hardware:
+  gpus_per_node: 4

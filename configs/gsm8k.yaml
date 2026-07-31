@@ -1,0 +1,18 @@
+# GSM8K asynchronous RL configuration.
+# Usage: python examples/gsm8k_async_rl.py --config configs/gsm8k.yaml
+
+base_config: base.yaml
+
+hardware_config: hardware_config/a100_80g.yaml
+model_arch_config: model_arch_config/qwen2.5-3b.yaml
+
+# Replace this cluster-specific path before running.
+model_path: "/path/to/Qwen3-4B"
+
+train_gpus: 2
+rollout_gpus: 2
+
+dataset_name: "openai/gsm8k"
+
+wandb_project: "RL_Framework_gsm8k"
+wandb_run_name: "gsm8k_async_rl"

@@ -1,0 +1,63 @@
+{
+  "timestamp": "2026-02-06T12:41:49.097334",
+  "total_sequences": 15,
+  "completed_sequences": 15,
+  "by_category_input_based": {
+    "short": 15
+  },
+  "by_subject": {
+    "Other": 15
+  },
+  "input_token_stats": {
+    "min": 53.0,
+    "max": 263.0,
+    "mean": 130.8,
+    "std": 52.11423350039155,
+    "p50": 123.0,
+    "p90": 198.2,
+    "p99": 257.12
+  },
+  "estimated_output_stats": {
+    "min": 128.0,
+    "max": 128.0,
+    "mean": 128.0,
+    "std": 0.0,
+    "p50": 128.0,
+    "p90": 128.0,
+    "p99": 128.0
+  },
+  "thresholds_input": {
+    "short": 5000,
+    "medium": 10000,
+    "long": 15000
+  },
+  "thresholds_total": {
+    "short": 6000,
+    "medium": 12000,
+    "long": 18000
+  },
+  "by_category_total_based": {
+    "extra_long": 6,
+    "long": 2,
+    "medium": 4,
+    "short": 3
+  },
+  "actual_output_stats": {
+    "min": 2800.0,
+    "max": 20000.0,
+    "mean": 13113.933333333332,
+    "std": 6332.628369186228,
+    "p50": 12799.0,
+    "p90": 20000.0,
+    "p99": 20000.0
+  },
+  "actual_total_stats": {
+    "min": 3063.0,
+    "max": 20221.0,
+    "mean": 13244.733333333334,
+    "std": 6317.361743287744,
+    "p50": 12963.0,
+    "p90": 20136.4,
+    "p99": 20209.94
+  }
+}

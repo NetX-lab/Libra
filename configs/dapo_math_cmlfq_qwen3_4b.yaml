@@ -1,0 +1,86 @@
+# DAPO-Math-17K full Async RL post-training with C-MLFQ rollout scheduling.
+base_config: base.yaml
+
+hardware_config: hardware_config/a800_80g.yaml
+model_arch_config: model_arch_config/qwen2.5-3b.yaml
+
+model_path: "/path/to/Qwen3-4B"
+tokenizer_path: "/path/to/Qwen3-4B"
+
+train_gpus: 4
+rollout_gpus: 8
+tp_size: 1
+train_tp_size: 1
+train_pp_size: 1
+train_dp_size: 4
+
+batch_size: 16
+micro_batch_size: 1
+total_steps: 1000
+learning_rate: 1.0e-6
+ppo_epochs: 1
+max_concurrent_rollouts: 16
+max_head_offpolicyness: 4
+queue_size: 256
+
+max_new_tokens: 32768
+max_seq_length: 32768
+n_samples: 1
+temperature: 0.8
+top_p: 0.95
+
+dataset_name: "dapo_math_17k"
+dataset_split: "train"
+
+sync_path: "./logs/dapo_math_cmlfq/qwen3_4b_weights"
+log_dir: "./logs/dapo_math_cmlfq"
+wandb_project: "RL_Framework_DAPO_Math_CMLFQ"
+wandb_run_name: "dapo-math-qwen3-4b-cmlfq"
+eval_interval: 100
+save_interval: 100
+keep_latest_checkpoints: 3
+
+enable_history_collection: true
+history_output_dir: "./logs/dapo_math_cmlfq/history"
+history_save_raw_lengths: false
+history_flush_interval: 1
+history_experiment_name: "dapo_math_cmlfq"
+
+heterogeneous_rollout:
+  enabled: true
+  total_gpus: 8
+  vllm_host: "0.0.0.0"
+  vllm_base_port: 8000
+  max_model_len: 32768
+  gpu_memory_utilization: 0.90
+
+  instances:
+    - instance_id: "long_tp4"
+      tp: 4
+      gpus: [0, 1, 2, 3]
+    - instance_id: "short_tp2_0"
+      tp: 2
+      gpus: [0, 1]
+    - instance_id: "short_tp2_1"
+      tp: 2
+      gpus: [2, 3]
+
+  scheduling:
+    scheduler_type: "cmlfq"
+    load_balance_strategy: "least_connections"
+    max_queue_length: 64
+    enable_fallback: true
+    cmlfq_rebuild_interval: 50
+    cmlfq_tree_path: "./logs/dapo_math_cmlfq/cmlfq_tree.json"
+    cmlfq_payload_small_threshold: 400
+    cmlfq_payload_large_threshold: 1600
+    cmlfq_buckets:
+      short:
+        tp_degrees: [2]
+        max_tokens: 3000
+      medium:
+        tp_degrees: [2]
+        max_tokens: 6000
+      long:
+        tp_degrees: [4]
+        max_tokens: 32768

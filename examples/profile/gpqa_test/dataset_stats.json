@@ -1,0 +1,12 @@
+{
+  "total_questions": 198,
+  "subjects": {
+    "Physics": 86,
+    "Chemistry": 93,
+    "Biology": 19
+  },
+  "avg_question_length": 431.2676767676768,
+  "min_question_length": 80,
+  "max_question_length": 1642,
+  "avg_choices_per_question": 4.0
+}

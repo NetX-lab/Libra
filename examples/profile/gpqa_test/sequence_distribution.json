@@ -1,0 +1,64 @@
+{
+  "timestamp": "2026-02-07T02:50:07.164974",
+  "total_sequences": 198,
+  "completed_sequences": 198,
+  "by_category_input_based": {
+    "short": 198
+  },
+  "by_subject": {
+    "Physics": 86,
+    "Chemistry": 93,
+    "Biology": 19
+  },
+  "input_token_stats": {
+    "min": 84.0,
+    "max": 2811.0,
+    "mean": 258.5,
+    "std": 214.44077494636124,
+    "p50": 223.0,
+    "p90": 380.50000000000006,
+    "p99": 804.1200000000001
+  },
+  "estimated_output_stats": {
+    "min": 128.0,
+    "max": 128.0,
+    "mean": 128.0,
+    "std": 0.0,
+    "p50": 128.0,
+    "p90": 128.0,
+    "p99": 128.0
+  },
+  "thresholds_input": {
+    "short": 10000,
+    "medium": 20000,
+    "long": 30000
+  },
+  "thresholds_total": {
+    "short": 10000,
+    "medium": 20000,
+    "long": 30000
+  },
+  "by_category_total_based": {
+    "short": 27,
+    "extra_long": 163,
+    "medium": 8
+  },
+  "actual_output_stats": {
+    "min": 0.0,
+    "max": 40000.0,
+    "mean": 34190.681818181816,
+    "std": 12627.177053009644,
+    "p50": 40000.0,
+    "p90": 40000.0,
+    "p99": 40000.0
+  },
+  "actual_total_stats": {
+    "min": 154.0,
+    "max": 40905.0,
+    "mean": 34449.181818181816,
+    "std": 12585.271844552488,
+    "p50": 40198.5,
+    "p90": 40345.9,
+    "p99": 40640.95
+  }
+}

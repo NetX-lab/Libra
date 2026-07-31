@@ -1,0 +1,13 @@
+# ============================================================
+#
+#   model_arch_config: model_arch_config/qwen3-4b.yaml
+# ============================================================
+
+num_params: 4.0e+9
+d_model: 2560
+n_layers: 36
+n_heads: 32
+n_kv_heads: 8               # GQA
+vocab_size: 151936
+intermediate_size: 9728
+dtype_bytes: 2              # BF16

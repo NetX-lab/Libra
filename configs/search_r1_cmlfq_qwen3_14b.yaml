@@ -1,0 +1,50 @@
+# Search-R1 + Qwen3-14B + C-MLFQ example.
+base_config: search_r1.yaml
+
+hardware_config: hardware_config/a800_80g.yaml
+model_arch_config: model_arch_config/qwen3-14b.yaml
+
+model_path: "Qwen/Qwen3-14B"
+sync_path: "./logs/search_r1/qwen3_14b_weights"
+rollout_gpus: 16
+max_seq_length: 40960
+
+heterogeneous_rollout:
+  enabled: true
+  total_gpus: 16
+  vllm_host: "0.0.0.0"
+  vllm_base_port: 8000
+  max_model_len: 40960
+  gpu_memory_utilization: 0.90
+
+  instances:
+    - instance_id: "short_tp2_0"
+      tp: 2
+      gpus: [0, 1]
+    - instance_id: "short_tp2_1"
+      tp: 2
+      gpus: [2, 3]
+    - instance_id: "medium_tp4"
+      tp: 4
+      gpus: [4, 5, 6, 7]
+    - instance_id: "long_tp8"
+      tp: 8
+      gpus: [8, 9, 10, 11, 12, 13, 14, 15]
+
+  scheduling:
+    scheduler_type: "cmlfq"
+    load_balance_strategy: "least_connections"
+    max_queue_length: 64
+    enable_fallback: true
+    cmlfq_rebuild_interval: 50
+    cmlfq_tree_path: "./logs/search_r1/cmlfq_tree.json"
+    cmlfq_buckets:
+      short:
+        tp_degrees: [2]
+        max_tokens: 5000
+      medium:
+        tp_degrees: [4]
+        max_tokens: 15000
+      long:
+        tp_degrees: [8]
+        max_tokens: 40960

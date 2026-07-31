@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "libra-agentic-rl"
+version = "0.2.0"
+description = "Efficient resource management for agentic RL post-training"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Kaiwen Chen"},
+  {name = "Xin Tan"},
+  {name = "Jingzong Li"},
+  {name = "Hong Xu"},
+]
+keywords = [
+  "agentic reinforcement learning",
+  "distributed training",
+  "resource management",
+  "vllm",
+  "megatron-core",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dynamic = ["dependencies"]
+
+[project.urls]
+Homepage = "https://github.com/NetX-lab/Libra"
+Repository = "https://github.com/NetX-lab/Libra"
+Paper = "https://arxiv.org/abs/2606.03077"
+
+[tool.setuptools]
+package-dir = {"RL_Framework" = "."}
+packages = [
+  "RL_Framework",
+  "RL_Framework.engine",
+  "RL_Framework.env",
+  "RL_Framework.infra",
+  "RL_Framework.infra.cost_model",
+  "RL_Framework.infra.elastic",
+  "RL_Framework.infra.execution",
+  "RL_Framework.infra.observability",
+  "RL_Framework.infra.scheduling",
+  "RL_Framework.infra.sync",
+  "RL_Framework.launcher",
+  "RL_Framework.trainer",
+  "RL_Framework.workflow",
+]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.package-data]
+"RL_Framework.infra.elastic" = ["*.c"]

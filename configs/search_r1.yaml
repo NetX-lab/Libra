@@ -1,0 +1,52 @@
+# ============================================================
+
+#
+
+#   export SERPER_KEY_ID=your_key_here
+#   python examples/search_r1_async_rl.py --config configs/search_r1.yaml
+
+#
+
+
+
+
+
+
+# ============================================================
+
+
+base_config: base.yaml
+
+
+hardware_config: hardware_config/a100_80g.yaml
+model_arch_config: model_arch_config/qwen2.5-3b.yaml
+
+
+model_path: "/path/to/Qwen3-4B"
+
+
+train_gpus: 2
+rollout_gpus: 2
+
+
+
+dataset_name: "search_r1_gsm8k"
+
+
+
+max_concurrent_rollouts: 32
+
+
+
+batch_size: 16
+micro_batch_size: 4
+
+
+
+max_new_tokens: 1024
+max_seq_length: 4096
+
+
+wandb_project: "RL_Framework_search_r1"
+wandb_run_name: "search_r1_async_rl"
+log_dir: "./logs/search_r1"

@@ -1,0 +1,52 @@
+# ============================================================
+
+#
+
+#   python examples/livecodebench_code_agent.py --config configs/code_agent.yaml
+
+#
+
+
+
+
+
+
+
+# ============================================================
+
+
+base_config: base.yaml
+
+
+hardware_config: hardware_config/a100_80g.yaml
+model_arch_config: model_arch_config/qwen2.5-3b.yaml
+
+
+model_path: "/path/to/Qwen3-4B"
+
+
+train_gpus: 2
+rollout_gpus: 2
+
+
+
+dataset_name: "livecodebench_codeforces"
+
+
+
+max_concurrent_rollouts: 16
+
+
+
+batch_size: 16
+micro_batch_size: 4
+
+
+
+max_new_tokens: 2048
+max_seq_length: 8192
+
+
+wandb_project: "RL_Framework_code_agent"
+wandb_run_name: "livecodebench_codeforces"
+log_dir: "./logs/code_agent"
