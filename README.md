@@ -106,6 +106,8 @@ Libra/
 
 | Guide | What it covers |
 | --- | --- |
+| [Slurm quick start](docs/quick_start.md) | Cluster validation path for import, planner, NCCL, and a short Slurm pilot |
+| [No-Slurm quick start](docs/quick_start_no_slurm.md) | Workstation or manually managed server checks without Slurm |
 | [Cluster manual](docs/manual.md) | End-to-end configuration and launch workflow |
 | [Data preparation](docs/data_preparation.md) | R2E-Gym, Search-R1, and DAPO-Math datasets |
 | [Configuration reference](docs/configuration_reference.md) | Core, Megatron-Core, planner, and elastic options |
