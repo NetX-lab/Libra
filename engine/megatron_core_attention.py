@@ -220,6 +220,37 @@ def apply_megatron_core_014_compatibility() -> None:
 
     from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
+    # Megatron-Core's native-Adam DistributedOptimizer calls state_dict() while
+    # constructing a distributed-checkpoint load template.  A freshly created
+    # optimizer has no per-parameter state yet, so upstream asserts that its
+    # empty set of Adam steps has length one.  During an elastic DP resize this
+    # is exactly the normal path.  Emit the same optimizer metadata with a
+    # step-zero placeholder so MCore can allocate the incoming sharded state.
+    original_state_dict = DistributedOptimizer.state_dict
+    if not getattr(original_state_dict, "_rl_framework_empty_state_compat", False):
+        def state_dict(self):
+            inner_state_dict = self.optimizer.state_dict()
+            if inner_state_dict.get("state"):
+                return original_state_dict(self)
+
+            optimizer_state = {
+                key: value
+                for key, value in inner_state_dict.items()
+                if key != "state"
+            }
+            for param_group in optimizer_state.get("param_groups", []):
+                param_group.pop("params", None)
+                # Native PyTorch Adam expects the global iteration in every
+                # group; its real per-parameter state is populated by load.
+                param_group.setdefault("step", 0)
+            result = {"optimizer": optimizer_state}
+            if self.grad_scaler:
+                result["grad_scaler"] = self.grad_scaler.state_dict()
+            return result
+
+        state_dict._rl_framework_empty_state_compat = True
+        DistributedOptimizer.state_dict = state_dict
+
     original_set_state = (
         DistributedOptimizer._set_main_param_and_optimizer_states
     )

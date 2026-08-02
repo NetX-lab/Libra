@@ -404,7 +404,24 @@ class GlobalResourcePlanner:
             fixed_train_gpus=self.fixed_train_gpus,
         )
         candidate = self._plan_from_result(result, config)
-        if candidate is None:
+        # Forced runtime plans are an explicit control-plane request.  They
+        # must still be evaluated when the analytic optimizer prunes every
+        # training configuration (for example, a long-context MoE model can
+        # make the optimizer's conservative memory check return no candidate).
+        # Previously this early return made GRP_FORCE_* a no-op in exactly that
+        # situation and hid the real runtime reconfiguration path.
+        forced_rollout_tp = self._forced_rollout_tp_list(config)
+        forced_train = self._forced_train_config(
+            config,
+            current,
+            rollout_gpus=(
+                sum(forced_rollout_tp)
+                if forced_rollout_tp is not None
+                else int(getattr(config, "rollout_gpus", 0) or 0)
+            ),
+        )
+        forced_candidate = forced_rollout_tp is not None or forced_train is not None
+        if candidate is None and not forced_candidate:
             self._mark_rejected_trigger_observed(trigger, runtime_metrics)
             return self._remember(
                 PlannerDecision(
@@ -419,17 +436,6 @@ class GlobalResourcePlanner:
                 )
             )
 
-        forced_rollout_tp = self._forced_rollout_tp_list(config)
-        forced_train = self._forced_train_config(
-            config,
-            current,
-            rollout_gpus=(
-                sum(forced_rollout_tp)
-                if forced_rollout_tp is not None
-                else int(getattr(config, "rollout_gpus", 0) or 0)
-            ),
-        )
-        forced_candidate = forced_rollout_tp is not None or forced_train is not None
         if forced_rollout_tp is not None:
             forced_rollout = RolloutClusterConfig(tp_list=forced_rollout_tp)
             forced_rollout_time, forced_rollout_details = self.evaluator.evaluate_rollout(
@@ -500,9 +506,13 @@ class GlobalResourcePlanner:
         candidate.reconfiguration_cost_s = self.reconfiguration_cost_s
 
         same_plan = self._same_plan(current, candidate)
-        force_runtime_reconfigure = (
-            os.environ.get("GRP_FORCE_RUNTIME_RECONFIGURE", "0") == "1"
-        )
+        force_runtime_reconfigure = bool(
+            getattr(
+                config.global_resource_planner,
+                "runtime_force_reconfigure",
+                False,
+            )
+        ) or os.environ.get("GRP_FORCE_RUNTIME_RECONFIGURE", "0") == "1"
         should = (
             (not same_plan or force_runtime_reconfigure)
             and (
@@ -551,24 +561,47 @@ class GlobalResourcePlanner:
             self._last_rejected_rollouts = runtime_metrics.rejected_rollouts
 
     def _forced_rollout_tp_list(self, config: AsyncRLConfig) -> list[int] | None:
+        configured = list(
+            getattr(
+                config.global_resource_planner,
+                "runtime_forced_rollout_tp_list",
+                [],
+            )
+            or []
+        )
         raw = os.environ.get("GRP_FORCE_ROLLOUT_TP_LIST", "").strip()
-        if not raw:
+        if configured:
+            tp_list = [int(item) for item in configured]
+        elif raw:
+            try:
+                tp_list = [
+                    int(item.strip())
+                    for item in re.split(r"[,;:]", raw)
+                    if item.strip()
+                ]
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid GRP_FORCE_ROLLOUT_TP_LIST={raw!r}"
+                ) from exc
+        else:
             return None
-        try:
-            tp_list = [
-                int(item.strip())
-                for item in re.split(r"[,;:]", raw)
-                if item.strip()
-            ]
-        except ValueError as exc:
-            raise ValueError(f"Invalid GRP_FORCE_ROLLOUT_TP_LIST={raw!r}") from exc
         if not tp_list:
             return None
         if any(tp <= 0 for tp in tp_list):
             raise ValueError(f"GRP_FORCE_ROLLOUT_TP_LIST must be positive: {tp_list}")
+        forced_train = int(
+            getattr(
+                config.global_resource_planner,
+                "runtime_forced_train_gpus",
+                0,
+            )
+            or 0
+        )
         forced_train_raw = os.environ.get("GRP_FORCE_TRAIN_GPUS", "").strip()
         rollout_gpus = int(getattr(config, "rollout_gpus", 0) or sum(tp_list))
-        if forced_train_raw:
+        if forced_train > 0:
+            rollout_gpus = int(self.n_total_gpus) - forced_train
+        elif forced_train_raw:
             try:
                 forced_train_gpus = int(forced_train_raw)
             except ValueError as exc:
@@ -590,13 +623,24 @@ class GlobalResourcePlanner:
         *,
         rollout_gpus: int,
     ) -> TrainParallelConfig | None:
+        configured = int(
+            getattr(
+                config.global_resource_planner,
+                "runtime_forced_train_gpus",
+                0,
+            )
+            or 0
+        )
         raw = os.environ.get("GRP_FORCE_TRAIN_GPUS", "").strip()
-        if not raw:
+        if configured > 0:
+            train_gpus = configured
+        elif raw:
+            try:
+                train_gpus = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"Invalid GRP_FORCE_TRAIN_GPUS={raw!r}") from exc
+        else:
             return None
-        try:
-            train_gpus = int(raw)
-        except ValueError as exc:
-            raise ValueError(f"Invalid GRP_FORCE_TRAIN_GPUS={raw!r}") from exc
         if train_gpus <= 0:
             raise ValueError(f"GRP_FORCE_TRAIN_GPUS must be positive: {train_gpus}")
         if train_gpus + rollout_gpus > self.n_total_gpus:
@@ -735,8 +779,16 @@ class GlobalResourcePlanner:
                 allocated = gpus[:tp]
                 pools[idx] = (host, gpus[tp:])
                 return host, allocated
-        host = pools[0][0] if pools else ""
-        return host, list(range(tp))
+        capacity = sum(len(gpus) for _, gpus in pools)
+        layout = ", ".join(
+            f"{host}:{gpus}" for host, gpus in pools
+        ) or "no rollout slots"
+        raise ValueError(
+            "insufficient physical rollout slots for TP="
+            f"{tp}: remaining_capacity={capacity}, pools={layout}. "
+            "A cluster swap that increases rollout GPUs requires an elastic "
+            "training launcher to release the corresponding training ranks first."
+        )
 
     def _remember(self, decision: PlannerDecision) -> PlannerDecision:
         self._last_decision = decision

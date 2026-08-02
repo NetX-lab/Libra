@@ -7,6 +7,7 @@ import os
 import sys
 from collections import Counter
 from datetime import timedelta
+from hashlib import blake2b
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
@@ -32,6 +33,48 @@ def _normalize_modified_files(value):
     except Exception:
         return [str(value)]
     return parsed if isinstance(parsed, list) else [str(parsed)]
+
+
+def _split_holdout(dataset):
+    """Create a deterministic R2E-Gym holdout without perturbing data order."""
+    fraction = float(os.environ.get("R2E_EVAL_HOLDOUT_FRACTION", "0"))
+    if not 0.0 < fraction < 1.0:
+        return dataset, dataset
+
+    seed = os.environ.get("R2E_EVAL_SEED", "0")
+    eval_indices = []
+    train_indices = []
+    for index, row in enumerate(dataset):
+        key = (
+            f"{seed}:{row.get('repo_name', '')}:"
+            f"{row.get('commit_hash', '')}:{index}"
+        ).encode("utf-8")
+        bucket = int.from_bytes(blake2b(key, digest_size=8).digest(), "big")
+        if bucket / 2**64 < fraction:
+            eval_indices.append(index)
+        else:
+            train_indices.append(index)
+    if not eval_indices or not train_indices:
+        raise ValueError("R2E-Gym holdout split produced an empty partition")
+    return dataset.select(train_indices), dataset.select(eval_indices)
+
+
+def _select_training_subset(dataset):
+    """Select a stable small training set for repeatable scheduler studies."""
+    limit = int(os.environ.get("R2E_TRAIN_MAX_SAMPLES", "0"))
+    if limit <= 0 or limit >= len(dataset):
+        return dataset
+
+    seed = os.environ.get("R2E_TRAIN_SUBSET_SEED", "0")
+    ranked_indices = []
+    for index, row in enumerate(dataset):
+        key = (
+            f"{seed}:{row.get('repo_name', '')}:"
+            f"{row.get('commit_hash', '')}:{index}"
+        ).encode("utf-8")
+        ranked_indices.append((blake2b(key, digest_size=8).digest(), index))
+    selected = sorted(index for _, index in sorted(ranked_indices)[:limit])
+    return dataset.select(selected)
 
 
 def main():
@@ -104,9 +147,13 @@ def main():
         }
 
     dataset = dataset.map(preprocess)
+    dataset, eval_dataset = _split_holdout(dataset)
+    dataset = _select_training_subset(dataset)
     if is_main_process:
         repo_counts = Counter(dataset["repo_name"])
-        print(f"Loaded R2E-Gym rows: {len(dataset)}")
+        print(
+            f"Loaded R2E-Gym rows: train={len(dataset)} eval={len(eval_dataset)}"
+        )
         print(f"Repositories: {dict(sorted(repo_counts.items()))}")
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -133,7 +180,7 @@ def main():
     )
 
     trainer = AsyncRLTrainer(config)
-    trainer.train(workflow=workflow, dataset=dataset)
+    trainer.train(workflow=workflow, dataset=dataset, eval_dataset=eval_dataset)
 
 
 if __name__ == "__main__":

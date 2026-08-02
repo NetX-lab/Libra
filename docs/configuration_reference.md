@@ -167,14 +167,24 @@ Every field below must be nested under `global_resource_planner`.
 | Online triggers | `runtime_async_planning`, `runtime_max_pending_plans`, `runtime_dynamic_reconfiguration_enabled`, `runtime_online_replanning`, `runtime_replan_cooldown_steps`, `runtime_queue_pressure_threshold`, `runtime_active_rollout_pressure_threshold`, `runtime_rejected_rollout_delta_threshold`, `runtime_rollout_train_imbalance_threshold` |
 | Simulators | `simulator_allow_fallback`, `simulator_timeout_s`, `simulator_cache_dir`, `sailor_path`, `sailor_python`, `sailor_train_command`, `vidur_path`, `vidur_python`, `vidur_rollout_command`, `vidur_model_name`, `vidur_device`, `vidur_qps`, `vidur_scheduler`, `vidur_batch_size_cap`, `vidur_chunk_size`, `vidur_time_limit_s` |
 | Rollout lifecycle | `runtime_manage_rollout_processes`, `runtime_adopt_existing_rollout_processes`, `runtime_drain_before_reconfigure`, `runtime_drain_timeout_s`, `runtime_rollout_reconfigure_strategy`, `runtime_cluster_swap_enabled`, `runtime_prewarm_no_spare_fallback_strategy`, `runtime_rollout_log_dir`, `runtime_rollout_manifest_path`, `runtime_rollout_pid_registry_path`, `runtime_wait_rollout_process_start_ready`, `runtime_post_rollout_stop_grace_s` |
-| Training/runtime coordination | `runtime_reconfigure_training`, `runtime_training_pool_only`, `runtime_training_pool_target_gpus`, `runtime_training_pool_plan_only`, `runtime_batch_collection_timeout_s`, `runtime_batch_collection_max_retries`, `runtime_use_nccl_barrier_after_rollout`, `runtime_use_nccl_barrier_before_weight_sync`, `runtime_coordinate_reconfiguration_ranks`, `runtime_coordinate_batch_source_only`, `runtime_peer_request_wait_s` |
+| Training/runtime coordination | `runtime_reconfigure_training`, `runtime_training_pool_only`, `runtime_training_pool_target_gpus`, `runtime_effective_train_gpus`, `runtime_training_pool_plan_only`, `runtime_training_resize_mode`, `runtime_training_handoff_enabled`, `runtime_training_handoff_dir`, `runtime_training_handoff_timeout_s`, `runtime_batch_collection_timeout_s`, `runtime_batch_collection_max_retries`, `runtime_use_nccl_barrier_after_rollout`, `runtime_use_nccl_barrier_before_weight_sync`, `runtime_coordinate_reconfiguration_ranks`, `runtime_coordinate_batch_source_only`, `runtime_peer_request_wait_s` |
 | Managed vLLM commands | `vllm_launch_command_template`, `vllm_stop_command_template`, `vllm_ready_timeout_s`, `vllm_stop_timeout_s` |
-| Hybrid workers | `hybrid_worker_launch_enabled`, `hybrid_training_prewarm_enabled`, `hybrid_training_prewarm_count`, `hybrid_training_prewarm_worker_ids`, `hybrid_worker_python`, `hybrid_worker_command_template`, `hybrid_worker_task_dir`, `hybrid_worker_ready_timeout_s` |
+| Hybrid workers | `hybrid_worker_launch_enabled`, `hybrid_training_prewarm_enabled`, `hybrid_training_prewarm_count`, `hybrid_training_prewarm_worker_ids`, `hybrid_worker_python`, `hybrid_worker_command_template`, `hybrid_worker_mode`, `hybrid_worker_config_path`, `hybrid_worker_task_dir`, `hybrid_worker_ready_timeout_s`, `hybrid_replica_gpus`, `hybrid_zero_sync_steps`, `hybrid_snapshot_interval`, `hybrid_max_pending_snapshots`, `hybrid_snapshot_retention`, `hybrid_state_alignment_timeout_s`, `hybrid_active_gradient_timeout_s`, `hybrid_lockstep_gradient_sync` |
 | Gradient transport | `gradient_transport_backend`, `decouple_communication_domains`, `gradient_server_host`, `gradient_server_public_host`, `gradient_server_port`, `gradient_server_authkey`, `native_rdma_device`, `native_rdma_gid_index`, `native_rdma_ib_port`, `native_rdma_max_bytes` |
 
 `runtime_rollout_reconfigure_strategy` accepts `diff`, `restart_all`,
 `blue_green`, `prewarm`, or `cluster_swap`. `gradient_transport_backend`
 accepts `tcp` or `native_rdma`.
+
+`hybrid_lockstep_gradient_sync` uses the bidirectional TCP protocol to return
+post-AllReduce gradients to active Hybrid ranks. Set `hybrid_snapshot_interval`
+to `0` for join-only snapshots; `hybrid_snapshot_retention` bounds completed
+distributed checkpoint versions.
+
+`runtime_training_resize_mode` accepts `hybrid_nonblocking` or
+`supervised_handoff`. The former keeps the core Megatron topology immutable and
+changes only complete external replicas; the latter is a checkpoint-and-restart
+fallback for changing the core partition.
 
 ## Cost-model inputs
 

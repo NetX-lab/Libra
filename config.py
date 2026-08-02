@@ -344,6 +344,15 @@ class SchedulingConfig:
     cmlfq_payload_small_threshold: int = 500
     cmlfq_payload_large_threshold: int = 5000
 
+    # Cold-start placement used before the causal prefix tree has a match.
+    # Keeping this explicit avoids silently sending long-output workloads to
+    # the short bucket while the online profile is still warming up.
+    cmlfq_initial_bucket: str = "short"
+
+    # Avoid paying a cross-bucket routing cost for continuations too short to
+    # amortize a larger TP replica.
+    cmlfq_min_migration_remaining_tokens: int = 256
+
     @classmethod
     def from_dict(cls, d: dict) -> "SchedulingConfig":
         return _from_dict(cls, d)
@@ -465,6 +474,11 @@ class GlobalResourcePlannerConfig:
     runtime_active_rollout_pressure_threshold: float = 0.85
     runtime_rejected_rollout_delta_threshold: int = 8
     runtime_rollout_train_imbalance_threshold: float = 1.25
+    # Persist explicit runtime targets so child ranks do not depend on Slurm
+    # forwarding control-plane environment variables.
+    runtime_forced_train_gpus: int = 0
+    runtime_forced_rollout_tp_list: list[int] = field(default_factory=list)
+    runtime_force_reconfigure: bool = False
 
 
     # {input_json}, {output_json}, {trace_csv}, {output_dir}, {sailor_path}, {vidur_path}
@@ -502,7 +516,12 @@ class GlobalResourcePlannerConfig:
     runtime_reconfigure_training: bool = False
     runtime_training_pool_only: bool = True
     runtime_training_pool_target_gpus: int = 0
+    runtime_effective_train_gpus: int = 0
     runtime_training_pool_plan_only: bool = True
+    runtime_training_resize_mode: str = "hybrid_nonblocking"  # hybrid_nonblocking | supervised_handoff
+    runtime_training_handoff_enabled: bool = False
+    runtime_training_handoff_dir: str = ""
+    runtime_training_handoff_timeout_s: float = 600.0
     runtime_batch_collection_timeout_s: float = 0.0
     runtime_batch_collection_max_retries: int = 0
     runtime_use_nccl_barrier_after_rollout: bool = False
@@ -520,8 +539,18 @@ class GlobalResourcePlannerConfig:
     hybrid_training_prewarm_worker_ids: list[str] = field(default_factory=list)
     hybrid_worker_python: str = "python"
     hybrid_worker_command_template: str = ""
+    hybrid_worker_mode: str = "megatron_core"
+    hybrid_worker_config_path: str = ""
     hybrid_worker_task_dir: str = "./logs/elastic_training_tasks"
-    hybrid_worker_ready_timeout_s: float = 60.0
+    hybrid_worker_ready_timeout_s: float = 600.0
+    hybrid_replica_gpus: int = 0
+    hybrid_zero_sync_steps: int = 1
+    hybrid_snapshot_interval: int = 0
+    hybrid_max_pending_snapshots: int = 1
+    hybrid_snapshot_retention: int = 2
+    hybrid_state_alignment_timeout_s: float = 300.0
+    hybrid_active_gradient_timeout_s: float = 300.0
+    hybrid_lockstep_gradient_sync: bool = True
     gradient_transport_backend: str = "tcp"  # tcp | native_rdma
     decouple_communication_domains: bool = True
     gradient_server_host: str = "127.0.0.1"
@@ -618,6 +647,7 @@ class AsyncRLConfig:
 
     total_steps: int = 100
     eval_interval: int = 10
+    eval_at_start: bool = False
     save_interval: int = 10
     seed: int = 42
 

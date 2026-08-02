@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from hashlib import blake2b
 import os
 import random
 from typing import Any, Callable
@@ -399,6 +400,10 @@ class R2EGymWorkflow:
             "eval_total_rows": n_total,
             "eval_index_strategy": eval_strategy,
             "eval_indices": eval_indices,
+            "eval_index_digest": blake2b(
+                ",".join(str(index) for index in eval_indices).encode("ascii"),
+                digest_size=8,
+            ).hexdigest(),
             "eval_accuracy": sum(accurate) / max(1, len(accurate)),
             "eval_accuracy_threshold": float(accuracy_threshold),
             "eval_reward_ge_0_3": sum(float(r >= 0.3) for r in rewards) / max(1, len(rewards)),
@@ -407,6 +412,22 @@ class R2EGymWorkflow:
             "eval_reward_mean": sum(rewards) / max(1, len(rewards)),
             "eval_reward_min": min(rewards) if rewards else 0.0,
             "eval_reward_max": max(rewards) if rewards else 0.0,
+            "eval_lexical_f1": (
+                sum(r.get("metrics", {}).get("lexical_f1", 0.0) for r in results)
+                / max(1, len(results))
+            ),
+            "eval_test_coverage": (
+                sum(r.get("metrics", {}).get("test_coverage", 0.0) for r in results)
+                / max(1, len(results))
+            ),
+            "eval_file_coverage": (
+                sum(r.get("metrics", {}).get("file_coverage", 0.0) for r in results)
+                / max(1, len(results))
+            ),
+            "eval_format_score": (
+                sum(r.get("metrics", {}).get("format_score", 0.0) for r in results)
+                / max(1, len(results))
+            ),
             "eval_failures": len(failures),
             "eval_first_error": failures[0].get("error", "") if failures else "",
             "eval_mode": "multi_turn" if use_feedback else "single_turn",

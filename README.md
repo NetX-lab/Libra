@@ -89,11 +89,16 @@ Libra/
 - **Heterogeneous rollout cluster.** Runs multiple OpenAI-compatible vLLM
   instances with different tensor-parallel degrees, such as TP-1, TP-2, TP-4,
   and TP-8 buckets.
-- **Elastic Hybrid Pool.** Models workers that can move between rollout and
-  training roles without changing the fixed core training topology.
-- **Decoupled communication domains.** Keeps core training collectives separate
-  from elastic hybrid-worker gradient exchange, so dynamic training-side
-  changes do not perturb Megatron-Core or FSDP process groups.
+- **Elastic Hybrid Pool.** Moves complete external Megatron replicas between
+  rollout and training without changing the fixed core topology. Joining uses
+  asynchronous sharded snapshots, a real zero-gradient boundary, atomic state
+  alignment, and frozen per-step membership. Active replicas receive the Core's
+  post-AllReduce gradient and advance model and optimizer state in lockstep,
+  without per-step checkpoint reloads.
+- **Decoupled communication domains.** Gives each model-parallel lane an
+  independent side-channel endpoint and injects external gradients before the
+  immutable core DP All-Reduce, so membership changes never rebuild Megatron
+  communicators.
 - **Cluster-swap execution.** Supports no-spare-GPU resource exchange between
   rollout and training pools when the planner changes the allocation.
 - **Async GRPO pipeline.** Decouples rollout and training, tracks policy

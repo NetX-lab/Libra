@@ -106,6 +106,79 @@ def test_runtime_executor_applies_rollout_reconfiguration():
     assert cfg.heterogeneous_rollout.instances
 
 
+def test_runtime_executor_requests_supervised_training_handoff(tmp_path):
+    """A physical DP resize must be delegated to the Slurm supervisor."""
+
+    cfg = _config()
+    planner, decision = _decision(cfg)
+    decision.candidate_plan.train_config.dp = 1
+    decision.candidate_plan.rollout_config.tp_list = [1, 1, 1]
+    cfg.global_resource_planner.runtime_reconfigure_training = True
+    cfg.global_resource_planner.runtime_training_pool_target_gpus = 1
+    cfg.global_resource_planner.runtime_training_handoff_enabled = True
+    cfg.global_resource_planner.runtime_training_handoff_dir = str(tmp_path)
+    executor = RuntimeElasticExecutor(config=cfg, planner=planner)
+
+    result = executor.execute(decision)
+
+    assert result.applied
+    assert result.reason == "training_handoff_requested"
+    request = json.loads((tmp_path / "request.json").read_text(encoding="utf-8"))
+    assert request["current_train_gpus"] == 2
+    assert request["target_train_gpus"] == 1
+    assert request["plan"]["train"]["n_gpus"] == 1
+
+
+def test_hybrid_nonblocking_growth_does_not_request_training_handoff(tmp_path):
+    cfg = _config()
+    planner, decision = _decision(cfg)
+    cfg.global_resource_planner.runtime_reconfigure_training = True
+    cfg.global_resource_planner.runtime_training_pool_plan_only = False
+    cfg.global_resource_planner.runtime_training_handoff_enabled = True
+    cfg.global_resource_planner.runtime_training_handoff_dir = str(tmp_path)
+    cfg.global_resource_planner.runtime_training_resize_mode = "hybrid_nonblocking"
+    cfg.global_resource_planner.runtime_training_pool_only = False
+    cfg.global_resource_planner.runtime_training_pool_target_gpus = 4
+    pool = ElasticHybridPool(
+        core_train_workers=["core0", "core1"],
+        core_rollout_workers=["rollout0", "rollout1"],
+        zero_sync_steps=0,
+    )
+    executor = RuntimeElasticExecutor(config=cfg, planner=planner, elastic_pool=pool)
+
+    result = executor.execute(decision)
+
+    assert result.reason != "training_handoff_requested"
+    assert not (tmp_path / "request.json").exists()
+    assert cfg.train_gpus == 2
+    assert cfg.train_dp_size == 2
+    assert cfg.global_resource_planner.runtime_effective_train_gpus == 4
+    pool.close()
+
+
+def test_sibling_step_launch_env_drops_parent_slurm_step(monkeypatch):
+    cfg = _config()
+    planner, _decision_value = _decision(cfg)
+    executor = RuntimeElasticExecutor(config=cfg, planner=planner)
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "gn[003-005]")
+    monkeypatch.setenv("SLURM_STEP_ID", "3")
+    monkeypatch.setenv("SLURM_STEP_NODELIST", "gn003")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("MASTER_ADDR", "gn003")
+
+    env = executor._allocation_launch_env("hybrid_training")
+
+    assert env["SLURM_JOB_ID"] == "123"
+    assert env["SLURM_JOB_NODELIST"] == "gn[003-005]"
+    assert env["RL_FRAMEWORK_ROLE"] == "hybrid_training"
+    assert "LIBRA_HYBRID_CPU_INITIALIZATION" not in env
+    assert "SLURM_STEP_ID" not in env
+    assert "SLURM_STEP_NODELIST" not in env
+    assert "RANK" not in env
+    assert "MASTER_ADDR" not in env
+
+
 def test_runtime_executor_requests_training_join_when_enabled():
     if ElasticHybridPool is None:
         pytest.skip("torch is not installed in this local environment")
@@ -536,9 +609,11 @@ def test_runtime_executor_cluster_swap_returns_training_gpu_to_rollout():
             )
 
     cfg = _config()
-    cfg.train_gpus = 4
-    cfg.rollout_gpus = 0
-    cfg.train_dp_size = 4
+    # The immutable core owns two GPUs; two external replicas account for the
+    # current effective training allocation of four GPUs.
+    cfg.train_gpus = 2
+    cfg.rollout_gpus = 2
+    cfg.train_dp_size = 2
     cfg.n_total_gpus = 4
     cfg.global_resource_planner.runtime_manage_rollout_processes = True
     cfg.global_resource_planner.runtime_reconfigure_training = True

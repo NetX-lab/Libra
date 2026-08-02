@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -47,6 +48,8 @@ class MegatronDistributedCheckpointManager:
         self.async_save = async_save
         self._save_strategy = None
         self._load_strategy = None
+        self._async_calls = None
+        self._async_versions: dict[int, int] = {}
 
     @property
     def rank(self) -> int:
@@ -170,6 +173,146 @@ class MegatronDistributedCheckpointManager:
         if optimizer is not None and "optimizer" in loaded:
             optimizer.load_state_dict(loaded["optimizer"])
         self._barrier()
+
+    def save_async_snapshot(
+        self,
+        *,
+        model: list[Any],
+        optimizer: Any,
+        version: int,
+        topology: dict[str, int],
+    ) -> bool:
+        """Schedule a distributed model+optimizer snapshot without HF export.
+
+        The staging call is collective across the immutable core ranks, while
+        storage I/O and finalization run through Megatron-Core's async queue.
+        At most one request is kept in flight to avoid checkpoint backlog.
+        """
+        if self._async_versions:
+            return False
+        if not self.async_save:
+            self.save(
+                model=model,
+                optimizer=optimizer,
+                bridge=None,
+                version=version,
+                topology=topology,
+                export_for_rollout=False,
+            )
+            return True
+
+        version_dir = self.sync_path / f"v{version}"
+        checkpoint_dir = version_dir / "megatron_dist"
+        self._mkdir_collective(checkpoint_dir)
+        self._record_phase(version_dir, version, "before_async_snapshot_stage")
+        state_dict = self._build_sharded_state_dict(
+            model=self._unwrap_model(model),
+            optimizer=optimizer,
+            version=version,
+        )
+        dist_checkpointing = self._dist_checkpointing()
+        request = dist_checkpointing.save(
+            sharded_state_dict=state_dict,
+            checkpoint_dir=str(checkpoint_dir),
+            sharded_strategy=self._get_save_strategy(dist_checkpointing),
+            async_sharded_save=True,
+        )
+
+        def finalize_snapshot() -> None:
+            self._write_snapshot_manifest(
+                version_dir=version_dir,
+                checkpoint_dir=checkpoint_dir,
+                version=version,
+                topology=topology,
+                includes_optimizer=optimizer is not None,
+            )
+            self._record_phase(version_dir, version, "async_snapshot_complete")
+
+        if request is None:
+            finalize_snapshot()
+            return True
+        request.add_finalize_fn(finalize_snapshot)
+        if self._async_calls is None:
+            from megatron.core.dist_checkpointing.strategies.async_utils import (
+                AsyncCallsQueue,
+            )
+
+            self._async_calls = AsyncCallsQueue(persistent=True)
+        call_idx = int(self._async_calls.schedule_async_request(request))
+        self._async_versions[call_idx] = int(version)
+        return True
+
+    def poll_async_snapshots(self, *, blocking: bool = False) -> list[int]:
+        if self._async_calls is None:
+            return []
+        finalized = self._async_calls.maybe_finalize_async_calls(blocking=blocking)
+        versions = [self._async_versions.pop(int(idx)) for idx in finalized]
+        return versions
+
+    def close_async_snapshots(self) -> list[int]:
+        versions = self.poll_async_snapshots(blocking=True)
+        if self._async_calls is not None:
+            self._async_calls.close()
+            self._async_calls = None
+        return versions
+
+    def prune_snapshots(
+        self,
+        *,
+        keep_latest: int = 2,
+        protected_versions: set[int] | None = None,
+    ) -> list[int]:
+        """Collectively remove completed snapshots that no join can reference."""
+        if self._async_versions:
+            return []
+        protected = {int(version) for version in (protected_versions or set())}
+        completed = []
+        for manifest in self.sync_path.glob(
+            "v*/megatron_checkpoint_manifest.json"
+        ):
+            try:
+                completed.append(int(manifest.parent.name[1:]))
+            except ValueError:
+                continue
+        completed.sort()
+        keep_count = max(0, int(keep_latest))
+        retained = (
+            set(completed[-keep_count:]) if keep_count else set()
+        ) | protected
+        removed = [version for version in completed if version not in retained]
+        if self.rank == 0:
+            for version in removed:
+                shutil.rmtree(self.sync_path / f"v{version}", ignore_errors=True)
+        return removed
+
+    def _write_snapshot_manifest(
+        self,
+        *,
+        version_dir: Path,
+        checkpoint_dir: Path,
+        version: int,
+        topology: dict[str, int],
+        includes_optimizer: bool,
+    ) -> None:
+        manifest = MegatronCheckpointManifest(
+            version=version,
+            checkpoint_format=self.checkpoint_format,
+            distributed_checkpoint=str(checkpoint_dir),
+            rollout_export="",
+            world_size=self.world_size,
+            tensor_parallel_size=int(topology.get("train_tp", 1)),
+            pipeline_parallel_size=int(topology.get("train_pp", 1)),
+            context_parallel_size=int(topology.get("train_cp", 1)),
+            expert_parallel_size=int(topology.get("train_ep", 1)),
+            data_parallel_size=int(topology.get("train_dp", 1)),
+            includes_optimizer=bool(includes_optimizer),
+            completed_at=time.time(),
+        )
+        if self.rank == 0:
+            self._write_json_atomic(
+                version_dir / "megatron_checkpoint_manifest.json",
+                asdict(manifest),
+            )
 
     def _build_sharded_state_dict(
         self,
