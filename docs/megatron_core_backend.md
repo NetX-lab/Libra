@@ -61,21 +61,12 @@ that maps multiple ranks to the same CUDA device and can surface as an NCCL
 
 ## Installation
 
-Activate the same environment used by the training job, install Libra, and run
-the backend installer:
+The cluster login node does not need internet access. Put the pinned MCore,
+Bridge, and small Python dependency packages in `vendor/megatron`, then run:
 
 ```bash
-source .venv/bin/activate
-python -m pip install -e .
 bash scripts/install_megatron_core.sh
 ```
-
-On a connected host the installer downloads the pinned dependencies. For an
-offline cluster, place the MCore source archive, Bridge wheel, a grouped-GEMM
-wheel matching the active Python ABI (or its source archive), and the small
-dependency wheels under `vendor/megatron`. Set `MCORE_WHEELHOUSE` when using a
-different directory. The complete artifact list and wheelhouse procedure are
-in [the environment guide](env_creation.md#megatron-core-offline-artifacts).
 
 The installer validates the Qwen3-MoE bridge, distributed checkpointing, and
 the SDPA adapter before a Slurm job is submitted.

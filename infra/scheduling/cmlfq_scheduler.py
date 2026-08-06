@@ -1,5 +1,7 @@
 """Support code for Cmlfq scheduler."""
 
+from __future__ import annotations
+
 import logging
 import os
 import time
@@ -88,8 +90,6 @@ class CMLFQScheduler(BaseScheduler):
         shared_load_dir: str = "",
         shared_load_ttl_s: float = 60.0,
         shared_load_heartbeat_s: float = 10.0,
-        initial_bucket: str = "short",
-        min_migration_remaining_tokens: int = 0,
     ):
         super().__init__(name="C-MLFQ")
 
@@ -103,12 +103,6 @@ class CMLFQScheduler(BaseScheduler):
         self._sorted_bucket_names = sorted(
             self._bucket_thresholds.keys(),
             key=lambda b: self._bucket_thresholds[b],
-        )
-        self._initial_bucket = initial_bucket if initial_bucket in self._buckets else (
-            self._sorted_bucket_names[0] if self._sorted_bucket_names else "short"
-        )
-        self._min_migration_remaining_tokens = max(
-            0, int(min_migration_remaining_tokens)
         )
 
 
@@ -190,8 +184,11 @@ class CMLFQScheduler(BaseScheduler):
         request_id = uuid.uuid4().hex
 
 
+        shortest_bucket = self._sorted_bucket_names[0] if self._sorted_bucket_names else "short"
+
+
         result = self._route_to_bucket(
-            bucket=self._initial_bucket,
+            bucket=shortest_bucket,
             input_tokens=input_tokens,
             prompt_id=prompt_id,
             reason="cmlfq_initial_placement",
@@ -202,7 +199,7 @@ class CMLFQScheduler(BaseScheduler):
             self._request_states[request_id] = CMLFQRequestState(
                 request_id=request_id,
                 prompt_id=prompt_id,
-                current_bucket=self._initial_bucket,
+                current_bucket=shortest_bucket,
                 current_instance_index=result.instance_index if result.instance_index >= 0 else -1,
             )
             result.request_id = request_id
@@ -276,30 +273,13 @@ class CMLFQScheduler(BaseScheduler):
                 p90_remaining_length=node.p90_remaining_length,
             )
 
-        if (
-            node.mean_remaining_length < self._min_migration_remaining_tokens
-            or node.p90_remaining_length < self._min_migration_remaining_tokens
-        ):
-            return CMLFQMigrationDecision(
-                should_migrate=False,
-                reason="remaining_length_below_migration_floor",
-                current_bucket=req_state.current_bucket,
-                target_bucket=target_bucket,
-                mean_remaining_length=node.mean_remaining_length,
-                p90_remaining_length=node.p90_remaining_length,
-            )
 
-
-        message = (
+        logger.info(
             f"[CMLFQ] migration decision: request={request_id}, "
             f"{req_state.current_bucket} -> {target_bucket}, "
             f"mean={node.mean_remaining_length:.0f}, p90={node.p90_remaining_length:.0f}, "
             f"tool={tool_state.to_key()}"
         )
-        logger.info(message)
-        # Training jobs commonly retain stdout but not module INFO logs.  Keep
-        # the decision in the rank log so a performance run is auditable.
-        print(message, flush=True)
 
         return CMLFQMigrationDecision(
             should_migrate=True,
@@ -590,36 +570,10 @@ class CMLFQScheduler(BaseScheduler):
                 idx = self._rr_index.get(tp_degree, 0) % len(candidates)
                 self._rr_index[tp_degree] = idx + 1
                 return candidates[idx]
-
-            # A bucket can intentionally expose several TP degrees.  Pick
-            # across the whole preference set so a ready TP4 instance cannot
-            # monopolize a mixed [4, 2] bucket while TP2 instances sit idle.
-            # Normalize active requests by TP degree: a TP4 request consumes
-            # roughly twice the parallel capacity of TP2, while ties retain
-            # the configured preference order.
-            all_candidates = []
-            for preferred_tp in tp_preferences:
-                preferred = [
-                    h for h in self._instances_by_tp.get(preferred_tp, [])
-                    if h.is_ready
-                ]
-                if self._max_queue_length > 0:
-                    preferred = [
-                        h for h in preferred
-                        if self._active_count(h, global_counts) < self._max_queue_length
-                    ]
-                all_candidates.extend(preferred)
-            if all_candidates:
-                preference_rank = {
-                    tp: rank for rank, tp in enumerate(tp_preferences)
-                }
+            else:
                 return min(
-                    all_candidates,
-                    key=lambda h: (
-                        self._active_count(h, global_counts) / max(h.tp_degree, 1),
-                        preference_rank.get(h.tp_degree, len(tp_preferences)),
-                        h.index,
-                    ),
+                    candidates,
+                    key=lambda h: self._active_count(h, global_counts),
                 )
         return None
 
@@ -773,9 +727,5 @@ class CMLFQScheduler(BaseScheduler):
             ),
             shared_load_heartbeat_s=getattr(
                 sched, "cmlfq_shared_load_heartbeat_s", 10.0
-            ),
-            initial_bucket=getattr(sched, "cmlfq_initial_bucket", "short"),
-            min_migration_remaining_tokens=getattr(
-                sched, "cmlfq_min_migration_remaining_tokens", 0
             ),
         )

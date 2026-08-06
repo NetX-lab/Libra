@@ -1,5 +1,7 @@
 """Support code for History collector."""
 
+from __future__ import annotations
+
 import json
 import os
 import time
@@ -142,7 +144,6 @@ class TrainingMetrics:
     grpo_mean_group_size: float = 0.0
     grpo_singleton_groups: int = 0
     grpo_zero_variance_groups: int = 0
-    grad_norm: float = 0.0
 
 
 @dataclass
@@ -384,7 +385,6 @@ class HistoryDataCollector:
             grpo_mean_group_size=float(stats.get("grpo_mean_group_size", 0.0)),
             grpo_singleton_groups=int(stats.get("grpo_singleton_groups", 0)),
             grpo_zero_variance_groups=int(stats.get("grpo_zero_variance_groups", 0)),
-            grad_norm=float(stats.get("grad_norm", 0.0)),
         )
 
 

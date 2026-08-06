@@ -1,5 +1,7 @@
 """Support code for Slurm utils."""
 
+from __future__ import annotations
+
 import os
 import subprocess
 from dataclasses import dataclass

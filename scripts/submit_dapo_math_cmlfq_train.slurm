@@ -8,6 +8,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH -p gpu
 #SBATCH --time=72:00:00
+#SBATCH --exclude=gn019
+
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/path/to/RL_Framework}"
@@ -41,7 +43,7 @@ JOB_ID="${SLURM_JOB_ID:-manual}"
 JOB_LOG_DIR="$PROJECT_DIR/logs/dapo_math_cmlfq/job_${JOB_ID}"
 mkdir -p "$JOB_LOG_DIR"
 
-export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
+export PYTHONPATH="$(dirname "$PROJECT_DIR"):${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_DIR="${PROJECT_DIR}/wandb_dapo_math_cmlfq"
@@ -230,7 +232,7 @@ srun --exclusive \
     bash -lc "
         source '$VENV_PATH'
         cd '$PROJECT_DIR'
-        export PYTHONPATH='$PROJECT_DIR':\${PYTHONPATH:-}
+        export PYTHONPATH='$(dirname "$PROJECT_DIR")':\${PYTHONPATH:-}
         export HETERO_INSTANCE_HOSTS='$HETERO_INSTANCE_HOSTS'
         export DAPO_MATH_ROOT='$DAPO_MATH_ROOT'
         export DAPO_MATH_SPLIT='$DAPO_MATH_SPLIT'

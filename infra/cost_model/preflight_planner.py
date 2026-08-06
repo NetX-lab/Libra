@@ -51,12 +51,10 @@ class PreflightPlanner:
         *,
         planner: GlobalResourcePlanner | None = None,
         apply_best_candidate: bool = True,
-        apply_plan: bool = True,
     ):
         self.config = copy.deepcopy(config)
         self.planner = planner or GlobalResourcePlanner.from_config(self.config)
         self.apply_best_candidate = apply_best_candidate
-        self.apply_plan = apply_plan
 
     def run(self, history: Iterable[dict[str, Any]]) -> PreflightPlannerResult:
         batch = list(history)
@@ -86,7 +84,7 @@ class PreflightPlanner:
             self.planner.reconfiguration_cost_s = original["reconfiguration_cost_s"]
             self.planner.min_gain_ratio = original["min_gain_ratio"]
 
-        applied_plan = self._select_plan(decision) if self.apply_plan else None
+        applied_plan = self._select_plan(decision)
         applied = applied_plan is not None
         if applied_plan is not None:
             self.planner.apply_plan_to_config(applied_plan, self.config)
@@ -99,7 +97,6 @@ class PreflightPlanner:
             metadata={
                 "num_history_records": len(batch),
                 "apply_best_candidate": self.apply_best_candidate,
-                "apply_plan": self.apply_plan,
             },
         )
 

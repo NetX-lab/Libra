@@ -100,34 +100,9 @@ def test_conversion_coverage_rejects_unmapped_local_parameters():
         engine._validate_conversion_coverage()
 
 
-def test_hybrid_applies_core_post_reduce_gradient_and_advances_version():
+def test_megatron_core_device_uses_configured_backend():
     engine = MegatronCoreTrainEngine.__new__(MegatronCoreTrainEngine)
-    module = torch.nn.Linear(2, 1)
-    for parameter in module.parameters():
-        parameter.main_grad = torch.zeros_like(parameter)
+    engine.device_backend = "npu"
+    engine.local_rank = 3
 
-    class Optimizer:
-        def __init__(self):
-            self.steps = 0
-
-        def step(self):
-            self.steps += 1
-            return True, torch.tensor(1.0), 0
-
-    engine.model = [module]
-    engine.optimizer = Optimizer()
-    engine.current_version = 4
-    updates = tuple(
-        torch.full_like(parameter.main_grad, 3.0)
-        for parameter in module.parameters()
-    )
-
-    engine.apply_elastic_gradient_update(updates, state_version=5)
-
-    assert engine.optimizer.steps == 1
-    assert engine.current_version == 5
-    for parameter in module.parameters():
-        assert torch.equal(
-            parameter.main_grad,
-            torch.full_like(parameter.main_grad, 3.0),
-        )
+    assert str(engine._device()) == "npu:3"

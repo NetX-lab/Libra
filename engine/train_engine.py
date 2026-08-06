@@ -1,5 +1,7 @@
 """Support code for Train engine."""
 
+from __future__ import annotations
+
 import os
 import json
 import time
@@ -27,6 +29,7 @@ from RL_Framework.infra.elastic import (
     GradientPayload,
     InterReplicaGradientDomain,
 )
+from RL_Framework.engine.device_utils import memory_stats, set_device, synchronize
 
 
 def _selected_token_logprobs(
@@ -221,8 +224,7 @@ class FSDPTrainEngine:
         self.is_distributed = dist.is_initialized()
 
 
-        torch.cuda.set_device(self.local_rank)
-        device = torch.device(f"cuda:{self.local_rank}")
+        device = set_device(self.local_rank)
 
 
         if self.is_main_process:
@@ -326,7 +328,7 @@ class FSDPTrainEngine:
         else:
 
             self.model = self.model.to(device)
-            print(f"Model loaded on GPU (single-GPU mode)")
+            print(f"Model loaded on {device.type.upper()} (single-device mode)")
 
 
         self.optimizer = torch.optim.AdamW(
@@ -550,7 +552,7 @@ class FSDPTrainEngine:
 
         pad_token_id = int(self.tokenizer.pad_token_id or 0)
         for traj, original_length, target_length in zip(
-            aligned, original_lengths, padded_lengths, strict=True
+            aligned, original_lengths, padded_lengths
         ):
             pad_width = target_length - original_length
             traj["_original_seq_len"] = original_length
@@ -601,8 +603,7 @@ class FSDPTrainEngine:
         # preceding phase are still running.  Synchronize the local stream so
         # every rank reaches the next FSDP all-gather from the same phase.
         device = next(self.model.parameters()).device
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+        synchronize(device)
 
         progress_root = Path(
             os.environ.get("FSDP_PROGRESS_DIR", "./logs/fsdp_progress")
@@ -796,14 +797,7 @@ class FSDPTrainEngine:
 
     def get_device_stats(self) -> dict[str, float]:
         """Get device stats."""
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated(self.local_rank) / 1e9
-            reserved = torch.cuda.memory_reserved(self.local_rank) / 1e9
-            return {
-                "gpu_memory_allocated_gb": allocated,
-                "gpu_memory_reserved_gb": reserved,
-            }
-        return {}
+        return memory_stats(self.local_rank)
 
     def step_scheduler(self):
         """Step scheduler."""

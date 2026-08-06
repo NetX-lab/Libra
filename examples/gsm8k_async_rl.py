@@ -11,6 +11,7 @@ from transformers import AutoTokenizer
 from datasets import load_dataset
 import wandb
 import logging
+from RL_Framework.engine.device_utils import distributed_backend, set_device
 def gsm8k_reward_fn(
     prompt: str,
     completion: str,
@@ -51,19 +52,19 @@ def main():
     if not is_distributed and world_size > 1:
 
 
-        torch.cuda.set_device(local_rank)
-        device = torch.device("cuda", local_rank)
+        device = set_device(local_rank, getattr(config, "device_backend", "auto"))
+        backend = distributed_backend(getattr(config, "distributed_backend", "auto"))
         try:
-            dist.init_process_group(backend="nccl", device_id=device)
+            dist.init_process_group(backend=backend, device_id=device)
         except TypeError:
 
-            dist.init_process_group(backend="nccl")
+            dist.init_process_group(backend=backend)
         is_distributed = True
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
-        torch.cuda.set_device(local_rank)
+        set_device(local_rank, getattr(config, "device_backend", "auto"))
 
     is_main_process = rank == 0
 

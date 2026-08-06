@@ -76,21 +76,25 @@ heterogeneous_rollout:
     - instance_id: "tp1_inst0"
       tp: 1
       gpus: [2]           # Node 0, GPU 2
+      node: 0
       description: "Node 0 TP=1 instance for short sequences"
 
     - instance_id: "tp1_inst1"
       tp: 1
       gpus: [3]           # Node 0, GPU 3
+      node: 0
       description: "Node 0 TP=1 instance for short sequences"
 
     - instance_id: "tp2_inst0"
       tp: 2
       gpus: [0, 1]        # Node 1, GPU 0,1
+      node: 1
       description: "Node 1 TP=2 instance for medium sequences"
 
     - instance_id: "tp2_inst1"
       tp: 2
       gpus: [2, 3]        # Node 1, GPU 2,3
+      node: 1
       description: "Node 1 TP=2 instance for long sequences"
 
 

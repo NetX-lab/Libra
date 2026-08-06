@@ -1,6 +1,4 @@
 # Runtime dependencies for Megatron-Core + Qwen3-MoE Bridge on PyTorch 2.7/CUDA 12.6.
-# Install with scripts/install_megatron_core.sh so Bridge can be installed with
-# --no-deps and avoid pulling an incompatible Transformer Engine stack.
 megatron-core==0.14.0
 grouped_gemm==1.1.4
 omegaconf>=2.3.0,<3.0.0

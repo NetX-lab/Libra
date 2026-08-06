@@ -30,6 +30,29 @@ rollout_gpus: 2
 
 
 
+max_turns: 5
+
+
+# mode: local | remote
+
+
+code_executor:
+  mode: "local"
+  sandbox_fusion_url: null
+  timeout: 10
+  memory_limit_mb: 1024
+  language: "python"
+
+
+reward:
+  continuous: true
+  format_weight: 0.1
+  compile_bonus: 0.0
+
+
+
+
+
 dataset_name: "livecodebench_codeforces"
 
 

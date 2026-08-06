@@ -1,0 +1,50 @@
+# Single-NPU smoke test using a real vLLM Ascend rollout server.
+# Expected vLLM endpoint: http://127.0.0.1:8000
+
+base_config: base.yaml
+
+hardware_config: hardware_config/a100_80g.yaml
+model_arch_config: model_arch_config/qwen3-4b.yaml
+
+model_path: "/data/qianzhirong/models/Qwen3-0.6B"
+tokenizer_path: "/data/qianzhirong/models/Qwen3-0.6B"
+
+device_backend: "npu"
+distributed_backend: "hccl"
+rollout_backend: "vllm"
+train_backend: "fsdp"
+
+train_gpus: 1
+rollout_gpus: 1
+tp_size: 1
+train_tp_size: 1
+train_pp_size: 1
+train_dp_size: 1
+vllm_tp_size: 1
+vllm_host: "127.0.0.1"
+vllm_port: 8000
+vllm_num_instances: 1
+
+batch_size: 1
+micro_batch_size: 1
+n_samples: 1
+total_steps: 1
+sync_interval: 0
+eval_interval: 0
+save_interval: 0
+
+max_seq_length: 512
+max_new_tokens: 8
+max_concurrent_rollouts: 1
+max_head_offpolicyness: 1
+queue_size: 8
+recompute_logprobs: true
+
+weight_sync_mode: "disk"
+rollout_weight_sync_mode: "none"
+require_rollout_weight_sync: false
+
+log_dir: "./logs/npu_vllm_smoke"
+sync_path: "./logs/npu_vllm_smoke/weights"
+wandb_project: ""
+wandb_run_name: "npu_vllm_smoke"

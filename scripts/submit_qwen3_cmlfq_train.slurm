@@ -26,6 +26,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH -p gpu
 #SBATCH --time=06:00:00
+#SBATCH --exclude=gn019
+
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/path/to/RL_Framework}"
@@ -57,7 +59,7 @@ mkdir -p logs
 JOB_LOG_DIR="$PROJECT_DIR/logs/qwen3_cmlfq_${SLURM_JOB_ID}"
 mkdir -p "$JOB_LOG_DIR"
 
-export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
+export PYTHONPATH="$(dirname "$PROJECT_DIR"):${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export NO_PROXY="localhost,127.0.0.1,${NO_PROXY:-}"
@@ -282,7 +284,7 @@ srun --exclusive \
     bash -lc "
         source '$VENV_PATH'
         cd '$PROJECT_DIR'
-        export PYTHONPATH='$PROJECT_DIR':\${PYTHONPATH:-}
+        export PYTHONPATH='$(dirname "$PROJECT_DIR")':\${PYTHONPATH:-}
         export HETERO_INSTANCE_HOSTS='$HETERO_INSTANCE_HOSTS'
         export MASTER_ADDR='$MASTER_ADDR'
         export MASTER_PORT='$MASTER_PORT'

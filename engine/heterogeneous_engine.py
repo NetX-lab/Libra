@@ -1,5 +1,7 @@
 """Support code for Heterogeneous engine."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import threading
@@ -214,6 +216,7 @@ class HeterogeneousRolloutEngine:
         n_samples: int = 1,
         epoch: int = -1,
         request_id: str = "",
+        **kwargs: Any,
     ) -> dict[str, Any]:
         """Generate."""
 
@@ -268,6 +271,7 @@ class HeterogeneousRolloutEngine:
                 temperature=temperature,
                 top_p=top_p,
                 n=n,
+                **kwargs,
             )
             output_tokens = len(gen_result.get("tokens", []))
 

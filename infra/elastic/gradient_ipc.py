@@ -6,7 +6,6 @@ import io
 import socket
 import struct
 import threading
-import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -16,7 +15,6 @@ from RL_Framework.infra.elastic.hybrid_pool import GradientPayload
 
 
 _HEADER = struct.Struct("!Q")
-_ACK = b"\x01"
 
 
 @dataclass(frozen=True)
@@ -33,122 +31,35 @@ class GradientEndpoint:
         }
 
 
-@dataclass(frozen=True)
-class GradientUpdate:
-    """Post-AllReduce gradient returned to one Hybrid replica lane."""
-
-    replica_id: str
-    tensors: tuple[torch.Tensor, ...]
-    step: int
-    state_version: int
-    membership_epoch: int
-
-
 class ElasticGradientClient:
     """Length-prefixed TCP client used by hybrid worker processes."""
 
-    def __init__(self, endpoint: GradientEndpoint, timeout: float = 300.0):
+    def __init__(self, endpoint: GradientEndpoint, timeout: float = 30.0):
         self.endpoint = endpoint
         self.timeout = timeout
 
-    def send(
-        self,
-        payload: GradientPayload,
-        *,
-        expect_update: bool = False,
-    ) -> GradientUpdate | None:
+    def send(self, payload: GradientPayload):
+        data = self._serialize(payload)
         with socket.create_connection(
             (self.endpoint.host, self.endpoint.port),
             timeout=self.timeout,
         ) as sock:
-            sock.settimeout(self.timeout)
-            metadata = self._serialize_metadata(
-                payload,
-                expect_update=expect_update,
-            )
-            sock.sendall(_HEADER.pack(len(metadata)))
-            sock.sendall(metadata)
-            for tensor in payload.tensors:
-                data = self._serialize_tensor(tensor)
-                sock.sendall(_HEADER.pack(len(data)))
-                sock.sendall(data)
-            sock.shutdown(socket.SHUT_WR)
-            if self._recv_exact(sock, 1) != _ACK:
-                raise ConnectionError("gradient receiver rejected the payload")
-            if not expect_update:
-                return None
-            return self._recv_update(sock)
+            sock.sendall(_HEADER.pack(len(data)))
+            sock.sendall(data)
 
-    def _serialize_metadata(
-        self,
-        payload: GradientPayload,
-        *,
-        expect_update: bool,
-    ) -> bytes:
+    def _serialize(self, payload: GradientPayload) -> bytes:
         buffer = io.BytesIO()
         torch.save(
             {
-                "protocol_version": 3,
                 "authkey": self.endpoint.authkey,
                 "replica_id": payload.replica_id,
                 "target_core_id": payload.target_core_id,
-                "tensor_count": len(payload.tensors),
+                "tensors": tuple(t.detach().cpu() for t in payload.tensors),
                 "zero_placeholder": payload.zero_placeholder,
-                "step": payload.step,
-                "state_version": payload.state_version,
-                "membership_epoch": payload.membership_epoch,
-                "expect_update": bool(expect_update),
             },
             buffer,
         )
         return buffer.getvalue()
-
-    def _recv_update(self, sock: socket.socket) -> GradientUpdate:
-        (metadata_length,) = _HEADER.unpack(
-            self._recv_exact(sock, _HEADER.size)
-        )
-        metadata = torch.load(
-            io.BytesIO(self._recv_exact(sock, metadata_length)),
-            map_location="cpu",
-            weights_only=False,
-        )
-        tensors = []
-        for _ in range(int(metadata["tensor_count"])):
-            (tensor_length,) = _HEADER.unpack(
-                self._recv_exact(sock, _HEADER.size)
-            )
-            tensors.append(
-                torch.load(
-                    io.BytesIO(self._recv_exact(sock, tensor_length)),
-                    map_location="cpu",
-                    weights_only=False,
-                )
-            )
-        return GradientUpdate(
-            replica_id=str(metadata["replica_id"]),
-            tensors=tuple(tensors),
-            step=int(metadata["step"]),
-            state_version=int(metadata["state_version"]),
-            membership_epoch=int(metadata["membership_epoch"]),
-        )
-
-    @staticmethod
-    def _serialize_tensor(tensor: torch.Tensor) -> bytes:
-        buffer = io.BytesIO()
-        torch.save(tensor.detach().cpu(), buffer)
-        return buffer.getvalue()
-
-    @staticmethod
-    def _recv_exact(sock: socket.socket, n_bytes: int) -> bytes:
-        data = bytearray(n_bytes)
-        view = memoryview(data)
-        received = 0
-        while received < n_bytes:
-            count = sock.recv_into(view[received:])
-            if count == 0:
-                raise ConnectionError("socket closed before acknowledgement")
-            received += count
-        return bytes(data)
 
 
 class ElasticGradientServer:
@@ -161,21 +72,15 @@ class ElasticGradientServer:
         port: int = 0,
         authkey: str = "",
         on_payload: Callable[[GradientPayload], None],
-        update_timeout: float = 300.0,
     ):
         self.host = host
         self.port = int(port)
         self.authkey = authkey
         self.on_payload = on_payload
-        self.update_timeout = float(update_timeout)
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._received = 0
-        self._handlers: set[threading.Thread] = set()
-        self._handler_lock = threading.Lock()
-        self._update_condition = threading.Condition()
-        self._updates: dict[tuple[str, int, int], GradientUpdate] = {}
 
     @property
     def endpoint(self) -> GradientEndpoint:
@@ -208,8 +113,6 @@ class ElasticGradientServer:
 
     def close(self):
         self._stop.set()
-        with self._update_condition:
-            self._update_condition.notify_all()
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -217,10 +120,6 @@ class ElasticGradientServer:
                 pass
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-        with self._handler_lock:
-            handlers = list(self._handlers)
-        for handler in handlers:
-            handler.join(timeout=2.0)
         self._sock = None
         self._thread = None
 
@@ -233,126 +132,36 @@ class ElasticGradientServer:
                 continue
             except OSError:
                 break
-            handler = threading.Thread(
-                target=self._handle_connection,
-                args=(conn,),
-                name="elastic-gradient-connection",
-                daemon=True,
-            )
-            with self._handler_lock:
-                self._handlers.add(handler)
-            handler.start()
-
-    def _handle_connection(self, conn: socket.socket) -> None:
-        try:
             with conn:
                 try:
-                    payload, expect_update = self._recv_payload(conn)
+                    payload = self._recv_payload(conn)
                     self.on_payload(payload)
                     self._received += 1
-                    update = None
-                    if expect_update:
-                        update = self._wait_for_update(payload)
-                    conn.sendall(_ACK)
-                    if update is not None:
-                        self._send_update(conn, update)
                 except Exception:
-                    try:
-                        conn.sendall(b"\x00")
-                    except OSError:
-                        pass
-        finally:
-            current = threading.current_thread()
-            with self._handler_lock:
-                self._handlers.discard(current)
+                    continue
 
-    def publish_update(self, update: GradientUpdate) -> None:
-        """Make one post-AllReduce update available to a waiting Hybrid lane."""
-        key = (update.replica_id, int(update.step), int(update.membership_epoch))
-        with self._update_condition:
-            self._updates[key] = update
-            self._update_condition.notify_all()
-
-    def _wait_for_update(self, payload: GradientPayload) -> GradientUpdate:
-        key = (payload.replica_id, int(payload.step), int(payload.membership_epoch))
-        deadline = time.monotonic() + max(self.update_timeout, 0.0)
-        with self._update_condition:
-            while key not in self._updates and not self._stop.is_set():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        "timed out waiting for post-AllReduce Hybrid update: "
-                        f"replica={payload.replica_id}, step={payload.step}"
-                    )
-                self._update_condition.wait(timeout=min(remaining, 0.5))
-            if self._stop.is_set() and key not in self._updates:
-                raise RuntimeError("gradient server closed before update was published")
-            return self._updates.pop(key)
-
-    @staticmethod
-    def _send_update(conn: socket.socket, update: GradientUpdate) -> None:
-        metadata_buffer = io.BytesIO()
-        torch.save(
-            {
-                "replica_id": update.replica_id,
-                "tensor_count": len(update.tensors),
-                "step": int(update.step),
-                "state_version": int(update.state_version),
-                "membership_epoch": int(update.membership_epoch),
-            },
-            metadata_buffer,
-        )
-        metadata = metadata_buffer.getvalue()
-        conn.sendall(_HEADER.pack(len(metadata)))
-        conn.sendall(metadata)
-        for tensor in update.tensors:
-            data = ElasticGradientClient._serialize_tensor(tensor)
-            conn.sendall(_HEADER.pack(len(data)))
-            conn.sendall(data)
-
-    def _recv_payload(
-        self,
-        conn: socket.socket,
-    ) -> tuple[GradientPayload, bool]:
+    def _recv_payload(self, conn: socket.socket) -> GradientPayload:
         header = self._recv_exact(conn, _HEADER.size)
         (length,) = _HEADER.unpack(header)
         raw = self._recv_exact(conn, length)
         data = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=False)
         if self.authkey and data.get("authkey") != self.authkey:
             raise PermissionError("invalid elastic gradient authkey")
-        if int(data.get("protocol_version", 0)) not in {2, 3}:
-            raise ValueError("unsupported elastic gradient protocol")
-        tensors = []
-        for _ in range(int(data["tensor_count"])):
-            tensor_header = self._recv_exact(conn, _HEADER.size)
-            (tensor_length,) = _HEADER.unpack(tensor_header)
-            tensor_raw = self._recv_exact(conn, tensor_length)
-            tensors.append(
-                torch.load(
-                    io.BytesIO(tensor_raw),
-                    map_location="cpu",
-                    weights_only=False,
-                )
-            )
-        payload = GradientPayload(
+        return GradientPayload(
             replica_id=str(data["replica_id"]),
             target_core_id=str(data["target_core_id"]),
-            tensors=tuple(tensors),
+            tensors=tuple(data["tensors"]),
             zero_placeholder=bool(data.get("zero_placeholder", False)),
-            step=int(data.get("step", -1)),
-            state_version=int(data.get("state_version", -1)),
-            membership_epoch=int(data.get("membership_epoch", 0)),
         )
-        return payload, bool(data.get("expect_update", False))
 
     @staticmethod
     def _recv_exact(conn: socket.socket, n_bytes: int) -> bytes:
-        data = bytearray(n_bytes)
-        view = memoryview(data)
-        received = 0
-        while received < n_bytes:
-            count = conn.recv_into(view[received:])
-            if count == 0:
+        chunks = []
+        remaining = n_bytes
+        while remaining > 0:
+            chunk = conn.recv(remaining)
+            if not chunk:
                 raise ConnectionError("socket closed before payload completed")
-            received += count
-        return bytes(data)
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)

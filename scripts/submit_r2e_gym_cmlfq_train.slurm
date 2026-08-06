@@ -8,6 +8,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH -p gpu
 #SBATCH --time=24:00:00
+#SBATCH --exclude=gn019
+
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/path/to/RL_Framework}"
@@ -35,7 +37,7 @@ JOB_ID="${SLURM_JOB_ID:-manual}"
 JOB_LOG_DIR="$PROJECT_DIR/logs/r2e_gym_cmlfq/job_${JOB_ID}"
 mkdir -p "$JOB_LOG_DIR"
 
-export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
+export PYTHONPATH="$(dirname "$PROJECT_DIR"):${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_DIR="${PROJECT_DIR}/wandb_r2e_gym_cmlfq"
@@ -218,7 +220,7 @@ srun --exclusive \
     bash -lc "
         source '$VENV_PATH'
         cd '$PROJECT_DIR'
-        export PYTHONPATH='$PROJECT_DIR':\${PYTHONPATH:-}
+        export PYTHONPATH='$(dirname "$PROJECT_DIR")':\${PYTHONPATH:-}
         export HETERO_INSTANCE_HOSTS='$HETERO_INSTANCE_HOSTS'
         export R2E_GYM_INDEX='$R2E_GYM_INDEX'
         export R2E_MAX_TURNS='$R2E_MAX_TURNS'

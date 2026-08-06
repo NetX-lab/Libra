@@ -1,10 +1,12 @@
-# Libra runtime dependencies
+# Heterogeneous TP Configuration Testing Framework Dependencies
 
 # Core ML/DL frameworks
 # Qwen3-30B-A3B is a MoE model. vLLM 0.9.0 has a known broken
 # MoE custom-op path for this model (`_moe_C.topk_softmax` missing).
-# Public installation uses a compatible wheel when one is available. Clusters
-# that need a local source build should follow docs/env_creation.md.
+# On the current HPC image, prebuilt vLLM wheels for 0.9.2 require
+# GLIBC_2.29 for `vllm/_moe_C.abi3.so`; build vLLM locally so the MoE
+# extension links against the cluster runtime instead of the wheel runtime.
+--no-binary=vllm
 vllm==0.9.2
 torch==2.7.0
 torchaudio==2.7.0
@@ -23,7 +25,6 @@ cmake==3.26.4
 
 # Dataset handling
 datasets>=2.18.0,<3.0.0
-pyarrow>=15.0.0
 
 # GPU monitoring
 pynvml>=11.5.0
@@ -61,6 +62,6 @@ colorlog>=6.8.0
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
 latex2sympy2
-word2number>=1.1
+# word2number
 wandb
 sympy

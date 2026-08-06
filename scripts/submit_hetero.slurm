@@ -44,7 +44,7 @@ echo "CUDA devices: $(python3 -c 'import torch; print(torch.cuda.device_count(),
 PROJECT_DIR="/path/to/RL_Framework"
 cd "$PROJECT_DIR"
 
-export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
+export PYTHONPATH="/path/to/user:${PYTHONPATH}"
 export NO_PROXY="localhost,127.0.0.1"
 
 

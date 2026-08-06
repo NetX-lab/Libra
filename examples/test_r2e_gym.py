@@ -28,22 +28,36 @@ EXPECTED_REPOS = {
 
 def main():
     shards = sorted(DATASET_DIR.glob("train-*-of-00013.parquet"))
-    assert len(shards) == 13, f"Expected 13 R2E-Gym shards, got {len(shards)}"
-
     counts = Counter()
     rows = 0
-    for shard in shards:
-        table = pq.read_table(
-            shard,
-            columns=[
-                "repo_name",
-                "docker_image",
-                "prompt",
-                "problem_statement",
-                "expected_output_json",
-            ],
+
+    if shards:
+        assert len(shards) == 13, f"Expected 13 R2E-Gym shards, got {len(shards)}"
+        row_iterables = []
+        for shard in shards:
+            table = pq.read_table(
+                shard,
+                columns=[
+                    "repo_name",
+                    "docker_image",
+                    "prompt",
+                    "problem_statement",
+                    "expected_output_json",
+                ],
+            )
+            row_iterables.append(table.to_pylist())
+    else:
+        index_path = DATASET_DIR / "index.jsonl"
+        assert index_path.exists(), (
+            "Expected R2E-Gym parquet shards or prepared index, "
+            f"found neither in {DATASET_DIR}"
         )
-        for row in table.to_pylist():
+        row_iterables = [
+            [json.loads(line) for line in index_path.read_text(encoding="utf-8").splitlines()]
+        ]
+
+    for row_iterable in row_iterables:
+        for row in row_iterable:
             problem_statement = row["problem_statement"] or ""
             prompt = row["prompt"] or ""
             assert problem_statement.strip() or prompt.strip()

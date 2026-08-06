@@ -15,8 +15,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import torch
-
 from RL_Framework.config import AsyncRLConfig
 from RL_Framework.infra.cost_model.global_resource_planner import (
     GlobalResourcePlan,
@@ -54,7 +52,6 @@ class ManagedHybridWorkerProcess:
     snapshot_path: str
     host: str = ""
     gpus: list[int] = field(default_factory=list)
-    log_path: str = ""
 
 
 @dataclass
@@ -102,26 +99,6 @@ class RuntimeElasticExecutor:
         "TORCHELASTIC_RUN_ID",
         "TORCHELASTIC_USE_AGENT_STORE",
     )
-    _SLURM_NESTED_STEP_ENV_KEYS = (
-        "SLURM_STEP_ID",
-        "SLURM_STEPID",
-        "SLURM_STEP_NODELIST",
-        "SLURM_STEP_NUM_NODES",
-        "SLURM_STEP_NUM_TASKS",
-        "SLURM_STEP_TASKS_PER_NODE",
-        "SLURM_STEP_GPUS",
-        "SLURM_STEP_GRES",
-        "SLURM_STEP_LAUNCHER_PORT",
-        "SLURM_STEP_RESV_PORTS",
-        "SLURM_SRUN_COMM_HOST",
-        "SLURM_SRUN_COMM_PORT",
-        "SLURM_GTIDS",
-        "SLURM_LOCALID",
-        "SLURM_NODEID",
-        "SLURM_PROCID",
-        "SLURM_NTASKS",
-        "SLURM_TASKS_PER_NODE",
-    )
 
     def __init__(
         self,
@@ -156,29 +133,16 @@ class RuntimeElasticExecutor:
         plan = decision.candidate_plan
         result = RuntimeReconfigurationResult(applied=False, reason=decision.reason)
         planner_cfg = self.config.global_resource_planner
+        rollout_runtime_enabled = bool(
+            getattr(planner_cfg, "apply_to_runtime", True)
+            or getattr(planner_cfg, "runtime_manage_rollout_processes", False)
+        )
         if not getattr(planner_cfg, "runtime_dynamic_reconfiguration_enabled", True):
             return RuntimeReconfigurationResult(
                 applied=False,
                 reason="runtime_dynamic_reconfiguration_disabled",
             )
-        core_train_gpus = int(self.config.train_gpus)
-        current_train_gpus = self._current_effective_train_gpus(core_train_gpus)
-        if self._requires_supervised_training_handoff(
-            core_train_gpus,
-            plan,
-        ):
-            handoff_path = self._request_training_handoff(
-                plan,
-                core_train_gpus,
-            )
-            return RuntimeReconfigurationResult(
-                applied=True,
-                reason="training_handoff_requested",
-                actions=[
-                    "training_handoff_requested",
-                    f"training_handoff_request:{handoff_path}",
-                ],
-            )
+        current_train_gpus = int(self.config.train_gpus)
         strategy = getattr(
             planner_cfg,
             "runtime_rollout_reconfigure_strategy",
@@ -356,9 +320,20 @@ class RuntimeElasticExecutor:
                         self._reconfigure_training_pool(current_train_gpus, plan, result)
                     )
 
-            if not prewarmed_rollout and not config_applied:
+            if (
+                not prewarmed_rollout
+                and not config_applied
+                and rollout_runtime_enabled
+            ):
                 self._apply_plan_to_runtime_config(plan)
                 result.actions.append("apply_config")
+            elif not prewarmed_rollout and not config_applied:
+                # The planner decision may still drive the Elastic Hybrid Pool,
+                # but externally managed rollout endpoints must remain exactly
+                # as launched.  Mutating the config here makes the trainer
+                # rebind to planned-yet-nonexistent ports even though
+                # apply_to_runtime is explicitly disabled.
+                result.actions.append("preserve_external_rollout_config")
 
             self._write_rollout_manifest(plan, phase="planned")
             if not coordinated_peers:
@@ -417,114 +392,6 @@ class RuntimeElasticExecutor:
                 self.dispatcher.resume()
                 result.actions.append("dispatcher_resume")
 
-    def _requires_supervised_training_handoff(
-        self,
-        current_train_gpus: int,
-        plan: GlobalResourcePlan,
-    ) -> bool:
-        """Return whether a live Megatron topology change needs parent supervision."""
-
-        cfg = self.config.global_resource_planner
-        if not getattr(cfg, "runtime_reconfigure_training", False):
-            return False
-        target = int(
-            getattr(cfg, "runtime_training_pool_target_gpus", 0)
-            or int(plan.train_gpus)
-        )
-        if target == int(current_train_gpus):
-            return False
-        mode = str(
-            getattr(cfg, "runtime_training_resize_mode", "hybrid_nonblocking")
-        ).lower()
-        replica_gpus = self._hybrid_replica_gpus()
-        can_use_hybrid = (
-            mode == "hybrid_nonblocking"
-            and target >= int(current_train_gpus)
-            and (target - int(current_train_gpus)) % replica_gpus == 0
-        )
-        if can_use_hybrid:
-            return False
-        return bool(getattr(cfg, "runtime_training_handoff_enabled", False))
-
-    def _hybrid_replica_gpus(self) -> int:
-        configured = int(
-            getattr(
-                self.config.global_resource_planner,
-                "hybrid_replica_gpus",
-                0,
-            )
-            or 0
-        )
-        if configured > 0:
-            return configured
-        return max(
-            1,
-            int(getattr(self.config, "train_tp_size", 1) or 1)
-            * int(getattr(self.config, "train_pp_size", 1) or 1)
-            * int(getattr(self.config, "train_cp_size", 1) or 1),
-        )
-
-    def _current_effective_train_gpus(self, core_train_gpus: int) -> int:
-        if self.elastic_pool is None:
-            configured = int(
-                getattr(
-                    self.config.global_resource_planner,
-                    "runtime_effective_train_gpus",
-                    0,
-                )
-                or 0
-            )
-            return configured or int(core_train_gpus)
-        snapshot = self.elastic_pool.snapshot()
-        elastic_replicas = sum(
-            1
-            for worker in snapshot.values()
-            if self._role_name(worker.role) in {"hybrid_training", "hybrid_joining"}
-        )
-        return int(core_train_gpus) + elastic_replicas * self._hybrid_replica_gpus()
-
-    def _training_handoff_dir(self) -> Path:
-        configured = str(
-            getattr(
-                self.config.global_resource_planner,
-                "runtime_training_handoff_dir",
-                "",
-            )
-            or ""
-        )
-        if configured:
-            return Path(configured)
-        return self._coordination_dir() / "training_handoff"
-
-    def _request_training_handoff(
-        self,
-        plan: GlobalResourcePlan,
-        current_train_gpus: int,
-    ) -> Path:
-        """Publish a checkpoint-and-restart request for the Slurm supervisor."""
-
-        directory = self._training_handoff_dir()
-        directory.mkdir(parents=True, exist_ok=True)
-        request_path = directory / "request.json"
-        payload = {
-            "job_id": os.environ.get("SLURM_JOB_ID", os.environ.get("JOB_ID", "")),
-            "requested_at": time.time(),
-            "current_train_gpus": int(current_train_gpus),
-            "target_train_gpus": int(plan.train_gpus),
-            "resume_step": None,
-            "plan": plan.to_dict(),
-        }
-        tmp_path = request_path.with_suffix(".json.tmp")
-        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        tmp_path.replace(request_path)
-        print(
-            "[RuntimeElasticExecutor] training_handoff_requested "
-            f"path={request_path} current_train_gpus={current_train_gpus} "
-            f"target_train_gpus={plan.train_gpus}",
-            flush=True,
-        )
-        return request_path
-
     def _reconfigure_training_pool(
         self,
         current_train_gpus: int,
@@ -543,30 +410,21 @@ class RuntimeElasticExecutor:
             )
             or int(plan.train_gpus)
         )
-        core_train_gpus = int(self.config.train_gpus)
-        current_train_gpus = self._current_effective_train_gpus(core_train_gpus)
-        if target_train_gpus < core_train_gpus:
-            raise ValueError(
-                "non-blocking elasticity cannot remove immutable core ranks: "
-                f"target={target_train_gpus}, core={core_train_gpus}"
-            )
-        replica_gpus = self._hybrid_replica_gpus()
-        delta = target_train_gpus - current_train_gpus
-        if delta % replica_gpus != 0:
-            raise ValueError(
-                "training target must change by complete model-parallel replicas: "
-                f"delta_gpus={delta}, replica_gpus={replica_gpus}"
-            )
-        replica_delta = delta // replica_gpus
-        core_ids, target_core, candidates = self._training_reconfiguration_targets(
+        _core_ids, target_core, candidates = self._training_reconfiguration_targets(
             current_train_gpus,
             plan,
         )
         snapshot = self.elastic_pool.snapshot()
+        active_hybrid_training = sum(
+            1
+            for worker in snapshot.values()
+            if self._role_name(worker.role) in {"hybrid_training", "hybrid_joining"}
+        )
+        effective_train_gpus = current_train_gpus + active_hybrid_training
+        delta = target_train_gpus - effective_train_gpus
 
-        if replica_delta > 0:
-            for index, worker_id in enumerate(candidates[:replica_delta]):
-                target_core = core_ids[index % len(core_ids)] if core_ids else target_core
+        if delta > 0:
+            for worker_id in candidates[:delta]:
                 handle = self.elastic_pool.join_training(worker_id, target_core)
                 if self._adopt_prewarmed_hybrid_worker(
                     worker_id=worker_id,
@@ -579,10 +437,7 @@ class RuntimeElasticExecutor:
                     )
                 elif self._cluster_swap_enabled():
                     actions.append(f"cluster_swap_training_slot_ready:{worker_id}")
-                elif (
-                    self._hybrid_worker_launch_enabled
-                    and getattr(self.elastic_pool, "join_preparer", None) is None
-                ):
+                elif self._hybrid_worker_launch_enabled:
                     thread = threading.Thread(
                         target=self._launch_hybrid_worker_after_join,
                         args=(handle, result),
@@ -592,21 +447,20 @@ class RuntimeElasticExecutor:
                     thread.start()
                     self._hybrid_launch_threads.append(thread)
                 actions.append(f"join_training:{worker_id}->{target_core}")
-        elif replica_delta < 0:
+        elif delta < 0:
             candidates = [
                 wid for wid, worker in snapshot.items()
                 if self._role_name(worker.role) in {"hybrid_training", "hybrid_joining"}
             ]
-            for worker_id in candidates[: abs(replica_delta)]:
+            for worker_id in candidates[: abs(delta)]:
                 self.elastic_pool.release_to_rollout(worker_id)
                 self._stop_hybrid_worker_process(worker_id, result)
                 actions.append(f"release_to_rollout:{worker_id}")
         else:
-            actions.append(f"training_gpus_unchanged:{target_train_gpus}")
-
-        self.config.global_resource_planner.runtime_effective_train_gpus = (
-            target_train_gpus
-        )
+            actions.append(
+                f"training_gpus_unchanged:{target_train_gpus}:"
+                f"active_hybrids={active_hybrid_training}"
+            )
 
         return actions
 
@@ -736,8 +590,6 @@ class RuntimeElasticExecutor:
             or int(plan.train_gpus)
         )
         delta = max(0, target_train_gpus - current_train_gpus)
-        replica_gpus = self._hybrid_replica_gpus()
-        replica_delta = delta // replica_gpus
         if delta <= 0 or not stopped_rollout:
             self._cluster_swap_training_slots = {}
             return {}
@@ -751,25 +603,15 @@ class RuntimeElasticExecutor:
             for meta in self._desired_rollout_processes(plan)
             for gpu in meta.gpus
         }
-        free_by_host: dict[str, list[int]] = {}
+        slots: list[dict[str, Any]] = []
         for meta in stopped_rollout:
             for gpu in meta.gpus:
                 if (meta.host, int(gpu)) in desired_rollout_slots:
                     continue
-                free_by_host.setdefault(meta.host, []).append(int(gpu))
-
-        slots: list[dict[str, Any]] = []
-        for host, gpu_ids in free_by_host.items():
-            gpu_ids.sort()
-            while len(gpu_ids) >= replica_gpus:
-                slots.append({"host": host, "gpus": gpu_ids[:replica_gpus]})
-                del gpu_ids[:replica_gpus]
+                slots.append({"host": meta.host, "gpus": [int(gpu)]})
 
         assigned: dict[str, dict[str, Any]] = {}
-        for worker_id, slot in zip(
-            candidates[:replica_delta],
-            slots[:replica_delta],
-        ):
+        for worker_id, slot in zip(candidates[:delta], slots[:delta]):
             assigned[str(worker_id)] = slot
         self._cluster_swap_training_slots = assigned
         return assigned
@@ -867,19 +709,9 @@ class RuntimeElasticExecutor:
         """Apply rollout changes while preserving fixed Megatron topology if requested."""
 
         planner_cfg = self.config.global_resource_planner
-        resize_mode = str(
-            getattr(
-                planner_cfg,
-                "runtime_training_resize_mode",
-                "hybrid_nonblocking",
-            )
-        ).lower()
         preserve_training = bool(
-            getattr(planner_cfg, "runtime_reconfigure_training", False)
-            and (
-                getattr(planner_cfg, "runtime_training_pool_only", True)
-                or resize_mode == "hybrid_nonblocking"
-            )
+            getattr(planner_cfg, "runtime_training_pool_only", True)
+            and getattr(planner_cfg, "runtime_reconfigure_training", False)
         )
         if not preserve_training:
             self.planner.apply_plan_to_config(plan, self.config)
@@ -1158,10 +990,6 @@ class RuntimeElasticExecutor:
         if self.elastic_pool is not None:
             self._ensure_gradient_server()
             self._attach_train_engine_gradient_domain()
-            if hasattr(self.train_engine, "set_elastic_step_callback"):
-                self.train_engine.set_elastic_step_callback(
-                    self.elastic_pool.advance_training_boundary
-                )
             return
         if self.train_engine is None:
             return
@@ -1203,11 +1031,7 @@ class RuntimeElasticExecutor:
         core_group = None
         if not decoupled and hasattr(self.train_engine, "get_elastic_core_process_group"):
             core_group = self.train_engine.get_elastic_core_process_group()
-        gradient_domain = getattr(
-            self.train_engine,
-            "elastic_gradient_domain",
-            None,
-        ) or InterReplicaGradientDomain(
+        gradient_domain = InterReplicaGradientDomain(
             core_replica_ids=core_ids,
             communication_domains=GradientCommunicationDomains(
                 core_process_group=core_group,
@@ -1222,25 +1046,7 @@ class RuntimeElasticExecutor:
             core_rollout_workers=rollout_workers,
             gradient_domain=gradient_domain,
             snapshot_fetcher=fetch_snapshot,
-            zero_sync_steps=int(
-                getattr(
-                    self.config.global_resource_planner,
-                    "hybrid_zero_sync_steps",
-                    1,
-                )
-            ),
-            require_training_boundary=True,
-            join_preparer=(
-                self._prepare_hybrid_worker
-                if self._hybrid_worker_launch_enabled
-                else None
-            ),
-            state_aligner=(
-                self._align_hybrid_worker_state
-                if self._hybrid_worker_launch_enabled
-                else None
-            ),
-            state_listener=self._write_hybrid_membership_state,
+            zero_sync_steps=1,
         )
         print(
             "[RuntimeElasticExecutor] elastic_gradient_domain "
@@ -1248,179 +1054,6 @@ class RuntimeElasticExecutor:
             flush=True,
         )
         self._attach_train_engine_gradient_domain()
-        if hasattr(self.train_engine, "set_elastic_step_callback"):
-            self.train_engine.set_elastic_step_callback(
-                self.elastic_pool.advance_training_boundary
-            )
-
-    def _hybrid_membership_dir(self) -> Path:
-        return Path(
-            getattr(
-                self.config.global_resource_planner,
-                "hybrid_worker_task_dir",
-                "./logs/elastic_training_tasks",
-            )
-        ) / "membership"
-
-    def _hybrid_bootstrap_lease_path(self, worker_id: str) -> Path:
-        """Return the lease that protects a snapshot during worker bootstrap."""
-        return (
-            Path(self.config.global_resource_planner.hybrid_worker_task_dir)
-            / "bootstrap_leases"
-            / f"{worker_id}.json"
-        )
-
-    def _write_hybrid_bootstrap_lease(self, worker_id: str, version: int) -> None:
-        path = self._hybrid_bootstrap_lease_path(worker_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(
-                {
-                    "worker_id": str(worker_id),
-                    "snapshot_version": int(version),
-                    "created_at": time.time(),
-                },
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
-        tmp.replace(path)
-
-    def _release_hybrid_bootstrap_lease(self, worker_id: str) -> None:
-        self._hybrid_bootstrap_lease_path(worker_id).unlink(missing_ok=True)
-
-    def _write_hybrid_membership_state(self, worker: Any) -> None:
-        directory = self._hybrid_membership_dir()
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{worker.worker_id}.json"
-        payload = {
-            "worker_id": str(worker.worker_id),
-            "role": self._role_name(worker.role),
-            "target_core_id": str(worker.target_core_id or ""),
-            "join_state": self._role_name(worker.join_state),
-            "state_version": int(worker.state_version),
-            "membership_epoch": int(worker.membership_epoch),
-            "activate_after_step": worker.activate_after_step,
-            "last_error": str(getattr(worker, "last_error", "")),
-            "updated_at": float(worker.last_transition_ts),
-        }
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-        tmp.replace(path)
-
-    def _prepare_hybrid_worker(
-        self,
-        worker_id: str,
-        target_core_id: str,
-        version: int,
-    ) -> None:
-        """Launch and validate a joining replica while core ranks keep stepping."""
-        if self._is_hybrid_worker_running(worker_id):
-            return
-        task_dir = Path(
-            self.config.global_resource_planner.hybrid_worker_task_dir
-        )
-        (task_dir / f"{worker_id}.ready").unlink(missing_ok=True)
-        # Membership state tracks the latest boundary for final alignment.  The
-        # worker still needs this immutable bootstrap snapshot until it reports
-        # ready, so protect it from the asynchronous checkpoint reaper.
-        self._write_hybrid_bootstrap_lease(worker_id, version)
-        slot = self._cluster_swap_training_slot(worker_id)
-        command = self._build_hybrid_worker_command(
-            worker_id=worker_id,
-            target_core_id=target_core_id,
-            snapshot_path=self._snapshot_path_for_version(version),
-            host=str(slot.get("host", "")),
-            gpus=[int(gpu) for gpu in slot.get("gpus", [])],
-        )
-        meta = self._launch_prewarmed_hybrid_worker(
-            worker_id=worker_id,
-            target_core_id=target_core_id,
-            command=command,
-            snapshot_path=self._snapshot_path_for_version(version),
-        )
-        meta.host = str(slot.get("host", ""))
-        meta.gpus = [int(gpu) for gpu in slot.get("gpus", [])]
-        try:
-            self._wait_hybrid_worker_ready(worker_id)
-        finally:
-            self._release_hybrid_bootstrap_lease(worker_id)
-
-    def _align_hybrid_worker_state(
-        self,
-        worker_id: str,
-        target_core_id: str,
-        version: int,
-        membership_epoch: int,
-    ) -> None:
-        """Reload the post-zero-sync state before making a replica active."""
-        del target_core_id
-        cfg = self.config.global_resource_planner
-        timeout = float(getattr(cfg, "hybrid_state_alignment_timeout_s", 300.0))
-        snapshot_path = Path(self._snapshot_path_for_version(version))
-        deadline = time.time() + max(timeout, 0.0)
-        while not snapshot_path.exists() and time.time() < deadline:
-            time.sleep(0.1)
-        if not snapshot_path.exists():
-            raise TimeoutError(
-                f"elastic snapshot v{version} was not completed before alignment"
-            )
-        task_dir = Path(cfg.hybrid_worker_task_dir)
-        task_dir.mkdir(parents=True, exist_ok=True)
-        task_path = task_dir / f"{worker_id}.align_v{version}.pt"
-        done_path = task_path.with_suffix(task_path.suffix + ".done")
-        tmp_path = task_path.with_suffix(task_path.suffix + ".tmp")
-        torch.save(
-            {
-                "reload_snapshot": str(snapshot_path),
-                "state_version": int(version),
-                "membership_epoch": int(membership_epoch),
-            },
-            tmp_path,
-        )
-        tmp_path.replace(task_path)
-        while not done_path.exists() and time.time() < deadline:
-            proc = self._hybrid_worker_processes.get(worker_id)
-            if proc is not None and proc.poll() is not None:
-                raise RuntimeError(
-                    f"hybrid worker {worker_id} exited during state alignment"
-                )
-            time.sleep(0.1)
-        if not done_path.exists():
-            raise TimeoutError(
-                f"hybrid worker {worker_id} did not align state v{version}"
-            )
-
-    def dispatch_hybrid_training_batch(
-        self,
-        *,
-        worker_id: str,
-        trajectories: list[dict[str, Any]],
-        step: int,
-    ) -> Path:
-        """Publish a step-tagged batch to one active external replica."""
-        if self.elastic_pool is None:
-            raise RuntimeError("elastic pool is not initialized")
-        worker = self.elastic_pool.snapshot()[worker_id]
-        if self._role_name(worker.role) != "hybrid_training":
-            raise RuntimeError(f"hybrid worker {worker_id} is not active")
-        task_dir = Path(self.config.global_resource_planner.hybrid_worker_task_dir)
-        task_dir.mkdir(parents=True, exist_ok=True)
-        task_path = task_dir / f"{worker_id}.step_{step}.pt"
-        tmp_path = task_path.with_suffix(task_path.suffix + ".tmp")
-        torch.save(
-            {
-                "trajectories": trajectories,
-                "step": int(step),
-                "state_version": int(step),
-                "membership_epoch": int(worker.membership_epoch),
-                "snapshot_path": self._snapshot_path_for_version(int(step)),
-            },
-            tmp_path,
-        )
-        tmp_path.replace(task_path)
-        return task_path
 
     @property
     def _hybrid_worker_launch_enabled(self) -> bool:
@@ -1535,31 +1168,14 @@ class RuntimeElasticExecutor:
         command: str,
         snapshot_path: str,
     ) -> ManagedHybridWorkerProcess:
-        env = self._allocation_launch_env("hybrid_training")
-        task_dir = Path(
-            getattr(
-                self.config.global_resource_planner,
-                "hybrid_worker_task_dir",
-                "./logs/elastic_training_tasks",
-            )
-        )
-        task_dir.mkdir(parents=True, exist_ok=True)
-        log_path = task_dir / f"{worker_id}.launch.log"
-        with log_path.open("a", encoding="utf-8") as log_handle:
-            proc = subprocess.Popen(
-                command,
-                shell=True,
-                env=env,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-            )
+        env = os.environ.copy()
+        proc = subprocess.Popen(command, shell=True, env=env)
         meta = ManagedHybridWorkerProcess(
             worker_id=worker_id,
             target_core_id=target_core_id,
             command=command,
             pid=proc.pid,
             snapshot_path=snapshot_path,
-            log_path=str(log_path),
         )
         self._hybrid_worker_processes[worker_id] = proc
         self._hybrid_worker_meta[worker_id] = meta
@@ -1577,23 +1193,21 @@ class RuntimeElasticExecutor:
             return False
         if not self._is_hybrid_worker_running(worker_id):
             return False
-        # Joining completes on a future core training boundary. Adoption must
-        # not wait for that boundary on the rank executing the planner.
-        del handle
+        worker = handle.result(timeout=None)
         meta = self._hybrid_worker_meta.get(worker_id)
         if meta is None:
-            version = int(getattr(self.train_engine, "current_version", 0) or 0)
             meta = ManagedHybridWorkerProcess(
                 worker_id=worker_id,
                 target_core_id=target_core_id,
                 command="prewarmed_external_worker",
                 pid=-1,
-                snapshot_path=self._snapshot_path_for_version(version),
+                snapshot_path=self._snapshot_path_for_version(worker.state_version),
                 host=str(self._cluster_swap_training_slot(worker_id).get("host", "")),
                 gpus=list(self._cluster_swap_training_slot(worker_id).get("gpus", [])),
             )
         else:
             meta.target_core_id = target_core_id
+            meta.snapshot_path = self._snapshot_path_for_version(worker.state_version)
         self._hybrid_worker_meta[worker_id] = meta
         result.started_hybrid_workers.append(meta)
         return True
@@ -1685,7 +1299,7 @@ class RuntimeElasticExecutor:
                 host=str(slot.get("host", "")),
                 gpus=[int(gpu) for gpu in slot.get("gpus", [])],
             )
-            env = self._allocation_launch_env("hybrid_training")
+            env = os.environ.copy()
             proc = subprocess.Popen(command, shell=True, env=env)
             meta = ManagedHybridWorkerProcess(
                 worker_id=worker.worker_id,
@@ -1728,12 +1342,10 @@ class RuntimeElasticExecutor:
             if ready_path.exists():
                 return
             if proc is not None and proc.poll() is not None:
-                self._release_hybrid_bootstrap_lease(worker_id)
                 raise RuntimeError(
                     f"hybrid worker {worker_id} exited before ready"
                 )
             time.sleep(0.2)
-        self._release_hybrid_bootstrap_lease(worker_id)
         raise TimeoutError(
             f"hybrid worker {worker_id} did not become ready after {timeout:.0f}s"
         )
@@ -1767,18 +1379,7 @@ class RuntimeElasticExecutor:
         rl_root = Path(__file__).resolve().parents[2]
         template = getattr(cfg, "hybrid_worker_command_template", "")
         assigned_gpus = [int(gpu) for gpu in (gpus or [])]
-        replica_gpus = len(assigned_gpus) or self._hybrid_replica_gpus()
         cuda_visible_devices = ",".join(str(gpu) for gpu in assigned_gpus)
-        worker_mode = str(getattr(cfg, "hybrid_worker_mode", "megatron_core"))
-        worker_config = str(
-            getattr(cfg, "hybrid_worker_config_path", "")
-            or os.environ.get("RUNTIME_CONFIG", "")
-        )
-        if worker_mode == "megatron_core" and not worker_config and not template:
-            raise ValueError(
-                "hybrid_worker_config_path or RUNTIME_CONFIG is required for "
-                "a physical Megatron-Core hybrid worker"
-            )
         values = {
             "python": shlex.quote(getattr(cfg, "hybrid_worker_python", sys.executable)),
             "rl_framework_path": shlex.quote(str(rl_root)),
@@ -1793,12 +1394,6 @@ class RuntimeElasticExecutor:
             "gradient_port": endpoint.port,
             "authkey": shlex.quote(endpoint.authkey),
             "task_dir": shlex.quote(getattr(cfg, "hybrid_worker_task_dir", "")),
-            "worker_mode": shlex.quote(worker_mode),
-            "worker_config": shlex.quote(worker_config),
-            "gradient_endpoint_dir": shlex.quote(
-                str(Path(getattr(cfg, "hybrid_worker_task_dir", "")) / "core_endpoints")
-            ),
-            "replica_gpus": replica_gpus,
             "idle_flag": "--idle" if idle else "",
             "native_rdma_device": shlex.quote(getattr(cfg, "native_rdma_device", "mlx5_0")),
             "native_rdma_gid_index": int(getattr(cfg, "native_rdma_gid_index", 0)),
@@ -1811,9 +1406,7 @@ class RuntimeElasticExecutor:
         if cuda_visible_devices:
             env_prefix = f"CUDA_VISIBLE_DEVICES={values['cuda_visible_devices']} "
         return (
-            f"{env_prefix}{values['python']} -m torch.distributed.run --standalone "
-            f"--nproc_per_node={values['replica_gpus']} "
-            f"{values['rl_framework_path']}/scripts/elastic_hybrid_worker.py "
+            f"{env_prefix}{values['python']} {values['rl_framework_path']}/scripts/elastic_hybrid_worker.py "
             f"--worker-id {values['worker_id']} "
             f"--target-core-id {values['target_core_id']} "
             f"--snapshot-path {values['snapshot_path']} "
@@ -1821,9 +1414,6 @@ class RuntimeElasticExecutor:
             f"--gradient-port {values['gradient_port']} "
             f"--authkey {values['authkey']} "
             f"--task-dir {values['task_dir']} "
-            f"--worker-mode {values['worker_mode']} "
-            f"--config {values['worker_config']} "
-            f"--gradient-endpoint-dir {values['gradient_endpoint_dir']} "
             f"--gradient-transport {values['gradient_transport_backend']} "
             f"{values['idle_flag']} "
             f"--native-rdma-device {values['native_rdma_device']} "
@@ -2279,24 +1869,11 @@ class RuntimeElasticExecutor:
         return started
 
     def _rollout_launch_env(self, meta: ManagedRolloutProcess) -> dict[str, str]:
-        env = self._allocation_launch_env("runtime_rollout")
-        env["PLANNED_CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in meta.gpus)
-        return env
-
-    def _allocation_launch_env(self, role: str) -> dict[str, str]:
-        """Build an environment for a sibling Slurm step in the parent job."""
         env = os.environ.copy()
-        for key in (
-            *self._TRAIN_DISTRIBUTED_ENV_KEYS,
-            *self._SLURM_NESTED_STEP_ENV_KEYS,
-        ):
+        for key in self._TRAIN_DISTRIBUTED_ENV_KEYS:
             env.pop(key, None)
-        if role == "hybrid_training":
-            # A nested srun must establish its own GPU-to-rank mapping. Keeping
-            # the parent Core step's visibility mask can make torchrun ranks on
-            # another node bind against a stale cgroup device namespace.
-            env.pop("CUDA_VISIBLE_DEVICES", None)
-        env["RL_FRAMEWORK_ROLE"] = str(role)
+        env["PLANNED_CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in meta.gpus)
+        env["RL_FRAMEWORK_ROLE"] = "runtime_rollout"
         return env
 
     def _stop_rollout_process(self, instance_id: str) -> list[ManagedRolloutProcess]:
@@ -2305,11 +1882,9 @@ class RuntimeElasticExecutor:
             return []
         proc = self._processes.get(instance_id)
         if meta.adopted or proc is None:
-            terminated = False
             if meta.pid > 0:
-                terminated = self._terminate_external_pid(meta)
-            if not terminated:
-                self._run_external_stop(meta)
+                self._terminate_external_pid(meta)
+            self._run_external_stop(meta)
             self._process_meta.pop(instance_id, None)
             self._processes.pop(instance_id, None)
             return [meta]
@@ -2331,11 +1906,9 @@ class RuntimeElasticExecutor:
         proc: subprocess.Popen | None,
     ) -> list[ManagedRolloutProcess]:
         if meta.adopted or proc is None:
-            terminated = False
             if meta.pid > 0:
-                terminated = self._terminate_external_pid(meta)
-            if not terminated:
-                self._run_external_stop(meta)
+                self._terminate_external_pid(meta)
+            self._run_external_stop(meta)
             return [meta]
         timeout = float(self.config.global_resource_planner.vllm_stop_timeout_s)
         if proc.poll() is None:
@@ -2525,7 +2098,7 @@ class RuntimeElasticExecutor:
         if grace_s > 0:
             time.sleep(grace_s)
 
-    def _terminate_external_pid(self, meta: ManagedRolloutProcess) -> bool:
+    def _terminate_external_pid(self, meta: ManagedRolloutProcess) -> None:
         timeout = float(
             getattr(
                 self.config.global_resource_planner,
@@ -2546,10 +2119,11 @@ class RuntimeElasticExecutor:
                 os.kill(meta.pid, signal.SIGTERM)
             except ProcessLookupError:
                 log_handle.write("launcher pid already exited\n")
-                return True
+                return
             except PermissionError as exc:
                 log_handle.write(f"launcher pid terminate permission error: {exc}\n")
-                return False
+                self._run_external_stop(meta)
+                return
 
             deadline = time.time() + timeout
             while time.time() < deadline:
@@ -2557,7 +2131,7 @@ class RuntimeElasticExecutor:
                     os.kill(meta.pid, 0)
                 except ProcessLookupError:
                     log_handle.write("launcher pid exited after SIGTERM\n")
-                    return True
+                    return
                 time.sleep(0.5)
 
             log_handle.write("launcher pid did not exit after SIGTERM; sending SIGKILL\n")
@@ -2565,7 +2139,6 @@ class RuntimeElasticExecutor:
                 os.kill(meta.pid, signal.SIGKILL)
             except ProcessLookupError:
                 log_handle.write("launcher pid exited before SIGKILL\n")
-            return True
 
     def _write_rollout_manifest(
         self,
@@ -2611,6 +2184,13 @@ class RuntimeElasticExecutor:
             or self.config.max_seq_length
         )
         public_host = host if host != "0.0.0.0" else "127.0.0.1"
+        device_backend = str(getattr(self.config, "device_backend", "auto")).lower()
+        use_npu = device_backend in {"npu", "ascend", "hccl"}
+        device_visible_name = "ASCEND_RT_VISIBLE_DEVICES" if use_npu else "CUDA_VISIBLE_DEVICES"
+        vllm_module = (
+            os.environ.get("VLLM_SERVER_MODULE")
+            or "vllm.entrypoints.openai.api_server"
+        )
         values = {
             "python": shlex.quote(sys.executable),
             "instance_id": shlex.quote(str(inst.instance_id or f"tp{inst.tp}_{port}")),
@@ -2621,6 +2201,9 @@ class RuntimeElasticExecutor:
             "port": port,
             "tp": inst.tp,
             "gpus": ",".join(str(g) for g in inst.gpus),
+            "devices": ",".join(str(g) for g in inst.gpus),
+            "device_visible_env": device_visible_name,
+            "vllm_module": shlex.quote(vllm_module),
             "max_model_len": max_model_len,
             "gpu_memory_utilization": self.config.heterogeneous_rollout.gpu_memory_utilization,
             "health_url": shlex.quote(f"http://{public_host}:{port}/health"),
@@ -2639,8 +2222,11 @@ class RuntimeElasticExecutor:
         }
         if template:
             return template.format(**values)
+        env_prefix = ""
+        if values["devices"]:
+            env_prefix = f"{device_visible_name}={shlex.quote(values['devices'])} "
         return (
-            "python3 -m vllm.entrypoints.openai.api_server "
+            f"{env_prefix}python3 -m {values['vllm_module']} "
             f"--model {values['model_path']} "
             f"--host {values['host']} "
             f"--port {port} "

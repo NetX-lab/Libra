@@ -14,10 +14,10 @@ set -e
 
 
 cd "$(dirname "$0")/.."
-PROJECT_DIR="$(pwd)"
 
 
 MODEL_PATH="/path/to/Qwen3-4B"
+export WANDB_API_KEY="bfee760e4e267073a9eeadca3169b8bc2b2cacbe"
 
 TRAIN_GPUS="0,1"
 ROLLOUT_GPUS="2,3"
@@ -40,8 +40,8 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 TRAIN_LOG="$LOG_DIR/training_${TIMESTAMP}.log"
 
 # PYTHONPATH
-export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
-cd "$PROJECT_DIR"
+export PYTHONPATH=/path/to/user:$PYTHONPATH
+cd /path/to/user
 
 
 

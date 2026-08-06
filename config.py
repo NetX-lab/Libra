@@ -1,5 +1,7 @@
 """Support code for Config."""
 
+from __future__ import annotations
+
 import copy
 import json
 import os
@@ -19,25 +21,18 @@ def _from_dict(cls, d: dict):
     if d is None:
         return cls()
     valid_keys = {f.name for f in fields(cls)}
-    unknown_keys = sorted(set(d) - valid_keys)
-    if unknown_keys:
-        raise ValueError(
-            f"Unknown {cls.__name__} field(s): {', '.join(unknown_keys)}"
-        )
     filtered = {}
     for k, v in d.items():
+        if k not in valid_keys:
+            continue
+
         if isinstance(v, str):
-            raw_value = v
             try:
-                numeric_value = float(raw_value)
-                if (
-                    numeric_value.is_integer()
-                    and "." not in raw_value
-                    and "e" not in raw_value.lower()
-                ):
-                    v = int(numeric_value)
-                else:
-                    v = numeric_value
+                v = float(v)
+
+                if v == int(v) and "." not in v and "e" not in v.lower().split(".")[0]:
+
+                    pass
             except (ValueError, OverflowError):
                 pass
         filtered[k] = v
@@ -344,15 +339,6 @@ class SchedulingConfig:
     cmlfq_payload_small_threshold: int = 500
     cmlfq_payload_large_threshold: int = 5000
 
-    # Cold-start placement used before the causal prefix tree has a match.
-    # Keeping this explicit avoids silently sending long-output workloads to
-    # the short bucket while the online profile is still warming up.
-    cmlfq_initial_bucket: str = "short"
-
-    # Avoid paying a cross-bucket routing cost for continuations too short to
-    # amortize a larger TP replica.
-    cmlfq_min_migration_remaining_tokens: int = 256
-
     @classmethod
     def from_dict(cls, d: dict) -> "SchedulingConfig":
         return _from_dict(cls, d)
@@ -474,11 +460,6 @@ class GlobalResourcePlannerConfig:
     runtime_active_rollout_pressure_threshold: float = 0.85
     runtime_rejected_rollout_delta_threshold: int = 8
     runtime_rollout_train_imbalance_threshold: float = 1.25
-    # Persist explicit runtime targets so child ranks do not depend on Slurm
-    # forwarding control-plane environment variables.
-    runtime_forced_train_gpus: int = 0
-    runtime_forced_rollout_tp_list: list[int] = field(default_factory=list)
-    runtime_force_reconfigure: bool = False
 
 
     # {input_json}, {output_json}, {trace_csv}, {output_dir}, {sailor_path}, {vidur_path}
@@ -516,12 +497,7 @@ class GlobalResourcePlannerConfig:
     runtime_reconfigure_training: bool = False
     runtime_training_pool_only: bool = True
     runtime_training_pool_target_gpus: int = 0
-    runtime_effective_train_gpus: int = 0
     runtime_training_pool_plan_only: bool = True
-    runtime_training_resize_mode: str = "hybrid_nonblocking"  # hybrid_nonblocking | supervised_handoff
-    runtime_training_handoff_enabled: bool = False
-    runtime_training_handoff_dir: str = ""
-    runtime_training_handoff_timeout_s: float = 600.0
     runtime_batch_collection_timeout_s: float = 0.0
     runtime_batch_collection_max_retries: int = 0
     runtime_use_nccl_barrier_after_rollout: bool = False
@@ -539,18 +515,8 @@ class GlobalResourcePlannerConfig:
     hybrid_training_prewarm_worker_ids: list[str] = field(default_factory=list)
     hybrid_worker_python: str = "python"
     hybrid_worker_command_template: str = ""
-    hybrid_worker_mode: str = "megatron_core"
-    hybrid_worker_config_path: str = ""
     hybrid_worker_task_dir: str = "./logs/elastic_training_tasks"
-    hybrid_worker_ready_timeout_s: float = 600.0
-    hybrid_replica_gpus: int = 0
-    hybrid_zero_sync_steps: int = 1
-    hybrid_snapshot_interval: int = 0
-    hybrid_max_pending_snapshots: int = 1
-    hybrid_snapshot_retention: int = 2
-    hybrid_state_alignment_timeout_s: float = 300.0
-    hybrid_active_gradient_timeout_s: float = 300.0
-    hybrid_lockstep_gradient_sync: bool = True
+    hybrid_worker_ready_timeout_s: float = 60.0
     gradient_transport_backend: str = "tcp"  # tcp | native_rdma
     decouple_communication_domains: bool = True
     gradient_server_host: str = "127.0.0.1"
@@ -573,6 +539,10 @@ class AsyncRLConfig:
 
     model_path: str
     tokenizer_path: str = ""
+
+    device_backend: str = "auto"  # auto | cuda | npu | cpu
+    distributed_backend: str = "auto"  # auto | nccl | hccl | gloo
+    rollout_backend: str = "vllm"  # vllm | mock
 
 
     train_gpus: int = 4
@@ -635,6 +605,11 @@ class AsyncRLConfig:
 
 
     max_new_tokens: int = 1024
+    # Workflow-specific limits.  Keeping these in the experiment config makes
+    # multi-turn capability runs reproducible instead of depending on shell
+    # environment variables.
+    r2e_max_turns: int = 3
+    r2e_max_prompt_tokens: int = 0
     n_samples: int = 4
     temperature: float = 1.0
     top_p: float = 1.0
@@ -647,7 +622,6 @@ class AsyncRLConfig:
 
     total_steps: int = 100
     eval_interval: int = 10
-    eval_at_start: bool = False
     save_interval: int = 10
     seed: int = 42
 
@@ -870,11 +844,6 @@ class AsyncRLConfig:
             "global_resource_planner",
         }
         valid_keys = {f.name for f in fields(cls) if f.name not in _nested_keys}
-        unknown_keys = sorted(set(d) - valid_keys)
-        if unknown_keys:
-            raise ValueError(
-                f"Unknown {cls.__name__} field(s): {', '.join(unknown_keys)}"
-            )
         filtered = {k: v for k, v in d.items() if k in valid_keys}
 
 

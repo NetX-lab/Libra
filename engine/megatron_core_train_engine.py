@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import os
-import threading
-import time
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +15,7 @@ from transformers import AutoTokenizer
 from RL_Framework.engine.megatron_core_checkpointing import (
     MegatronDistributedCheckpointManager,
 )
+from RL_Framework.engine.device_utils import accelerator_backend, set_device
 from RL_Framework.infra.elastic import (
     GradientPayload,
     InterReplicaGradientDomain,
@@ -59,6 +58,7 @@ class MegatronCoreTrainEngine:
         use_cpu_initialization: bool = False,
         recompute_num_layers: int = 1,
         sync_path: str = "./logs/async_rl_weights",
+        device_backend: str = "auto",
     ):
         self.train_backend = "megatron_core"
         self.model_path = model_path
@@ -94,6 +94,7 @@ class MegatronCoreTrainEngine:
         self.use_transformer_engine = use_transformer_engine
         self.use_cpu_initialization = use_cpu_initialization
         self.recompute_num_layers = recompute_num_layers
+        self.device_backend = accelerator_backend(device_backend)
 
         self.rank = int(os.getenv("RANK", "0"))
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -109,41 +110,12 @@ class MegatronCoreTrainEngine:
         self.max_seq_length = 0
         self.elastic_gradient_domain: InterReplicaGradientDomain | None = None
         self._pending_hybrid_gradients: list[GradientPayload] = []
-        self._hybrid_gradient_lock = threading.Lock()
-        self._hybrid_gradient_condition = threading.Condition(
-            self._hybrid_gradient_lock
-        )
-        self._elastic_active_gradient_timeout_s = 300.0
-        self._elastic_snapshot_wait_timeout_s = 300.0
-        self._elastic_training_step = -1
-        self._elastic_step_hybrid_workers: tuple[str, ...] = ()
-        self._elastic_step_membership_frozen = False
-        self._elastic_step_callback = None
-        self._elastic_gradient_update_callback = None
-        self._elastic_gradient_metrics = {
-            "accepted": 0,
-            "stale": 0,
-            "future": 0,
-        }
         self.checkpoints = MegatronDistributedCheckpointManager(
             sync_path=sync_path,
             checkpoint_format=checkpoint_format,
             fully_parallel_save=fully_parallel_save,
             async_save=async_save,
         )
-        elastic_state_dir = Path(
-            os.getenv(
-                "ELASTIC_TRAINING_STATE_DIR",
-                "./logs/elastic_training_state",
-            )
-        )
-        self.elastic_checkpoints = MegatronDistributedCheckpointManager(
-            sync_path=str(elastic_state_dir / "checkpoints"),
-            checkpoint_format=checkpoint_format,
-            fully_parallel_save=fully_parallel_save,
-            async_save=True,
-        )
-        self._latest_elastic_snapshot_version = -1
 
     def initialize(
         self,
@@ -171,9 +143,7 @@ class MegatronCoreTrainEngine:
                 "MegatronCoreTrainEngine currently supports PP=1; use TP/EP/DP "
                 "for Qwen3-30B-A3B"
             )
-        if not torch.cuda.is_available():
-            raise RuntimeError("MegatronCoreTrainEngine requires CUDA")
-        torch.cuda.set_device(self.local_rank)
+        self._prepare_accelerator()
         self.max_seq_length = max_seq_length
 
         init_phase("imports_start")
@@ -217,7 +187,26 @@ class MegatronCoreTrainEngine:
         self.provider.finalize()
         init_phase("provider_finalize_complete")
         init_phase("parallel_init_start")
-        self.provider.initialize_model_parallel(seed=42)
+        if self.device_backend == "npu":
+            from RL_Framework.engine.megatron_npu_compat import (
+                apply_megatron_npu_compatibility,
+            )
+
+            apply_megatron_npu_compatibility()
+            original_init_process_group = dist.init_process_group
+
+            def hccl_init_process_group(backend=None, *args, **kwargs):
+                if backend == "nccl":
+                    backend = "hccl"
+                return original_init_process_group(backend, *args, **kwargs)
+
+            dist.init_process_group = hccl_init_process_group
+            try:
+                self.provider.initialize_model_parallel(seed=42)
+            finally:
+                dist.init_process_group = original_init_process_group
+        else:
+            self.provider.initialize_model_parallel(seed=42)
         init_phase("parallel_init_complete")
 
         init_phase(
@@ -319,6 +308,10 @@ class MegatronCoreTrainEngine:
             not in {"0", "false", "no"}
         )
         provider.moe_permute_fusion = False
+        # MCore's fused bias/dropout/add path is decorated with its CUDA JIT
+        # fuser.  torch-npu redirects that decorator through Inductor/Triton,
+        # which is neither required nor available in the supported stack.
+        provider.bias_dropout_fusion = False
         provider.moe_router_dtype = None
         provider.moe_token_dispatcher_type = "alltoall"
         if self.use_transformer_engine:
@@ -420,7 +413,7 @@ class MegatronCoreTrainEngine:
             return trajectories
         lengths = torch.tensor(
             [int(item["input_ids"].shape[-1]) for item in trajectories],
-            device=torch.device(f"cuda:{self.local_rank}"),
+            device=self._device(),
             dtype=torch.long,
         )
         dist.all_reduce(lengths, op=dist.ReduceOp.MAX)
@@ -543,11 +536,8 @@ class MegatronCoreTrainEngine:
                 scaled_loss.backward()
                 local_stats.append(stats)
 
-            # Appendix D requires external gradients to be accumulated into the
-            # target core replica before the immutable core DP All-Reduce.
-            matched_hybrid_payloads = self._apply_elastic_inter_replica_gradients()
             finalize_model_grads(self.model)
-            self._publish_elastic_gradient_updates(matched_hybrid_payloads)
+            self._apply_elastic_inter_replica_gradients()
             update_successful, grad_norm, _ = self.optimizer.step()
             if not update_successful:
                 raise FloatingPointError("Megatron optimizer rejected the update")
@@ -557,73 +547,9 @@ class MegatronCoreTrainEngine:
             else:
                 merged["grad_norm"] = float(grad_norm or 0.0)
             epoch_stats.append(self._reduce_stats(merged))
-            if self._elastic_step_callback is not None:
-                self._elastic_step_callback(
-                    self._elastic_training_step,
-                    self._elastic_training_step + 1,
-                )
         result = self._merge_stats(epoch_stats)
         result["version"] = self.current_version
         return result
-
-    def compute_elastic_gradient_payload(
-        self,
-        trajectories: list[dict[str, Any]],
-        *,
-        worker_id: str,
-        target_core_id: str,
-        step: int,
-        state_version: int,
-        membership_epoch: int,
-    ) -> GradientPayload:
-        """Compute one external replica gradient without applying an update."""
-        from megatron.core.distributed import finalize_model_grads
-
-        micro_batches = list(self._iter_micro_batches(trajectories))
-        self._zero_grad()
-        self._set_train_mode(True)
-        for micro_batch in micro_batches:
-            logits = self._forward(micro_batch)
-            loss, _stats = self._loss(micro_batch, logits)
-            scaled_loss = self.optimizer.scale_loss(
-                loss / max(len(micro_batches), 1)
-            )
-            scaled_loss.backward()
-        finalize_model_grads(self.model)
-        gradients = []
-        for model_chunk in self.model:
-            for param in model_chunk.parameters():
-                grad = getattr(param, "main_grad", None)
-                if grad is not None:
-                    gradients.append(grad.detach().cpu())
-        return GradientPayload(
-            replica_id=worker_id,
-            target_core_id=target_core_id,
-            tensors=tuple(gradients),
-            step=int(step),
-            state_version=int(state_version),
-            membership_epoch=int(membership_epoch),
-        )
-
-    def apply_elastic_gradient_update(
-        self,
-        tensors: tuple[torch.Tensor, ...],
-        *,
-        state_version: int,
-    ) -> None:
-        """Apply the Core's post-AllReduce gradient on a Hybrid replica."""
-        local_gradients = self._model_main_gradients()
-        if len(tensors) != len(local_gradients):
-            raise ValueError(
-                "Hybrid update tensor count mismatch: "
-                f"received={len(tensors)}, local={len(local_gradients)}"
-            )
-        for local, remote in zip(local_gradients, tensors):
-            local.copy_(remote.to(device=local.device, dtype=local.dtype))
-        update_successful, _grad_norm, _zeros = self.optimizer.step()
-        if not update_successful:
-            raise FloatingPointError("Hybrid Megatron optimizer rejected the update")
-        self.current_version = int(state_version)
 
     def save_weights(self, path: str, version: int):
         if Path(path) != self.checkpoints.sync_path:
@@ -668,22 +594,6 @@ class MegatronCoreTrainEngine:
             for index in range(max(1, self.get_data_parallel_world_size()))
         ]
 
-    def get_elastic_lane_state(self) -> dict[str, int]:
-        parallel_state = self._parallel_state()
-        return {
-            "global_rank": self.rank,
-            "data_parallel_rank": self.get_data_parallel_rank(),
-            "tensor_parallel_rank": int(
-                parallel_state.get_tensor_model_parallel_rank()
-            ),
-            "pipeline_parallel_rank": int(
-                parallel_state.get_pipeline_model_parallel_rank()
-            ),
-            "context_parallel_rank": int(
-                parallel_state.get_context_parallel_rank()
-            ),
-        }
-
     def configure_elastic_training(
         self,
         core_replica_ids: list[str] | None = None,
@@ -715,145 +625,34 @@ class MegatronCoreTrainEngine:
             domain.process_group = self.get_elastic_core_process_group()
 
     def enqueue_hybrid_gradient_payload(self, payload: GradientPayload) -> None:
-        with self._hybrid_gradient_condition:
-            self._pending_hybrid_gradients.append(payload)
-            self._hybrid_gradient_condition.notify_all()
-
-    def set_elastic_training_step(
-        self,
-        step: int,
-        active_hybrid_workers: list[str] | tuple[str, ...] | None = None,
-    ) -> None:
-        self._elastic_training_step = int(step)
-        if active_hybrid_workers is not None:
-            self._elastic_step_hybrid_workers = tuple(active_hybrid_workers)
-            self._elastic_step_membership_frozen = True
-
-    def set_elastic_step_callback(self, callback) -> None:
-        self._elastic_step_callback = callback
-
-    def set_elastic_gradient_update_callback(self, callback) -> None:
-        self._elastic_gradient_update_callback = callback
-
-    def set_elastic_active_gradient_timeout(self, timeout_s: float) -> None:
-        self._elastic_active_gradient_timeout_s = max(0.0, float(timeout_s))
-
-    def set_elastic_snapshot_wait_timeout(self, timeout_s: float) -> None:
-        self._elastic_snapshot_wait_timeout_s = max(0.0, float(timeout_s))
-
-    def get_elastic_gradient_metrics(self) -> dict[str, int]:
-        with self._hybrid_gradient_lock:
-            return dict(self._elastic_gradient_metrics)
+        self._pending_hybrid_gradients.append(payload)
 
     def capture_elastic_state_snapshot(
         self,
         worker_id: str,
         target_core_id: str,
     ) -> int:
-        """Return metadata for the latest completed asynchronous snapshot."""
+        """Write metadata for the latest collective distributed checkpoint."""
         del worker_id, target_core_id
-        deadline = time.monotonic() + self._elastic_snapshot_wait_timeout_s
-        version = self._find_latest_elastic_snapshot_version()
-        while version < 0 and time.monotonic() < deadline:
-            time.sleep(0.1)
-            version = self._find_latest_elastic_snapshot_version()
-        if version < 0:
-            raise TimeoutError(
-                "no completed elastic snapshot became available before the "
-                "join timeout; core ranks must publish a boundary snapshot"
-            )
         snapshot_path = Path(
-            self.get_elastic_state_snapshot_path(version)
+            self.get_elastic_state_snapshot_path(self.current_version)
         )
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path = (
-            self.elastic_checkpoints.sync_path
-            / f"v{version}"
+            self.checkpoints.sync_path
+            / f"v{self.current_version}"
             / "megatron_checkpoint_manifest.json"
         )
         torch.save(
             {
                 "backend": self.train_backend,
-                "version": version,
+                "version": self.current_version,
                 "manifest_path": str(manifest_path),
-                "checkpoint_root": str(self.elastic_checkpoints.sync_path),
                 "parallel_state": self.get_parallel_state(),
             },
             snapshot_path,
         )
-        return version
-
-    def publish_elastic_state_snapshot(self, version: int) -> bool:
-        """Collectively stage a non-blocking model+optimizer snapshot."""
-        self.poll_elastic_state_snapshots()
-        scheduled = self.elastic_checkpoints.save_async_snapshot(
-            model=self.model,
-            optimizer=self.optimizer,
-            version=int(version),
-            topology=self.get_parallel_state(),
-        )
-        if scheduled and not self.elastic_checkpoints.async_save:
-            self._record_completed_elastic_snapshot(int(version))
-        return scheduled
-
-    def poll_elastic_state_snapshots(self, *, blocking: bool = False) -> list[int]:
-        versions = self.elastic_checkpoints.poll_async_snapshots(blocking=blocking)
-        for version in versions:
-            self._record_completed_elastic_snapshot(int(version))
-        return versions
-
-    def close_elastic_state_snapshots(self) -> None:
-        for version in self.elastic_checkpoints.close_async_snapshots():
-            self._record_completed_elastic_snapshot(int(version))
-
-    def prune_elastic_state_snapshots(
-        self,
-        *,
-        keep_latest: int = 2,
-        protected_versions: set[int] | None = None,
-    ) -> list[int]:
-        return self.elastic_checkpoints.prune_snapshots(
-            keep_latest=keep_latest,
-            protected_versions=protected_versions,
-        )
-
-    def _record_completed_elastic_snapshot(self, version: int) -> None:
-        self._latest_elastic_snapshot_version = max(
-            self._latest_elastic_snapshot_version,
-            int(version),
-        )
-        snapshot_path = Path(self.get_elastic_state_snapshot_path(version))
-        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "backend": self.train_backend,
-                "version": int(version),
-                "manifest_path": str(
-                    self.elastic_checkpoints.sync_path
-                    / f"v{version}"
-                    / "megatron_checkpoint_manifest.json"
-                ),
-                "checkpoint_root": str(self.elastic_checkpoints.sync_path),
-                "parallel_state": self.get_parallel_state(),
-            },
-            snapshot_path,
-        )
-
-    def _find_latest_elastic_snapshot_version(self) -> int:
-        candidates = []
-        for path in self.elastic_checkpoints.sync_path.glob(
-            "v*/megatron_checkpoint_manifest.json"
-        ):
-            try:
-                candidates.append(int(path.parent.name[1:]))
-            except ValueError:
-                continue
-        if candidates:
-            self._latest_elastic_snapshot_version = max(
-                self._latest_elastic_snapshot_version,
-                max(candidates),
-            )
-        return self._latest_elastic_snapshot_version
+        return self.current_version
 
     def get_elastic_state_snapshot_path(self, version: int) -> str:
         state_dir = Path(
@@ -871,17 +670,7 @@ class MegatronCoreTrainEngine:
             weights_only=False,
         )
         version = int(payload["version"])
-        checkpoint_root = str(
-            payload.get("checkpoint_root", self.elastic_checkpoints.sync_path)
-        )
-        if Path(checkpoint_root) != self.elastic_checkpoints.sync_path:
-            self.elastic_checkpoints.sync_path = Path(checkpoint_root)
-        self.elastic_checkpoints.load(
-            model=self.model,
-            optimizer=self.optimizer,
-            version=version,
-        )
-        self.current_version = version
+        self.load_weights(str(self.checkpoints.sync_path), version)
 
     def _iter_micro_batches(self, trajectories: list[dict[str, Any]]):
         for start in range(0, len(trajectories), self.micro_batch_size):
@@ -892,7 +681,7 @@ class MegatronCoreTrainEngine:
         self,
         trajectories: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        device = torch.device(f"cuda:{self.local_rank}")
+        device = self._device()
         max_length = max(int(item["input_ids"].shape[-1]) for item in trajectories)
         batch_size = len(trajectories)
         input_ids = torch.full(
@@ -1041,8 +830,11 @@ class MegatronCoreTrainEngine:
                 updates,
                 stats.get("grad_norm", 0.0) * updates,
             ],
-            dtype=torch.float64,
-            device=torch.device(f"cuda:{self.local_rank}"),
+            # HCCL on the validated 910B3/CANN 8.5.2 stack does not support
+            # float64 collectives. Training statistics do not require double
+            # precision, and float32 is supported by both HCCL and NCCL.
+            dtype=torch.float32,
+            device=self._device(),
         )
         group = self._parallel_state().get_data_parallel_group(
             with_context_parallel=True
@@ -1108,104 +900,68 @@ class MegatronCoreTrainEngine:
         for model_chunk in self.model:
             model_chunk.train(enabled)
 
-    def _model_main_gradients(self) -> list[torch.Tensor]:
-        gradients = []
+    def _apply_elastic_inter_replica_gradients(self) -> None:
+        if self.elastic_gradient_domain is None:
+            self._pending_hybrid_gradients.clear()
+            return
+        params_and_grads = []
         for model_chunk in self.model:
             for param in model_chunk.parameters():
                 grad = getattr(param, "main_grad", None)
                 if grad is not None:
-                    gradients.append(grad)
-        return gradients
-
-    def _apply_elastic_inter_replica_gradients(self) -> list[GradientPayload]:
-        if self.elastic_gradient_domain is None:
-            with self._hybrid_gradient_lock:
-                self._pending_hybrid_gradients.clear()
-            return []
-        params_and_grads = [(None, grad) for grad in self._model_main_gradients()]
+                    params_and_grads.append((param, grad))
         if not params_and_grads:
-            return []
+            self._pending_hybrid_gradients.clear()
+            return
 
         core_id = f"dp{self.get_data_parallel_rank()}"
-        current_step = self._elastic_training_step
-        expected_workers = set(
-            self._elastic_step_hybrid_workers
-            if self._elastic_step_membership_frozen
-            else self.elastic_gradient_domain.active_hybrid_ids_for_core(core_id)
+        reduced = self.elastic_gradient_domain.reduce_core_gradients(
+            core_gradients={
+                core_id: tuple(grad.detach() for _, grad in params_and_grads),
+            },
+            hybrid_payloads=self._pending_hybrid_gradients,
         )
-        deadline = time.time() + self._elastic_active_gradient_timeout_s
-        with self._hybrid_gradient_condition:
-            while expected_workers:
-                present = {
-                    payload.replica_id
-                    for payload in self._pending_hybrid_gradients
-                    if payload.replica_id in expected_workers
-                    and (payload.step < 0 or payload.step == current_step)
-                    and payload.membership_epoch
-                    == self.elastic_gradient_domain.membership_epoch(
-                        payload.replica_id
-                    )
-                }
-                missing = expected_workers - present
-                if not missing:
-                    break
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        "timed out waiting for active hybrid gradients before "
-                        f"core All-Reduce: step={current_step}, missing={sorted(missing)}"
-                    )
-                self._hybrid_gradient_condition.wait(timeout=min(remaining, 0.1))
-
-            matching: list[GradientPayload] = []
-            future: list[GradientPayload] = []
-            for payload in self._pending_hybrid_gradients:
-                if (
-                    payload.replica_id in expected_workers
-                    and (payload.step < 0 or current_step < 0 or payload.step == current_step)
-                ):
-                    matching.append(payload)
-                elif payload.step > current_step:
-                    future.append(payload)
-                    self._elastic_gradient_metrics["future"] += 1
-                else:
-                    self._elastic_gradient_metrics["stale"] += 1
-            self._pending_hybrid_gradients = future
-            self._elastic_gradient_metrics["accepted"] += len(matching)
-
-        accumulated = self.elastic_gradient_domain.accumulate_local_gradients(
-            core_replica_id=core_id,
-            core_gradients=tuple(grad.detach() for _, grad in params_and_grads),
-            hybrid_payloads=matching,
-            step=current_step,
-            state_version=current_step,
-        )
-        for (_, grad), accumulated_grad in zip(
+        for (_, grad), reduced_grad in zip(
             params_and_grads,
-            accumulated,
+            reduced[core_id],
         ):
             grad.copy_(
-                accumulated_grad.to(device=grad.device, dtype=grad.dtype)
+                reduced_grad.to(device=grad.device, dtype=grad.dtype)
             )
-        return matching
-
-    def _publish_elastic_gradient_updates(
-        self,
-        payloads: list[GradientPayload],
-    ) -> None:
-        if not payloads or self._elastic_gradient_update_callback is None:
-            return
-        gradients = tuple(
-            grad.detach().cpu() for grad in self._model_main_gradients()
-        )
-        self._elastic_gradient_update_callback(
-            payloads,
-            gradients,
-            self._elastic_training_step + 1,
-        )
+        self._pending_hybrid_gradients.clear()
 
     @staticmethod
     def _parallel_state():
         from megatron.core import parallel_state
 
         return parallel_state
+
+    def _prepare_accelerator(self) -> None:
+        """Activate the Ascend compatibility layer before importing MCore.
+
+        Megatron-Core and Megatron Bridge still use CUDA-shaped APIs internally.
+        The project-local compatibility layer is applied after MCore imports so
+        it can rewrite those Python call sites to torch-npu and HCCL. Tensor
+        allocation in this engine remains explicit through :meth:`_device`.
+        """
+        if self.device_backend == "npu":
+            try:
+                import torch_npu  # noqa: F401
+            except Exception as exc:
+                raise RuntimeError(
+                    "Megatron-Core NPU execution requires torch-npu"
+                ) from exc
+            if not torch.npu.is_available():
+                raise RuntimeError("Megatron-Core requested NPU but no NPU is available")
+        elif self.device_backend == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("Megatron-Core requested CUDA but CUDA is unavailable")
+        else:
+            raise RuntimeError(
+                "Megatron-Core requires an accelerator backend (cuda or npu); "
+                f"resolved {self.device_backend!r}"
+            )
+        set_device(self.local_rank, self.device_backend)
+
+    def _device(self) -> torch.device:
+        return torch.device(f"{self.device_backend}:{self.local_rank}")

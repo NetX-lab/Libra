@@ -119,93 +119,17 @@ prewarming.
 ```bash
 export GRP_RECONFIGURE_TRAINING=1
 export GRP_TRAINING_POOL_PLAN_ONLY=0
-export GRP_TRAINING_RESIZE_MODE=hybrid_nonblocking
-export GRP_TRAINING_HANDOFF_ENABLED=0
 export GRP_DECOUPLE_COMMUNICATION_DOMAINS=1
-export GRP_HYBRID_WORKER_LAUNCH_ENABLED=1
-export GRP_HYBRID_WORKER_MODE=megatron_core
 export GRP_CLUSTER_SWAP_ENABLED=1
 export GRP_ROLLOUT_RECONFIGURE_STRATEGY=cluster_swap
 export GRP_DRAIN_BEFORE_RECONFIGURE=0
 ```
 
-In this mode, `TRAIN_GPUS` is the immutable Core Training Pool. Planner targets
-must be at least `TRAIN_GPUS` and change by a complete
-`TRAIN_TP_SIZE * TRAIN_PP_SIZE * TRAIN_CP_SIZE` replica. `GRP_FORCE_TRAIN_GPUS`
-and `GRP_TRAINING_POOL_TARGET_GPUS` describe the effective total of core plus
-hybrid GPUs; they do not change Megatron's `WORLD_SIZE`.
-
-While a replica is joining, core ranks stage Megatron distributed model and
-optimizer snapshots with asynchronous storage I/O. The rollout replica loads a
-completed snapshot before publishing ready, remains outside the active gradient
-set for at least one zero-gradient boundary, reloads the boundary-aligned state,
-and becomes active only afterward. Shrinking removes the worker from the
-side-channel membership before its process is returned to rollout. No core NCCL
-communicator is destroyed or rebuilt.
-
-The active membership is frozen before each step collects trajectories. A
-replica that finishes joining during that collection is admitted on the next
-step, so the core never waits for a batch that was not dispatched. Each active
-task carries a step and membership epoch. The worker sends its local gradient
-to the matching Core lane; after the fixed Core DP AllReduce, Core returns that
-lane's final gradient and the worker applies it with its synchronized optimizer.
-Model and optimizer state therefore advance in lockstep without an active-rank
-checkpoint reload. Boundary snapshots are produced on demand while a worker is
-joining; `hybrid_snapshot_retention` bounds completed versions on disk.
-
-`hybrid_worker_ready_timeout_s` defaults to 600 seconds because Slurm may need
-to finish teardown of the previous rollout step before it grants the same GPUs
-to the Megatron worker. This wait happens in the join thread; Core training
-continues, and a timeout reason is persisted as `last_error` in the membership
-record.
-
-When the planner launches a sibling Slurm step, Libra removes inherited
-`SLURM_STEP_*`, torchrun rank, and rendezvous variables while retaining the
-parent `SLURM_JOB_ID` and job node list. This allows a Core rank running inside
-one step to return GPUs on another node to the job allocation and launch the
-replacement Hybrid or rollout process there.
-
-With decoupled communication domains, every core model-parallel lane exposes an
-independent gradient endpoint. Hybrid TP/PP/CP lanes send step-, version-, and
-membership-epoch-tagged gradients to their matching core lanes. The core rank
-accumulates them before its fixed DP All-Reduce. Set
+With decoupled communication domains, Libra receives hybrid-worker gradient
+payloads through the configured elastic side channel while leaving the core
+training backend's DP/TP/PP process groups untouched. Set
 `GRP_DECOUPLE_COMMUNICATION_DOMAINS=0` only when elastic gradient reduction
 must reuse the training DP group.
-
-The default TCP side channel streams one tensor at a time in both directions:
-Hybrid-to-Core local gradients and Core-to-Hybrid post-AllReduce gradients. It
-waits for explicit acknowledgement and avoids constructing a second,
-model-sized serialized byte buffer in either process. The current lockstep
-reply protocol requires `gradient_transport_backend: tcp`; native RDMA remains
-available for one-way transport experiments.
-
-The supplied Slurm launcher defaults to
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`. Megatron-Core's persistent
-async-checkpoint process uses CUDA multiprocessing IPC, and older compute-node
-kernels without `pidfd_open` reject that IPC path when expandable segments are
-enabled. Newer clusters may override the variable after validating the kernel.
-
-Useful correctness and timing controls:
-
-```bash
-export GRP_HYBRID_ZERO_SYNC_STEPS=1
-export GRP_HYBRID_SNAPSHOT_INTERVAL=0  # on-demand while joining
-export GRP_HYBRID_SNAPSHOT_RETENTION=2
-export GRP_HYBRID_LOCKSTEP_GRADIENT_SYNC=1
-export GRP_HYBRID_STATE_ALIGNMENT_TIMEOUT_S=600
-export GRP_HYBRID_ACTIVE_GRADIENT_TIMEOUT_S=600
-# 0 derives one replica from TP * PP * CP.
-export GRP_HYBRID_REPLICA_GPUS=0
-```
-
-`supervised_handoff` remains an explicit maintenance fallback for a persistent
-partition change that must reduce the immutable core itself. It checkpoints and
-restarts the core ranks, so it is not a zero-interruption mode:
-
-```bash
-export GRP_TRAINING_RESIZE_MODE=supervised_handoff
-export GRP_TRAINING_HANDOFF_ENABLED=1
-```
 
 To force a short cluster-swap run:
 
@@ -217,10 +141,9 @@ export GRP_INITIAL_ROLLOUT_TP_LIST=4:2:2
 export GRP_TRAINING_POOL_TARGET_GPUS=12
 ```
 
-When `GRP_DRAIN_BEFORE_RECONFIGURE=0`, hybrid join/release runs concurrently
-with core training. Active hybrid replicas still synchronize their gradient at
-the normal fixed-core All-Reduce boundary; the non-blocking guarantee applies
-to the joining and state-restoration window.
+When `GRP_DRAIN_BEFORE_RECONFIGURE=0`, Libra skips dispatcher and peer-rank
+drain before applying the cluster-swap plan. This is useful for validating
+runtime control paths without waiting for long-tail rollout tasks.
 
 ## 5. Control Batch Collection and Long-Tail Rollouts
 
@@ -329,7 +252,7 @@ sbatch --export=ALL scripts/submit_search_r1_searxng_train.slurm
 ### DAPO-Math-17K with C-MLFQ
 
 ```bash
-export MODEL_PATH=/path/to/Qwen3-14B
+export MODEL_PATH=/path/to/Qwen3-4B
 export DAPO_MATH_PATH=/path/to/train.parquet
 sbatch --export=ALL scripts/submit_dapo_math_cmlfq_train.slurm
 ```
@@ -344,9 +267,7 @@ python examples/search_r1_async_rl.py \
   --config configs/search_r1_cmlfq_qwen3_14b.yaml
 ```
 
-Run `python -m pip install -e .` once from the repository root. The editable
-installation exposes `RL_Framework` regardless of the checkout directory name;
-the supplied launchers also prepend `PROJECT_DIR` to `PYTHONPATH`.
+Make sure `PYTHONPATH` points to the parent directory of this repository.
 
 For the full list of configuration fields, see the
 [configuration reference](configuration_reference.md).

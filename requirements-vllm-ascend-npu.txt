@@ -1,0 +1,16 @@
+# Optional Ascend rollout dependency.
+#
+# Keep this separate from requirements-npu.txt. The real vLLM rollout server
+# needs a Python 3.11 environment on aarch64 because upstream vLLM wheels are
+# not available for the inspected host's default Python 3.9.
+#
+# Validated on CANN 8.5.2 with NNAL/ATB 8.5.2:
+#   torch==2.7.1
+#   torch-npu==2.7.1
+#   vllm-ascend==0.11.0
+#   vllm==0.11.0 installed separately with --no-deps
+#
+# Install vllm-ascend first so it owns the torch/torch-npu line, then install
+# upstream vLLM with --no-deps to avoid replacing torch with the CUDA-targeted
+# dependency declared by upstream vLLM.
+vllm-ascend==0.11.0

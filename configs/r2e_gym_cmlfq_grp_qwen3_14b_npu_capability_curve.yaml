@@ -1,0 +1,130 @@
+# Multi-turn capability-curve validation for R2E-Gym + Qwen3-14B.
+#
+# The 8-device layout remains stable during this run so model-quality results
+# are not confounded by vLLM restarts. GRP evaluates real runtime history and
+# records candidate plans without changing the active rollout processes.
+
+base_config: base.yaml
+
+hardware_config: hardware_config/a100_80g.yaml
+model_arch_config: model_arch_config/qwen3-14b.yaml
+
+model_path: "/data/qianzhirong/models/Qwen3-14B"
+tokenizer_path: "/data/qianzhirong/models/Qwen3-14B"
+
+device_backend: "npu"
+distributed_backend: "hccl"
+rollout_backend: "vllm"
+train_backend: "fsdp"
+
+# NPU 0-3 are FSDP training, NPU 4-7 are the heterogeneous rollout pool.
+train_gpus: 4
+rollout_gpus: 4
+tp_size: 1
+train_tp_size: 1
+train_pp_size: 1
+train_dp_size: 4
+vllm_tp_size: 1
+
+batch_size: 8
+micro_batch_size: 1
+n_samples: 2
+total_steps: 12
+learning_rate: 2.0e-6
+ppo_epochs: 1
+sync_interval: 6
+eval_interval: 6
+save_interval: 0
+
+max_seq_length: 4096
+max_new_tokens: 512
+r2e_max_turns: 6
+r2e_max_prompt_tokens: 1536
+max_concurrent_rollouts: 2
+max_head_offpolicyness: 1
+queue_size: 8
+temperature: 1.0
+top_p: 0.95
+recompute_logprobs: true
+
+weight_sync_mode: "disk"
+rollout_weight_sync_mode: "restart"
+rollout_weight_sync_control_dir: "/data_nv2/r2e_gym_qwen3_14b_npu_capability_curve/rollout_weight_sync"
+rollout_weight_sync_timeout_s: 2400
+rollout_weight_sync_export_only: false
+require_rollout_weight_sync: true
+
+enable_history_collection: true
+history_output_dir: "/data/qianzhirong/runs/r2e_gym_qwen3_14b_npu_capability_curve/history"
+history_save_raw_lengths: true
+history_flush_interval: 1
+history_experiment_name: "r2e_gym_qwen3_14b_npu_capability_curve"
+
+log_dir: "/data/qianzhirong/runs/r2e_gym_qwen3_14b_npu_capability_curve/logs"
+sync_path: "/data_nv2/r2e_gym_qwen3_14b_npu_capability_curve/weights"
+wandb_project: ""
+wandb_run_name: "r2e-gym-qwen3-14b-npu-capability-curve"
+
+heterogeneous_rollout:
+  enabled: true
+  total_gpus: 4
+  vllm_host: "127.0.0.1"
+  vllm_base_port: 8000
+  max_model_len: 4096
+  gpu_memory_utilization: 0.88
+
+  instances:
+    - instance_id: "short_tp1_0"
+      tp: 1
+      gpus: [4]
+      port: 8000
+    - instance_id: "short_tp1_1"
+      tp: 1
+      gpus: [5]
+      port: 8001
+    - instance_id: "long_tp2"
+      tp: 2
+      gpus: [6, 7]
+      port: 8002
+
+  scheduling:
+    scheduler_type: "cmlfq"
+    load_balance_strategy: "least_connections"
+    max_queue_length: 8
+    enable_fallback: true
+    cmlfq_rebuild_interval: 4
+    cmlfq_tree_path: "/data/qianzhirong/runs/r2e_gym_qwen3_14b_npu_capability_curve/cmlfq_tree.json"
+    cmlfq_tree_persist_interval: 1
+    cmlfq_payload_small_threshold: 400
+    cmlfq_payload_large_threshold: 1600
+    cmlfq_buckets:
+      short:
+        tp_degrees: [1]
+        max_tokens: 256
+      medium:
+        tp_degrees: [1]
+        max_tokens: 768
+      long:
+        tp_degrees: [2]
+        max_tokens: 1024
+
+global_resource_planner:
+  enabled: true
+  train_backend: "analytic"
+  rollout_backend: "analytic"
+  plan_interval: 2
+  warmup_steps: 0
+  min_history_size: 4
+  min_gain_ratio: 0.0
+  reconfiguration_cost_s: 0.0
+  allowed_train_tp: [1]
+  allowed_train_pp: [1]
+  fixed_train_gpus: 4
+  allowed_rollout_tp: [1, 2]
+  require_heterogeneous_rollout_tp: true
+  micro_batch_sizes: [1]
+  apply_to_runtime: false
+  runtime_async_planning: false
+  runtime_dynamic_reconfiguration_enabled: false
+  runtime_online_replanning: false
+  verbose: true

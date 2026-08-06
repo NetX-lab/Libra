@@ -38,13 +38,11 @@ try:
         ElasticGradientClient,
         ElasticGradientServer,
         GradientEndpoint,
-        GradientUpdate,
     )
     _GRADIENT_IPC_EXPORTS = [
         "ElasticGradientClient",
         "ElasticGradientServer",
         "GradientEndpoint",
-        "GradientUpdate",
     ]
 except ModuleNotFoundError as exc:  # pragma: no cover - local dev without torch
     if exc.name != "torch":
