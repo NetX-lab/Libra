@@ -23,6 +23,7 @@
 </p>
 
 <p align="center">
+  <a href="#latest-news">Latest News</a> ·
   <a href="#features">Features</a> ·
   <a href="#system-overview">Architecture</a> ·
   <a href="#installation">Installation</a> ·
@@ -36,6 +37,15 @@ changes during training.
 
 This repository accompanies the paper **"Libra: Efficient Resource Management
 for Agentic RL Post-Training"**. Read the [paper](https://arxiv.org/abs/2606.03077) for the full design.
+
+## Latest News
+
+- **2026-08-06** — Added multi-node Ascend NPU cluster support on the
+  [`NPU_Support`](https://github.com/NetX-lab/Libra/tree/NPU_Support) branch,
+  including Megatron-Core/HCCL training, vLLM Ascend rollout workers, Global
+  Resource Planner integration, C-MLFQ scheduling, and Elastic Hybrid Pool
+  execution. The validated reference run uses Qwen3-14B on 6 nodes and 48 NPUs.
+- **2026-08-03** — Libra was officially open sourced.
 
 
 ## System Overview
