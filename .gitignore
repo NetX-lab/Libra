@@ -76,3 +76,7 @@ data/r2e_gym_v1/manifest.json
 search_r1_raw
 *.parquet
 *.analysis.md
+
+# Local NPU validation records
+docs/npu_validation.md
+docs/ascend_megatron_validated_environment.md

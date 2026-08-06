@@ -1,9 +1,9 @@
 # Ascend NPU Environment
 
-For the newer, hardware-validated Megatron-Core/Bridge baseline, see
-`docs/ascend_megatron_validated_environment.md` and run
-`scripts/setup_ascend_megatron_validated_env.sh`.  That record pins the exact
-environment which passed a real Qwen3 Megatron-Core forward test on 2026-08-05.
+For the newer Megatron-Core/Bridge baseline, run
+`scripts/setup_ascend_megatron_validated_env.sh`. Its direct dependency pins
+are recorded in `requirements-ascend-megatron-validated.lock.txt` and
+`requirements-vllm-ascend-validated.lock.txt`.
 
 This is the first-pass dependency split for running Libra on Ascend NPUs. Use
 it on NPU hosts instead of the CUDA-oriented `requirements.txt`.

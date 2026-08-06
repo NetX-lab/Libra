@@ -46,7 +46,6 @@ for Agentic RL Post-Training"**. Read the [paper](https://arxiv.org/abs/2606.030
 - **2026-08-06** — Added multi-node Ascend NPU cluster support, including
   Megatron-Core/HCCL training, vLLM Ascend rollout workers, Global Resource
   Planner integration, C-MLFQ scheduling, and Elastic Hybrid Pool execution.
-  The reference validation uses Qwen3-14B on 6 nodes and 48 NPUs.
 - **2026-08-03** — Libra was officially open sourced.
 
 
@@ -135,8 +134,6 @@ RL_Framework/
 | [Runtime history collection](docs/history_data_collection.md) | Metrics and history data used by the online planner |
 | [NPU support overview](docs/npu_support.md) | NPU branch scope, architecture, and supported components |
 | [NPU cluster quick start](docs/npu_cluster_quick_start.md) | Six-node launch preparation and reusable environment setup |
-| [Validated Ascend environment](docs/ascend_megatron_validated_environment.md) | Reproducible Megatron-Core/Bridge and vLLM Ascend dependency baseline |
-| [NPU validation report](docs/npu_validation.md) | Qwen3-14B, 6-node/48-NPU, 100-step validation evidence |
 
 > Libra is a research artifact. This branch targets multi-node Ascend NPU
 > clusters. Host addresses, network devices, shared paths, and model locations
@@ -161,8 +158,8 @@ bash scripts/setup_npu_env.sh
 ```
 
 See the [NPU cluster quick start](docs/npu_cluster_quick_start.md) and
-[validated Ascend environment](docs/ascend_megatron_validated_environment.md)
-for the CANN, Megatron-Core/Bridge, and vLLM Ascend dependency paths.
+[Ascend NPU environment guide](docs/npu_environment.md) for the CANN,
+Megatron-Core/Bridge, and vLLM Ascend dependency paths.
 
 If your platform has a compatible vLLM wheel, you can simplify installation by
 using that wheel instead of a source build. On clusters, install inside the same

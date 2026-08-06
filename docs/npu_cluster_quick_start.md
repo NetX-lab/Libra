@@ -13,8 +13,8 @@ environment and keep the vLLM Ascend environment separate:
 bash scripts/setup_ascend_megatron_validated_env.sh
 ```
 
-See `docs/ascend_megatron_validated_environment.md` for exact pins and the
-hardware preflight command.
+See `docs/npu_environment.md` and the validated requirement lock files for the
+dependency pins and hardware preflight command.
 
 ## 2. Distribute code and models
 
