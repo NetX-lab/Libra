@@ -28,6 +28,8 @@ run_name="${RUN_NAME:-formal_4node32_${ARM}_$(date +%Y%m%d_%H%M%S)}"
 run_dir="${run_root}/${run_name}"
 master_port="${MASTER_PORT:-30740}"
 config_python="${CONFIG_PYTHON:-/opt/libra/envs/rl_framework_py310/bin/python}"
+vllm_venv_dir="${VLLM_VENV_DIR:-/opt/libra/envs/vllm_ascend}"
+model_path="${MODEL_PATH:-/opt/libra/models/Qwen3-14B}"
 
 read -r -a available_hosts <<< "${AVAILABLE_HOSTS:-}"
 [[ "${#available_hosts[@]}" -eq 4 ]] || {
@@ -105,7 +107,7 @@ cleanup_rollout() {
   for host in "${rollout_hosts[@]}"; do
     node_id="n${host##*.}"
     INTERNAL_SSH_TIMEOUT=30 "$project_dir/scripts/internal_ssh.sh" "$host" -- \
-      "cd '$rollout_project_dir' && PROJECT_DIR='$rollout_project_dir' RUN_ROOT='$run_root' ROLLOUT_TP_PATTERN='$rollout_tp_pattern' bash scripts/start_r2e_rollout_pool_npu.sh stop '$node_id'" || true
+      "cd '$rollout_project_dir' && PROJECT_DIR='$rollout_project_dir' VLLM_VENV_DIR='$vllm_venv_dir' MODEL_PATH='$model_path' RUN_ROOT='$run_root' ROLLOUT_TP_PATTERN='$rollout_tp_pattern' bash scripts/start_r2e_rollout_pool_npu.sh stop '$node_id'" || true
   done
 }
 trap cleanup_rollout EXIT INT TERM
@@ -146,7 +148,7 @@ find "${run_root}/rollout_weight_sync" -maxdepth 1 -type f \
 for host in "${rollout_hosts[@]}"; do
   node_id="n${host##*.}"
   "$project_dir/scripts/internal_ssh.sh" "$host" -- \
-    "cd '$rollout_project_dir' && PROJECT_DIR='$rollout_project_dir' RUN_ROOT='$run_root' ROLLOUT_TP_PATTERN='$rollout_tp_pattern' bash scripts/start_r2e_rollout_pool_npu.sh start '$node_id'"
+    "cd '$rollout_project_dir' && PROJECT_DIR='$rollout_project_dir' VLLM_VENV_DIR='$vllm_venv_dir' MODEL_PATH='$model_path' RUN_ROOT='$run_root' ROLLOUT_TP_PATTERN='$rollout_tp_pattern' bash scripts/start_r2e_rollout_pool_npu.sh start '$node_id'"
 done
 
 for host in "${rollout_hosts[@]}"; do

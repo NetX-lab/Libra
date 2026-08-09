@@ -145,7 +145,28 @@ stop_one() {
 
 case "$action" in
     start)
-        for index in "${!ids[@]}"; do start_one "$index"; done
+        # Stagger wrapper creation slightly: launching four TP2 vLLM process
+        # trees in the same instant can exhaust transient host resources and
+        # make the final wrapper exit before it writes a log.
+        for index in "${!ids[@]}"; do
+            start_one "$index"
+            sleep 1
+        done
+        # Verify the long-lived restartable wrappers, and idempotently retry
+        # only missing instances. Endpoint readiness is checked by the
+        # cluster launcher after this local process-level guard.
+        for _ in 1 2 3; do
+            sleep 5
+            missing=0
+            for index in "${!ids[@]}"; do
+                pid_file="${pid_dir}/${ids[$index]}.pid"
+                if [[ ! -f "$pid_file" ]] || ! kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+                    missing=1
+                    start_one "$index"
+                fi
+            done
+            [[ "$missing" -eq 0 ]] && break
+        done
         ;;
     stop)
         for index in "${!ids[@]}"; do stop_one "$index"; done
