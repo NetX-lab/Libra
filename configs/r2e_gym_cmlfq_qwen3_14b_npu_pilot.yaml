@@ -11,8 +11,8 @@ base_config: base.yaml
 hardware_config: hardware_config/a100_80g.yaml
 model_arch_config: model_arch_config/qwen3-14b.yaml
 
-model_path: "/data/qianzhirong/models/Qwen3-14B"
-tokenizer_path: "/data/qianzhirong/models/Qwen3-14B"
+model_path: "/opt/libra/models/Qwen3-14B"
+tokenizer_path: "/opt/libra/models/Qwen3-14B"
 
 device_backend: "npu"
 distributed_backend: "hccl"

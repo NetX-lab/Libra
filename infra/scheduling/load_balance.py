@@ -112,8 +112,19 @@ class LoadBalanceScheduler(BaseScheduler):
             return min(candidates, key=weighted_load)
 
         else:
-
-            return min(candidates, key=lambda h: h.active_requests)
+            min_active = min(h.active_requests for h in candidates)
+            least_loaded = [
+                h for h in candidates if h.active_requests == min_active
+            ]
+            # A plain ``min`` always picks the first registered endpoint when
+            # requests complete between scheduling calls.  That starves later
+            # endpoints (and can leave an entire rollout node idle) for
+            # low-concurrency, multi-turn workloads such as R2E-Gym.  Rotate
+            # among equal-load endpoints while preserving least-connections
+            # as the primary selection criterion.
+            idx = self._rr_counter % len(least_loaded)
+            self._rr_counter += 1
+            return least_loaded[idx]
 
     def on_request_done(
         self,

@@ -114,6 +114,23 @@ def _tokens_per_second(records: list[dict[str, Any]]) -> list[float]:
     return values
 
 
+def _aggregate_token_throughput(records: list[dict[str, Any]]) -> float:
+    total_tokens = 0
+    total_time = 0.0
+    for record in records:
+        step_time = _safe_float(record.get("timing", {}).get("step_total_time"))
+        if step_time <= 0:
+            continue
+        tokens = sum(
+            _safe_int(seq.get("input_len")) + _safe_int(seq.get("output_len"))
+            for seq in record.get("sequences") or []
+        )
+        if tokens > 0:
+            total_tokens += tokens
+            total_time += step_time
+    return total_tokens / total_time if total_time > 0 else 0.0
+
+
 def _trajectory_throughput(records: list[dict[str, Any]]) -> list[float]:
     values: list[float] = []
     for record in records:
@@ -123,6 +140,36 @@ def _trajectory_throughput(records: list[dict[str, Any]]) -> list[float]:
         n_traj = _safe_int(metrics.get("n_trajectories"))
         if step_time > 0 and n_traj > 0:
             values.append(n_traj / step_time)
+    return values
+
+
+def _aggregate_trajectory_throughput(records: list[dict[str, Any]]) -> float:
+    total_trajectories = 0
+    total_time = 0.0
+    for record in records:
+        step_time = _safe_float(record.get("timing", {}).get("step_total_time"))
+        n_traj = _safe_int(record.get("training_metrics", {}).get("n_trajectories"))
+        if step_time > 0 and n_traj > 0:
+            total_trajectories += n_traj
+            total_time += step_time
+    return total_trajectories / total_time if total_time > 0 else 0.0
+
+
+def _validator_reward_series(records: list[dict[str, Any]]) -> list[float]:
+    """Return per-step mean best validator reward across generated sequences."""
+    values: list[float] = []
+    for record in records:
+        sequence_rewards: list[float] = []
+        for sequence in record.get("sequences") or []:
+            rewards = [
+                _safe_float(item.get("reward"))
+                for item in sequence.get("tool_returns") or []
+                if item.get("reward") is not None
+            ]
+            if rewards:
+                sequence_rewards.append(max(rewards))
+        if sequence_rewards:
+            values.append(_mean(sequence_rewards))
     return values
 
 
@@ -201,6 +248,9 @@ def _count_log_patterns(path: Path) -> dict[str, int]:
         "elastic_gradient_domain": "elastic_gradient_domain",
         "cluster_swap_complete": "cluster_swap_complete",
         "planner_applied": "applied actions=",
+        "active_hybrids_0": "active_hybrids=0",
+        "active_hybrids_1": "active_hybrids=1",
+        "hybrid_join": "join_training:rollout0->dp0",
         "prefix_tree_updates": "prefix-tree",
     }
     counts = {key: 0 for key in patterns}
@@ -236,9 +286,14 @@ def _load_tree_stats(paths: list[Path]) -> dict[str, Any]:
     return stats
 
 
-def load_run(name: str, path: Path) -> RunSummary:
+def load_run(name: str, path: Path, history_roots: list[Path] | None = None) -> RunSummary:
     run = RunSummary(name=name, path=path)
-    run.history_files = sorted(path.rglob("*history*.jsonl"))
+    history_files = set(path.rglob("*history*.jsonl"))
+    for history_root in history_roots or []:
+        for history_path in history_root.rglob("*history*.jsonl"):
+            if path.name in history_path.name or name in history_path.name:
+                history_files.add(history_path)
+    run.history_files = sorted(history_files)
     for history_path in run.history_files:
         run.history_records.extend(_load_jsonl(history_path))
     for events_path in sorted(path.rglob("runtime_reconfiguration_events.jsonl")):
@@ -262,6 +317,9 @@ def load_run(name: str, path: Path) -> RunSummary:
 
 
 def _reward_series(run: RunSummary) -> list[float]:
+    rewards = _validator_reward_series(run.history_records)
+    if rewards:
+        return rewards
     rewards = [
         _safe_float(v)
         for v in _history_metric(
@@ -290,6 +348,14 @@ def summarize_run(run: RunSummary) -> dict[str, Any]:
     if not traj_tps:
         traj_tps = _log_trajectory_throughput(run.log_step_records)
     token_tps = _tokens_per_second(run.history_records)
+    aggregate_traj_tps = _aggregate_trajectory_throughput(run.history_records)
+    aggregate_token_tps = _aggregate_token_throughput(run.history_records)
+    training_rewards = [
+        _safe_float(v)
+        for v in _history_metric(
+            run.history_records, "training_metrics", "reward_mean"
+        )
+    ]
     gen_means = [
         _safe_float(v)
         for v in _history_metric(
@@ -304,6 +370,10 @@ def summarize_run(run: RunSummary) -> dict[str, Any]:
         _safe_float(v)
         for v in _history_metric(run.history_records, "timing", "train_time")
     ]
+    weight_sync_times = [
+        _safe_float(v)
+        for v in _history_metric(run.history_records, "timing", "weight_sync_time")
+    ]
     planner_decisions = [
         event for event in run.events
         if event.get("decision", {}).get("should_reconfigure")
@@ -315,9 +385,11 @@ def summarize_run(run: RunSummary) -> dict[str, Any]:
         run.log_counts.get("cluster_swap_complete", 0),
     )
     return {
-        "steps": len(rewards) or len(run.history_records) or len(run.log_step_records),
+        "steps": len(run.history_records) or len(run.log_step_records) or len(rewards),
         "max_logged_step": max(
-            [_safe_int(r.get("step")) for r in run.log_step_records] or [0]
+            [_safe_int(r.get("step")) for r in run.history_records]
+            + [_safe_int(r.get("step")) for r in run.log_step_records]
+            or [0]
         ),
         "reward_first": _mean(_first_window(rewards)),
         "reward_last": _mean(_last_window(rewards)),
@@ -325,12 +397,27 @@ def summarize_run(run: RunSummary) -> dict[str, Any]:
         if rewards else 0.0,
         "reward_min": min(rewards) if rewards else 0.0,
         "reward_max": max(rewards) if rewards else 0.0,
+        "capability_reward_zero_ratio": (
+            sum(1 for reward in rewards if abs(reward) < 1e-12) / len(rewards)
+            if rewards else 0.0
+        ),
+        "training_reward_zero_ratio": (
+            sum(1 for reward in training_rewards if abs(reward) < 1e-12)
+            / len(training_rewards)
+            if training_rewards else 0.0
+        ),
         "step_time_mean": _mean(step_times),
         "step_time_median": median(step_times) if step_times else 0.0,
-        "traj_per_s_mean": _mean(traj_tps),
-        "tokens_per_s_mean": _mean(token_tps),
+        "steps_per_hour": (
+            3600.0 * len(step_times) / sum(step_times) if step_times else 0.0
+        ),
+        "traj_per_s_mean": aggregate_traj_tps or _mean(traj_tps),
+        "tokens_per_s_mean": aggregate_token_tps or _mean(token_tps),
         "rollout_time_mean": _mean([v for v in rollout_times if v > 0]),
         "train_time_mean": _mean([v for v in train_times if v > 0]),
+        "weight_sync_time_mean_nonzero": _mean(
+            [v for v in weight_sync_times if v > 0]
+        ),
         "gen_len_first": _mean(_first_window(gen_means)),
         "gen_len_last": _mean(_last_window(gen_means)),
         "runtime_events": len(run.events),
@@ -380,7 +467,18 @@ def render_report(runs: list[RunSummary]) -> str:
         lines.append(
             f"- **{run.name}**: reward {direction}; first-window={s['reward_first']:.4f}, "
             f"last-window={s['reward_last']:.4f}, delta={s['reward_delta']:.4f}; "
-            f"generation mean changed {s['gen_len_first']:.1f} -> {s['gen_len_last']:.1f} tokens."
+            f"training zero-reward ratio={s['training_reward_zero_ratio']:.1%}; generation mean changed "
+            f"{s['gen_len_first']:.1f} -> {s['gen_len_last']:.1f} tokens."
+        )
+    lines.extend(["", "## Throughput and Phase Timing", ""])
+    for run in runs:
+        s = summaries[run.name]
+        lines.append(
+            f"- **{run.name}**: {s['steps_per_hour']:.2f} steps/hour, "
+            f"step={s['step_time_mean']:.2f}s (median {s['step_time_median']:.2f}s), "
+            f"rollout={s['rollout_time_mean']:.2f}s, train={s['train_time_mean']:.2f}s, "
+            f"nonzero weight-sync={s['weight_sync_time_mean_nonzero']:.2f}s, "
+            f"trajectory={s['traj_per_s_mean']:.4f}/s, token={s['tokens_per_s_mean']:.2f}/s."
         )
     if len(runs) >= 2:
         base = summaries[runs[0].name]
@@ -414,6 +512,8 @@ def render_report(runs: list[RunSummary]) -> str:
             f"GRP log events={counts.get('global_resource_planner', 0)}, "
             f"EHP/runtime events={counts.get('runtime_elastic_executor', 0)}, "
             f"elastic domain events={counts.get('elastic_gradient_domain', 0)}, "
+            f"active_hybrids=1 events={counts.get('active_hybrids_1', 0)}, "
+            f"hybrid joins={counts.get('hybrid_join', 0)}, "
             f"cluster swaps={counts.get('cluster_swap_complete', 0)}."
         )
         if tree:
@@ -437,10 +537,20 @@ def main() -> None:
         help="Run name and log directory. Can be passed multiple times.",
     )
     parser.add_argument("--output", default="", help="Markdown output path.")
+    parser.add_argument(
+        "--history-root",
+        action="append",
+        default=[],
+        help="Additional history directory. Files are matched by run directory/name.",
+    )
     args = parser.parse_args()
     if not args.run:
         raise SystemExit("at least one --run NAME=PATH is required")
     runs: list[RunSummary] = []
+    history_roots = [Path(item).expanduser().resolve() for item in args.history_root]
+    for history_root in history_roots:
+        if not history_root.exists():
+            raise SystemExit(f"history root does not exist: {history_root}")
     for item in args.run:
         if "=" not in item:
             raise SystemExit(f"invalid --run value: {item!r}")
@@ -448,7 +558,7 @@ def main() -> None:
         path = Path(raw_path).expanduser().resolve()
         if not path.exists():
             raise SystemExit(f"run path does not exist: {path}")
-        runs.append(load_run(name, path))
+        runs.append(load_run(name, path, history_roots=history_roots))
     report = render_report(runs)
     if args.output:
         out = Path(args.output).expanduser().resolve()

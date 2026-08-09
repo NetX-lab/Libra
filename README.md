@@ -23,7 +23,6 @@
 </p>
 
 <p align="center">
-  <a href="#latest-news">Latest News</a> ·
   <a href="#features">Features</a> ·
   <a href="#system-overview">Architecture</a> ·
   <a href="#installation">Installation</a> ·
@@ -37,16 +36,6 @@ changes during training.
 
 This repository accompanies the paper **"Libra: Efficient Resource Management
 for Agentic RL Post-Training"**. Read the [paper](https://arxiv.org/abs/2606.03077) for the full design.
-
-> This is the **Ascend NPU implementation branch**. The NVIDIA GPU release is
-> maintained separately on [`main`](https://github.com/NetX-lab/Libra/tree/main).
-
-## Latest News
-
-- **2026-08-06** — Added multi-node Ascend NPU cluster support, including
-  Megatron-Core/HCCL training, vLLM Ascend rollout workers, Global Resource
-  Planner integration, C-MLFQ scheduling, and Elastic Hybrid Pool execution.
-- **2026-08-03** — Libra was officially open sourced.
 
 
 ## System Overview
@@ -109,8 +98,6 @@ RL_Framework/
 - **Megatron-Core training backend.** Supports tensor parallelism, distributed
   optimizer, sharded checkpoint metadata, precision-aware optimizer settings,
   and CPU optimizer offload for large models.
-- **Ascend NPU runtime.** Supports torch-npu device selection, HCCL distributed
-  execution, Megatron-Core compatibility shims, and vLLM Ascend rollout pools.
 - **Async GRPO pipeline.** Decouples rollout and training, tracks policy
   versions, bounds off-policyness, and can recompute log probabilities before
   policy updates.
@@ -132,12 +119,10 @@ RL_Framework/
 | [Multi-node Slurm guide](docs/slurm_multi_node_guide.md) | Distributed launch configuration and operational notes |
 | [Megatron-Core backend](docs/megatron_core_backend.md) | Backend architecture, configuration, and stability guidance |
 | [Runtime history collection](docs/history_data_collection.md) | Metrics and history data used by the online planner |
-| [NPU support overview](docs/npu_support.md) | NPU branch scope, architecture, and supported components |
-| [NPU cluster quick start](docs/npu_cluster_quick_start.md) | Six-node launch preparation and reusable environment setup |
 
-> Libra is a research artifact. This branch targets multi-node Ascend NPU
-> clusters. Host addresses, network devices, shared paths, and model locations
-> in the reference templates must be adapted to your environment.
+> Libra is a research artifact. The supplied launchers target multi-node NVIDIA
+> GPU clusters managed by Slurm. Paths, partitions, node names, network devices,
+> container runtimes, and model locations should be adapted to your own cluster.
 
 ## Installation
 
@@ -157,9 +142,9 @@ For Ascend NPU hosts, use the NPU dependency split instead:
 bash scripts/setup_npu_env.sh
 ```
 
-See the [NPU cluster quick start](docs/npu_cluster_quick_start.md) and
-[Ascend NPU environment guide](docs/npu_environment.md) for the CANN,
-Megatron-Core/Bridge, and vLLM Ascend dependency paths.
+See [Ascend NPU Environment](docs/npu_environment.md) for the current CANN
+8.5.x baseline, optional Megatron/vLLM Ascend installs, and the first
+CUDA-to-NPU adaptation points.
 
 If your platform has a compatible vLLM wheel, you can simplify installation by
 using that wheel instead of a source build. On clusters, install inside the same
@@ -178,9 +163,9 @@ pytest -q \
   tests/test_runtime_elastic_executor.py
 ```
 
-NPU, distributed, HCCL, and end-to-end tests are environment dependent. Start
-with `examples/test_megatron_core_npu_runtime.py`, then use the cluster launcher
-under `scripts/` for the full reference topology.
+GPU, distributed, native-RDMA, and end-to-end tests are environment dependent.
+See the production Slurm launchers under `scripts/` and the distributed or
+elastic test suites under `tests/`.
 
 
 ## Citation
@@ -200,6 +185,9 @@ If Libra is useful in your research, please cite:
 ```
 
 ## Acknowledgements
+
+We gratefully acknowledge Huawei's 2012 Laboratories for their collaboration
+and support.
 
 Libra builds on ideas and components from the broader open-source RL and
 distributed-systems ecosystem, including verl, vLLM, Megatron-LM, AReaL, Sailor,

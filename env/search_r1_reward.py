@@ -4,8 +4,8 @@ import re
 import string
 from typing import List, Union
 
-from RL_Framework.env.grader import math_equal
-from RL_Framework.env.parse_utils_qwen import extract_answer
+from env.grader import math_equal
+from env.parse_utils_qwen import extract_answer
 
 
 def extract_search_r1_answer(text: str) -> str:

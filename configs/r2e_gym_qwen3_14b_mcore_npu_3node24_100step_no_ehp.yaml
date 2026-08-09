@@ -1,0 +1,14 @@
+# Exact compact-run control arm.  It inherits the 3-node/24-NPU EHP config
+# and changes only the EHP training-pool controls and run labels.
+base_config: r2e_gym_qwen3_14b_mcore_npu_3node24_100step.yaml
+
+wandb_run_name: "r2e-gym-qwen3-14b-mcore-npu-3node24-100step-no-ehp"
+history_experiment_name: "r2e_gym_qwen3_14b_3node24_100step_no_ehp"
+
+global_resource_planner:
+  runtime_training_pool_target_gpus: 16
+  hybrid_training_prewarm_enabled: false
+  hybrid_training_prewarm_count: 0
+  hybrid_training_prewarm_worker_ids: []
+  hybrid_worker_launch_enabled: false
+  hybrid_worker_task_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_3node24/elastic_training_tasks_no_ehp"

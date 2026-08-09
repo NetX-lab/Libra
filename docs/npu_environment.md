@@ -1,9 +1,9 @@
 # Ascend NPU Environment
 
-For the newer Megatron-Core/Bridge baseline, run
-`scripts/setup_ascend_megatron_validated_env.sh`. Its direct dependency pins
-are recorded in `requirements-ascend-megatron-validated.lock.txt` and
-`requirements-vllm-ascend-validated.lock.txt`.
+For the newer, hardware-validated Megatron-Core/Bridge baseline, see
+`docs/ascend_megatron_validated_environment.md` and run
+`scripts/setup_ascend_megatron_validated_env.sh`.  That record pins the exact
+environment which passed a real Qwen3 Megatron-Core forward test on 2026-08-05.
 
 This is the first-pass dependency split for running Libra on Ascend NPUs. Use
 it on NPU hosts instead of the CUDA-oriented `requirements.txt`.
@@ -18,7 +18,7 @@ The initial target inspected on 2026-07-31 is:
 ## Create the environment
 
 ```bash
-cd /root/RL_Framework_npu
+cd /opt/libra/RL_Framework_NPU
 bash scripts/setup_npu_env.sh
 source .venv-npu/bin/activate
 export PYTHONPATH="$(dirname "$PWD"):${PYTHONPATH:-}"
@@ -53,7 +53,7 @@ NNAL/ATB is required for real vLLM Ascend serving because it provides
 `torch_atb` wheel is installed into the vLLM environment:
 
 ```bash
-source /root/vllm_ascend_env/bin/activate
+source /opt/libra/envs/vllm_ascend/bin/activate
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 /tmp/Ascend-cann-nnal_8.5.2_linux-aarch64.run \
   --install --quiet --install-for-all --force --whitelist=all --torch_atb
@@ -62,17 +62,17 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 Start a single-card vLLM server on a different NPU from training:
 
 ```bash
-cd /root/RL_Framework_npu
-VENV_DIR=/root/vllm_ascend_env \
+cd /opt/libra/RL_Framework_NPU
+VENV_DIR=/opt/libra/envs/vllm_ascend \
 ASCEND_DEVICES=1 \
 MAX_MODEL_LEN=512 \
-bash scripts/run_vllm_ascend_server.sh /data/qianzhirong/models/Qwen3-0.6B
+bash scripts/run_vllm_ascend_server.sh /opt/libra/models/Qwen3-0.6B
 ```
 
 Then run the real rollout smoke test on NPU 0:
 
 ```bash
-cd /root/RL_Framework_npu
+cd /opt/libra/RL_Framework_NPU
 source .venv-npu/bin/activate
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 PYTHONPATH=/root \

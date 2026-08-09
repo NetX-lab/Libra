@@ -73,6 +73,11 @@ class AsyncRLTrainer:
 
         self.global_step = 0
         self.stats = {}
+        self.start_step = int(os.environ.get("RL_TRAIN_START_STEP", "0") or 0)
+        self.initial_model_version = int(
+            os.environ.get("RL_INITIAL_MODEL_VERSION", str(self.start_step))
+            or self.start_step
+        )
 
 
         self.workflow = None
@@ -117,6 +122,17 @@ class AsyncRLTrainer:
             print("Initializing the training engine...")
         self.train_engine = create_train_engine(self.config)
         self.train_engine.initialize(max_seq_length=self.config.max_seq_length)
+        if self.start_step > 0 or self.initial_model_version > 0:
+            self.train_engine.set_version(self.initial_model_version)
+            if self.is_main_process:
+                print(
+                    "RESUME_STATE "
+                    f"start_step={self.start_step} "
+                    f"initial_model_version={self.initial_model_version} "
+                    f"model_path={self.config.model_path}",
+                    flush=True,
+                )
+        self._initialize_elastic_communication_domains()
 
 
         if self.is_main_process and self.train_engine.is_batch_source():
@@ -598,6 +614,11 @@ class AsyncRLTrainer:
 
         if dataset is None:
             raise ValueError("dataset cannot be None")
+        if self.start_step < 0 or self.start_step >= self.config.total_steps:
+            raise ValueError(
+                "RL_TRAIN_START_STEP must be in [0, total_steps): "
+                f"start_step={self.start_step}, total_steps={self.config.total_steps}"
+            )
 
 
         data_gen = self._create_data_generator(dataset, workflow)
@@ -612,13 +633,14 @@ class AsyncRLTrainer:
         if self.is_main_process:
             print("\nStarting asynchronous pipeline training")
             print(f"Total steps: {self.config.total_steps}")
+            print(f"Start step: {self.start_step}")
             print(f"global_batch_size: {self.config.batch_size}")
             print(f"local_batch_size_per_dp_replica: {local_batch_size}")
             print("=" * 60)
 
         start_time = time.time()
 
-        for step in range(self.config.total_steps):
+        for step in range(self.start_step, self.config.total_steps):
             self.global_step = step
             step_start = time.time()
             self._trace_train_phase(step, "step_start")
@@ -1213,13 +1235,69 @@ class AsyncRLTrainer:
 
         checkpoint = {
             "global_step": self.global_step,
-            "stats": self.stats,
-            "config": self.config,
+            "stats": self._checkpoint_safe_value(self.stats),
+            "config": self.config.to_dict(),
             "version": self.train_engine.get_version(),
         }
 
         torch.save(checkpoint, os.path.join(checkpoint_path, f"step_{self.global_step}.pt"))
         print(f"Checkpoint saved: step_{self.global_step}.pt")
+
+    @classmethod
+    def _checkpoint_safe_value(
+        cls,
+        value: Any,
+        *,
+        _seen: set[int] | None = None,
+        _depth: int = 0,
+        max_depth: int = 32,
+    ) -> Any:
+        """Build a bounded, cycle-safe snapshot for lightweight checkpoints."""
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, torch.Tensor):
+            detached = value.detach().cpu()
+            return detached.item() if detached.numel() == 1 else detached.tolist()
+        if _depth >= max_depth:
+            return "<max-depth-exceeded>"
+
+        if _seen is None:
+            _seen = set()
+        value_id = id(value)
+        if value_id in _seen:
+            return "<recursive-reference>"
+
+        if isinstance(value, dict):
+            _seen.add(value_id)
+            try:
+                return {
+                    str(key): cls._checkpoint_safe_value(
+                        item,
+                        _seen=_seen,
+                        _depth=_depth + 1,
+                        max_depth=max_depth,
+                    )
+                    for key, item in value.items()
+                }
+            finally:
+                _seen.remove(value_id)
+        if isinstance(value, (list, tuple, set)):
+            _seen.add(value_id)
+            try:
+                return [
+                    cls._checkpoint_safe_value(
+                        item,
+                        _seen=_seen,
+                        _depth=_depth + 1,
+                        max_depth=max_depth,
+                    )
+                    for item in value
+                ]
+            finally:
+                _seen.remove(value_id)
+        return repr(value)
 
     def _cleanup_old_weights(self):
         """Cleanup old weights."""
@@ -1247,9 +1325,15 @@ class AsyncRLTrainer:
 
         for v in to_delete:
             try:
-                shutil.rmtree(version_dir_map[v])
+                weight_dir = Path(version_dir_map[v]).resolve()
+                model_path_value = str(getattr(self.config, "model_path", "") or "")
+                if model_path_value and Path(model_path_value).resolve() == weight_dir:
+                    if self.is_main_process:
+                        print(f"Preserving resume source weights: {weight_dir}")
+                    continue
+                shutil.rmtree(weight_dir)
                 if self.is_main_process:
-                    print(f"Deleted old weights: {version_dir_map[v]}")
+                    print(f"Deleted old weights: {weight_dir}")
             except Exception as e:
                 print(f"WARNING: Failed to delete weights {version_dir_map[v]}: {e}")
 
@@ -1264,6 +1348,18 @@ class AsyncRLTrainer:
             self._grp_executor = None
             self._grp_future = None
             self._grp_future_step = None
+
+        if self.runtime_elastic_executor is not None:
+            self.runtime_elastic_executor.close()
+            self.runtime_elastic_executor = None
+
+        close_elastic = getattr(
+            self.train_engine,
+            "close_elastic_communication_domain",
+            None,
+        )
+        if callable(close_elastic):
+            close_elastic()
 
 
         if self.history_collector is not None:
@@ -1376,6 +1472,39 @@ class AsyncRLTrainer:
             f"gain_threshold={planner_cfg.min_gain_ratio:.2%} "
             f"async={getattr(planner_cfg, 'runtime_async_planning', True)}"
         )
+
+    def _initialize_elastic_communication_domains(self) -> None:
+        """Create the isolated elastic CCL domain on every training rank."""
+        planner_cfg = getattr(self.config, "global_resource_planner", None)
+        if planner_cfg is None or not getattr(planner_cfg, "enabled", False):
+            return
+        if not bool(getattr(planner_cfg, "decouple_communication_domains", True)):
+            return
+        if not bool(
+            getattr(planner_cfg, "elastic_hybrid_require_isolated_ccl", False)
+        ):
+            return
+        initializer = getattr(
+            self.train_engine,
+            "initialize_elastic_communication_domain",
+            None,
+        )
+        if not callable(initializer):
+            raise RuntimeError(
+                "production EHP requires a train engine with isolated CCL support"
+            )
+        initializer()
+        if self.is_main_process:
+            state = self.train_engine.get_parallel_state()
+            if not state.get("elastic_gradient_ccl_isolated", False):
+                raise RuntimeError(
+                    "train engine did not report an isolated elastic CCL domain"
+                )
+            print(
+                "[ElasticCCL] trainer setup verified isolated elastic domain "
+                f"ranks={state.get('elastic_gradient_group_ranks', [])}",
+                flush=True,
+            )
 
     def _start_runtime_reconfiguration_follower(self) -> None:
         planner_cfg = getattr(self.config, "global_resource_planner", None)
@@ -1842,6 +1971,13 @@ class AsyncRLTrainer:
             domain = InterReplicaGradientDomain(
                 core_replica_ids=core_ids,
                 decouple_communication_domains=decoupled,
+                require_isolated_process_group=bool(
+                    getattr(
+                        self.config.global_resource_planner,
+                        "elastic_hybrid_require_isolated_ccl",
+                        False,
+                    )
+                ),
             )
             setter = getattr(self.train_engine, "set_elastic_gradient_domain", None)
             if callable(setter):
@@ -1851,6 +1987,9 @@ class AsyncRLTrainer:
             str(worker_id): str(target_core)
             for worker_id, target_core in (state.get("hybrid_targets") or {}).items()
         }
+        for active_worker_id in list(domain.active_hybrid_ids()):
+            if active_worker_id not in hybrid_targets:
+                domain.detach(active_worker_id)
         for worker_id, target_core in hybrid_targets.items():
             domain.request_join(worker_id, target_core)
             if bool(state.get("activate_hybrids", False)):
@@ -1875,8 +2014,13 @@ class AsyncRLTrainer:
                 step=step,
                 dispatcher_metrics=dispatcher_metrics,
                 step_stats={
-                    **stats,
+                    **self._planner_step_stats(stats),
                     "max_concurrent_rollouts": self.config.max_concurrent_rollouts,
+                    **(
+                        self.runtime_elastic_executor.hybrid_runtime_state()
+                        if self.runtime_elastic_executor is not None
+                        else {}
+                    ),
                 },
             )
             self._write_runtime_reconfiguration_pending(step)
@@ -1903,8 +2047,13 @@ class AsyncRLTrainer:
             step=step,
             dispatcher_metrics=dispatcher_metrics,
             step_stats={
-                **stats,
+                **self._planner_step_stats(stats),
                 "max_concurrent_rollouts": self.config.max_concurrent_rollouts,
+                **(
+                    self.runtime_elastic_executor.hybrid_runtime_state()
+                    if self.runtime_elastic_executor is not None
+                    else {}
+                ),
             },
         )
         stats["global_resource_planner"] = {
@@ -1959,6 +2108,12 @@ class AsyncRLTrainer:
             f"history={self.global_resource_planner.history_size}"
         )
 
+    @staticmethod
+    def _planner_step_stats(stats: dict[str, Any]) -> dict[str, Any]:
+        """Exclude planner outputs from the next planner runtime observation."""
+        excluded = {"global_resource_planner", "global_resource_planner_runtime"}
+        return {key: value for key, value in stats.items() if key not in excluded}
+
     def _consume_global_resource_planner_result(self, stats: dict):
         if self._grp_future is None or not self._grp_future.done():
             return
@@ -1988,6 +2143,13 @@ class AsyncRLTrainer:
         stats["global_resource_planner"] = decision.to_dict()
 
         if not decision.should_reconfigure or decision.candidate_plan is None:
+            if (
+                self.runtime_elastic_executor is not None
+                and getattr(decision, "elastic_hybrid_signal", None) is not None
+            ):
+                self.runtime_elastic_executor.accept_planner_signal(
+                    decision.elastic_hybrid_signal
+                )
             if decision.reason not in {"interval_skip", "warmup"}:
                 print(
                     "[GlobalResourcePlanner] "
@@ -2139,6 +2301,16 @@ class AsyncRLTrainer:
             output_dir = os.path.join(self.config.log_dir, "history")
 
         experiment_name = getattr(self.config, "history_experiment_name", "") or ""
+        # Keep history artifacts isolated per launched run.  The validated
+        # six-node configs intentionally share a history root/name so that
+        # operators do not need to edit YAML between EHP and non-EHP runs.
+        # Include the scheduler/job identifier when available; this prevents
+        # accidental mixing or filename collisions during retries or parallel
+        # A/B experiments while preserving the configured prefix for tools
+        # that discover ``*history*.jsonl`` files.
+        run_id = os.environ.get("SLURM_JOB_ID") or os.environ.get("JOB_ID")
+        if run_id:
+            experiment_name = f"{experiment_name}_{run_id}" if experiment_name else str(run_id)
 
         self.history_collector = HistoryDataCollector(
             output_dir=output_dir,

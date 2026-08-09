@@ -3,9 +3,9 @@
 set -euo pipefail
 
 project_dir="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-train_python="${TRAIN_PYTHON:-/data/qianzhirong/envs/rl_mindspeed_260/bin/python}"
-rollout_python="${ROLLOUT_PYTHON:-/root/vllm_ascend_env/bin/python}"
-snapshot_root="${SNAPSHOT_ROOT:-/data/qianzhirong/environment_snapshots}"
+train_python="${TRAIN_PYTHON:-/opt/libra/envs/rl_mindspeed/bin/python}"
+rollout_python="${ROLLOUT_PYTHON:-/opt/libra/envs/vllm_ascend/bin/python}"
+snapshot_root="${SNAPSHOT_ROOT:-/opt/libra/environment_snapshots}"
 snapshot_name="${SNAPSHOT_NAME:-ascend_megatron_$(date +%Y%m%d_%H%M%S)}"
 snapshot_dir="${snapshot_root}/${snapshot_name}"
 
@@ -106,7 +106,7 @@ fi
     printf 'DEVICE_BACKEND=%s\n' "${DEVICE_BACKEND:-npu}"
     printf 'DIST_BACKEND=%s\n' "${DIST_BACKEND:-hccl}"
     printf 'CANN_ENV=%s\n' "${CANN_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
-    printf 'TORCH_EXTENSIONS_DIR=%s\n' "${TORCH_EXTENSIONS_DIR:-/data_nv2/qianzhirong/torch_extensions}"
+    printf 'TORCH_EXTENSIONS_DIR=%s\n' "${TORCH_EXTENSIONS_DIR:-/opt/libra/torch_extensions}"
     printf 'MCORE_MOE_GROUPED_GEMM=%s\n' "${MCORE_MOE_GROUPED_GEMM:-0}"
     printf 'TOKENIZERS_PARALLELISM=%s\n' "${TOKENIZERS_PARALLELISM:-false}"
 } >"${snapshot_dir}/runtime.env"

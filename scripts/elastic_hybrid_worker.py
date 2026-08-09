@@ -31,6 +31,9 @@ from RL_Framework.infra.elastic.hybrid_pool import GradientPayload
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker-id", required=True)
+    parser.add_argument("--replica-id", default="")
+    parser.add_argument("--replica-rank", type=int, default=0)
+    parser.add_argument("--replica-world-size", type=int, default=1)
     parser.add_argument("--target-core-id", required=True)
     parser.add_argument("--snapshot-path", required=True)
     parser.add_argument("--gradient-host", required=True)
@@ -53,6 +56,9 @@ def _load_payload_file(
     *,
     worker_id: str,
     target_core_id: str,
+    replica_id: str = "",
+    replica_rank: int = 0,
+    replica_world_size: int = 1,
 ) -> GradientPayload | None:
     data = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(data, dict) and data.get("shutdown"):
@@ -61,10 +67,12 @@ def _load_payload_file(
         return data
     tensors = data["tensors"] if isinstance(data, dict) else data
     return GradientPayload(
-        replica_id=str(data.get("replica_id", worker_id)) if isinstance(data, dict) else worker_id,
+        replica_id=str(data.get("replica_id", replica_id or worker_id)) if isinstance(data, dict) else (replica_id or worker_id),
         target_core_id=str(data.get("target_core_id", target_core_id)) if isinstance(data, dict) else target_core_id,
         tensors=tuple(t.detach().cpu() for t in tensors),
         zero_placeholder=bool(data.get("zero_placeholder", False)) if isinstance(data, dict) else False,
+        replica_rank=int(data.get("replica_rank", replica_rank)) if isinstance(data, dict) else replica_rank,
+        replica_world_size=int(data.get("replica_world_size", replica_world_size)) if isinstance(data, dict) else replica_world_size,
     )
 
 
@@ -107,6 +115,9 @@ def main():
             Path(args.payload_file),
             worker_id=args.worker_id,
             target_core_id=args.target_core_id,
+            replica_id=args.replica_id,
+            replica_rank=args.replica_rank,
+            replica_world_size=args.replica_world_size,
         )
         if payload is not None:
             client.send(payload)
@@ -137,6 +148,9 @@ def main():
                     task_path,
                     worker_id=args.worker_id,
                     target_core_id=args.target_core_id,
+                    replica_id=args.replica_id,
+                    replica_rank=args.replica_rank,
+                    replica_world_size=args.replica_world_size,
                 )
                 if payload is not None:
                     client.send(payload)

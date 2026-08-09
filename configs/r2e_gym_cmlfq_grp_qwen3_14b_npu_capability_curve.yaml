@@ -9,8 +9,8 @@ base_config: base.yaml
 hardware_config: hardware_config/a100_80g.yaml
 model_arch_config: model_arch_config/qwen3-14b.yaml
 
-model_path: "/data/qianzhirong/models/Qwen3-14B"
-tokenizer_path: "/data/qianzhirong/models/Qwen3-14B"
+model_path: "/opt/libra/models/Qwen3-14B"
+tokenizer_path: "/opt/libra/models/Qwen3-14B"
 
 device_backend: "npu"
 distributed_backend: "hccl"
@@ -49,19 +49,19 @@ recompute_logprobs: true
 
 weight_sync_mode: "disk"
 rollout_weight_sync_mode: "restart"
-rollout_weight_sync_control_dir: "/data_nv2/r2e_gym_qwen3_14b_npu_capability_curve/rollout_weight_sync"
+rollout_weight_sync_control_dir: "/opt/libra/r2e_gym_qwen3_14b_npu_capability_curve/rollout_weight_sync"
 rollout_weight_sync_timeout_s: 2400
 rollout_weight_sync_export_only: false
 require_rollout_weight_sync: true
 
 enable_history_collection: true
-history_output_dir: "/data/qianzhirong/runs/r2e_gym_qwen3_14b_npu_capability_curve/history"
+history_output_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_npu_capability_curve/history"
 history_save_raw_lengths: true
 history_flush_interval: 1
 history_experiment_name: "r2e_gym_qwen3_14b_npu_capability_curve"
 
-log_dir: "/data/qianzhirong/runs/r2e_gym_qwen3_14b_npu_capability_curve/logs"
-sync_path: "/data_nv2/r2e_gym_qwen3_14b_npu_capability_curve/weights"
+log_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_npu_capability_curve/logs"
+sync_path: "/opt/libra/r2e_gym_qwen3_14b_npu_capability_curve/weights"
 wandb_project: ""
 wandb_run_name: "r2e-gym-qwen3-14b-npu-capability-curve"
 
@@ -93,7 +93,7 @@ heterogeneous_rollout:
     max_queue_length: 8
     enable_fallback: true
     cmlfq_rebuild_interval: 4
-    cmlfq_tree_path: "/data/qianzhirong/runs/r2e_gym_qwen3_14b_npu_capability_curve/cmlfq_tree.json"
+    cmlfq_tree_path: "/opt/libra/runs/r2e_gym_qwen3_14b_npu_capability_curve/cmlfq_tree.json"
     cmlfq_tree_persist_interval: 1
     cmlfq_payload_small_threshold: 400
     cmlfq_payload_large_threshold: 1600

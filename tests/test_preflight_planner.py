@@ -88,6 +88,21 @@ def test_preflight_applies_best_candidate_and_writes_config(tmp_path: Path):
     assert json.loads(out_json.read_text(encoding="utf-8"))["applied"] is True
 
 
+def test_grp_startup_ignores_legacy_fixed_train_split(tmp_path: Path):
+    cfg = _config(tmp_path)
+    cfg.global_resource_planner.initial_allocation_strategy = "grp"
+    cfg.global_resource_planner.fixed_train_gpus = 3
+
+    result = PreflightPlanner(cfg).run(
+        synthetic_history(num_requests=8, input_len=128, output_len=1024)
+    )
+
+    assert result.applied
+    assert result.planned_config.train_gpus != 3
+    assert result.planned_config.train_gpus + result.planned_config.rollout_gpus == 4
+    assert result.metadata["initial_allocation_strategy"] == "grp"
+
+
 def test_history_jsonl_loader(tmp_path: Path):
     path = tmp_path / "history.jsonl"
     path.write_text(

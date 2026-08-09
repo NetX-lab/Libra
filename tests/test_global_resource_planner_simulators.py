@@ -323,6 +323,135 @@ json.dump({"makespan": 80.0 / max(gpus, 1)}, open(sys.argv[2], "w"))
         self.assertEqual(decision.candidate_plan.train_gpus, 12)
         self.assertEqual(decision.candidate_plan.rollout_tp_list, [4, 4])
 
+    def test_grp_emits_join_signal_when_training_is_the_runtime_bottleneck(self):
+        cfg = self._base_config()
+        cfg.global_resource_planner.fixed_train_gpus = cfg.train_gpus
+        cfg.global_resource_planner.elastic_hybrid_planning_enabled = True
+        cfg.global_resource_planner.initial_allocation_strategy = "configured"
+        cfg.global_resource_planner.elastic_hybrid_max_workers = 1
+        planner = GlobalResourcePlanner.from_config(cfg)
+        batch = [{"input_len": 128, "output_len": 512}] * 4
+        planner.observe_batch(batch)
+        metrics = planner.observe_runtime(
+            step=1,
+            dispatcher_metrics={"runner_max_queue_size": 16},
+            step_stats={
+                "train_time": 20.0,
+                "rollout_time": 5.0,
+                "active_hybrid_workers": 0,
+                "max_concurrent_rollouts": 8,
+            },
+        )
+
+        decision = planner.plan_if_needed(
+            step=1,
+            config=cfg,
+            runtime_metrics=metrics,
+        )
+
+        self.assertTrue(decision.should_reconfigure)
+        self.assertEqual(decision.reason, "elastic_hybrid_adjustment")
+        self.assertEqual(decision.elastic_hybrid_signal.action, "join")
+        self.assertEqual(decision.elastic_hybrid_signal.desired_workers, 2)
+        self.assertEqual(decision.elastic_hybrid_signal.capacity_replicas, 2)
+
+    def test_grp_has_no_policy_cap_and_counts_complete_dp_replicas(self):
+        cfg = self._base_config()
+        cfg.train_gpus = 8
+        cfg.rollout_gpus = 24
+        cfg.n_total_gpus = 32
+        cfg.train_tp_size = 4
+        cfg.train_pp_size = 1
+        cfg.train_cp_size = 1
+        cfg.train_dp_size = 2
+        cfg.global_resource_planner.elastic_hybrid_planning_enabled = True
+        cfg.global_resource_planner.initial_allocation_strategy = "configured"
+        cfg.global_resource_planner.fixed_train_gpus = 8
+        cfg.global_resource_planner.allowed_train_tp = [4]
+        cfg.global_resource_planner.elastic_hybrid_max_workers = 0
+        cfg.global_resource_planner.elastic_hybrid_replica_size_gpus = 4
+        cfg.global_resource_planner.elastic_hybrid_min_rollout_gpus = 4
+        planner = GlobalResourcePlanner.from_config(cfg)
+        planner.observe_batch([{"input_len": 128, "output_len": 512}] * 4)
+        metrics = planner.observe_runtime(
+            step=1,
+            dispatcher_metrics={"runner_max_queue_size": 16},
+            step_stats={
+                "train_time": 20.0,
+                "rollout_time": 5.0,
+                "max_concurrent_rollouts": 8,
+            },
+        )
+
+        decision = planner.plan_if_needed(step=1, config=cfg, runtime_metrics=metrics)
+
+        signal = decision.elastic_hybrid_signal
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.replica_size_gpus, 4)
+        self.assertEqual(signal.capacity_replicas, 5)
+        self.assertEqual(signal.desired_replicas, 5)
+
+    def test_grp_emits_release_signal_when_rollout_needs_the_capacity(self):
+        cfg = self._base_config()
+        cfg.global_resource_planner.fixed_train_gpus = cfg.train_gpus
+        cfg.global_resource_planner.elastic_hybrid_planning_enabled = True
+        cfg.global_resource_planner.elastic_hybrid_max_workers = 1
+        planner = GlobalResourcePlanner.from_config(cfg)
+        batch = [{"input_len": 128, "output_len": 512}] * 4
+        planner.observe_batch(batch)
+        metrics = planner.observe_runtime(
+            step=1,
+            dispatcher_metrics={"runner_max_queue_size": 16},
+            step_stats={
+                "train_time": 2.0,
+                "rollout_time": 20.0,
+                "active_hybrid_workers": 1,
+                "max_concurrent_rollouts": 8,
+            },
+        )
+
+        decision = planner.plan_if_needed(
+            step=1,
+            config=cfg,
+            runtime_metrics=metrics,
+        )
+
+        self.assertTrue(decision.should_reconfigure)
+        self.assertEqual(decision.elastic_hybrid_signal.action, "release")
+        self.assertEqual(decision.elastic_hybrid_signal.desired_workers, 0)
+
+    def test_grp_release_cancels_capacity_already_consumed_by_joining_worker(self):
+        cfg = self._base_config()
+        cfg.global_resource_planner.fixed_train_gpus = cfg.train_gpus
+        cfg.global_resource_planner.elastic_hybrid_planning_enabled = True
+        cfg.global_resource_planner.elastic_hybrid_max_workers = 1
+        planner = GlobalResourcePlanner.from_config(cfg)
+        batch = [{"input_len": 128, "output_len": 512}] * 4
+        planner.observe_batch(batch)
+        metrics = planner.observe_runtime(
+            step=1,
+            dispatcher_metrics={"runner_max_queue_size": 16},
+            step_stats={
+                "train_time": 2.0,
+                "rollout_time": 20.0,
+                "active_hybrid_workers": 0,
+                "joining_hybrid_workers": 1,
+                "pending_hybrid_joins": 1,
+                "max_concurrent_rollouts": 8,
+            },
+        )
+
+        decision = planner.plan_if_needed(
+            step=1,
+            config=cfg,
+            runtime_metrics=metrics,
+        )
+
+        self.assertTrue(decision.should_reconfigure)
+        self.assertEqual(decision.elastic_hybrid_signal.current_workers, 1)
+        self.assertEqual(decision.elastic_hybrid_signal.joining_workers, 1)
+        self.assertEqual(decision.elastic_hybrid_signal.action, "release")
+
 
 if __name__ == "__main__":
     unittest.main()

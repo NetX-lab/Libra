@@ -43,10 +43,11 @@ class TrainParallelConfig:
     dp: int = 1
     b_micro: int = 4       # micro batch size
     zero_level: int = 2
+    cp: int = 1
 
     @property
     def n_gpus(self) -> int:
-        return self.tp * self.pp * self.dp
+        return self.tp * self.pp * self.cp * self.dp
 
 
 @dataclass

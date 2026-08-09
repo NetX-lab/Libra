@@ -109,6 +109,9 @@ class MegatronCoreTrainEngine:
         self.tokenizer = None
         self.max_seq_length = 0
         self.elastic_gradient_domain: InterReplicaGradientDomain | None = None
+        self._elastic_gradient_process_group = None
+        self._elastic_gradient_process_group_owned = False
+        self._elastic_gradient_group_ranks: tuple[int, ...] = ()
         self._pending_hybrid_gradients: list[GradientPayload] = []
         self.checkpoints = MegatronDistributedCheckpointManager(
             sync_path=sync_path,
@@ -586,6 +589,10 @@ class MegatronCoreTrainEngine:
             "streaming_export": self.streaming_export,
             "transformer_engine": self.use_transformer_engine,
             "elastic_gradient_domain": self.elastic_gradient_domain is not None,
+            "elastic_gradient_ccl_isolated": bool(
+                self._elastic_gradient_process_group is not None
+            ),
+            "elastic_gradient_group_ranks": list(self._elastic_gradient_group_ranks),
         }
 
     def get_elastic_core_replica_ids(self) -> list[str]:
@@ -600,6 +607,8 @@ class MegatronCoreTrainEngine:
         decouple_communication_domains: bool = True,
     ) -> InterReplicaGradientDomain:
         core_ids = core_replica_ids or self.get_elastic_core_replica_ids()
+        if decouple_communication_domains:
+            self.initialize_elastic_communication_domain()
         self.elastic_gradient_domain = InterReplicaGradientDomain(
             core_replica_ids=core_ids,
             process_group=(
@@ -607,7 +616,13 @@ class MegatronCoreTrainEngine:
                 if decouple_communication_domains
                 else self.get_elastic_core_process_group()
             ),
+            communication_domains=(
+                None
+                if not decouple_communication_domains
+                else self._elastic_communication_domains()
+            ),
             decouple_communication_domains=decouple_communication_domains,
+            require_isolated_process_group=decouple_communication_domains,
         )
         return self.elastic_gradient_domain
 
@@ -623,6 +638,88 @@ class MegatronCoreTrainEngine:
         self.elastic_gradient_domain = domain
         if domain is not None and not domain.decoupled_communication_domains:
             domain.process_group = self.get_elastic_core_process_group()
+        elif domain is not None:
+            self.initialize_elastic_communication_domain()
+            domain.bind_hybrid_process_group(self._elastic_gradient_process_group)
+
+    def initialize_elastic_communication_domain(self):
+        """Create one isolated HCCL communicator for the elastic DP lane.
+
+        The communicator is created once, collectively during trainer setup,
+        and is never reused for Megatron's core data-parallel collectives. The
+        ``use_local_synchronization`` path is safe here because DP groups are
+        disjoint for a fixed TP/PP/CP lane.
+        """
+        if self._elastic_gradient_process_group is not None:
+            return self._elastic_gradient_process_group
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError(
+                "cannot create isolated elastic CCL domain before dist init"
+            )
+        core_group = self.get_elastic_core_process_group()
+        ranks_fn = getattr(dist, "get_process_group_ranks", None)
+        if callable(ranks_fn):
+            ranks = tuple(int(rank) for rank in ranks_fn(core_group))
+        else:
+            global_rank_fn = getattr(dist, "get_global_rank", None)
+            if not callable(global_rank_fn):
+                raise RuntimeError(
+                    "torch.distributed lacks process-group rank introspection; "
+                    "cannot safely isolate the elastic CCL domain"
+                )
+            ranks = tuple(
+                int(global_rank_fn(core_group, index))
+                for index in range(dist.get_world_size(group=core_group))
+            )
+        if not ranks:
+            raise RuntimeError("Megatron data-parallel group has no ranks")
+        backend = dist.get_backend(core_group)
+        try:
+            group = dist.new_group(
+                ranks=list(ranks),
+                backend=backend,
+                use_local_synchronization=True,
+            )
+        except TypeError as exc:
+            raise RuntimeError(
+                "this torch.distributed build does not support local-synchronized "
+                "isolated CCL groups; refusing to fall back to the core group"
+            ) from exc
+        if group is core_group:
+            raise RuntimeError("isolated elastic CCL group aliases the core group")
+        self._elastic_gradient_process_group = group
+        self._elastic_gradient_process_group_owned = True
+        self._elastic_gradient_group_ranks = ranks
+        print(
+            "[ElasticCCL] isolated process group created "
+            f"backend={backend} ranks={list(ranks)} core_group={id(core_group)} "
+            f"elastic_group={id(group)}",
+            flush=True,
+        )
+        return group
+
+    def _elastic_communication_domains(self):
+        from RL_Framework.infra.elastic.hybrid_pool import GradientCommunicationDomains
+
+        return GradientCommunicationDomains(
+            core_process_group=self.get_elastic_core_process_group(),
+            hybrid_process_group=self._elastic_gradient_process_group,
+            decoupled=True,
+        )
+
+    def close_elastic_communication_domain(self) -> None:
+        group = self._elastic_gradient_process_group
+        self._elastic_gradient_process_group = None
+        self._elastic_gradient_group_ranks = ()
+        if group is not None and self._elastic_gradient_process_group_owned:
+            try:
+                dist.destroy_process_group(group)
+            except Exception:
+                pass
+        self._elastic_gradient_process_group_owned = False
+
+    def get_elastic_gradient_process_group(self):
+        return self._elastic_gradient_process_group
 
     def enqueue_hybrid_gradient_payload(self, payload: GradientPayload) -> None:
         self._pending_hybrid_gradients.append(payload)

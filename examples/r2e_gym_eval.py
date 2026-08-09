@@ -140,6 +140,9 @@ def main():
             if os.environ.get("R2E_MAX_PROMPT_TOKENS")
             else (config.r2e_max_prompt_tokens or None)
         ),
+        stop_reward=float(
+            os.environ.get("R2E_STOP_REWARD", str(config.r2e_stop_reward))
+        ),
         temperature=config.temperature,
         top_p=config.top_p,
         n_samples=config.n_samples,

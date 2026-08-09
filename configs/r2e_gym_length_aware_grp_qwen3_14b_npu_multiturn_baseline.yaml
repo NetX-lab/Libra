@@ -3,10 +3,10 @@
 # topology fixed while replacing causal routing with length-only routing.
 base_config: r2e_gym_cmlfq_grp_qwen3_14b_npu_multiturn_validation.yaml
 
-log_dir: "/data/qianzhirong/runs/r2e_gym_qwen3_14b_npu_multiturn_baseline/logs"
-sync_path: "/data_nv2/r2e_gym_qwen3_14b_npu_multiturn_baseline/weights"
-rollout_weight_sync_control_dir: "/data_nv2/r2e_gym_qwen3_14b_npu_multiturn_baseline/rollout_weight_sync"
-history_output_dir: "/data/qianzhirong/runs/r2e_gym_qwen3_14b_npu_multiturn_baseline/history"
+log_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_npu_multiturn_baseline/logs"
+sync_path: "/opt/libra/r2e_gym_qwen3_14b_npu_multiturn_baseline/weights"
+rollout_weight_sync_control_dir: "/opt/libra/r2e_gym_qwen3_14b_npu_multiturn_baseline/rollout_weight_sync"
+history_output_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_npu_multiturn_baseline/history"
 history_experiment_name: "r2e_gym_qwen3_14b_npu_multiturn_baseline"
 wandb_run_name: "r2e-gym-qwen3-14b-npu-multiturn-baseline"
 

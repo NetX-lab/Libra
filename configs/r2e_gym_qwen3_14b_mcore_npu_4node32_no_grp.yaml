@@ -1,0 +1,13 @@
+# Control arm: no GRP, with the requested even 16/16 resource split.
+base_config: r2e_gym_qwen3_14b_mcore_npu_4node32_grp_ab_common.yaml
+
+wandb_run_name: "r2e-gym-qwen3-14b-mcore-npu-4node32-no-grp"
+history_experiment_name: "r2e_gym_qwen3_14b_4node32_no_grp"
+
+global_resource_planner:
+  enabled: false
+  initial_allocation_strategy: "fixed"
+  fixed_train_gpus: 16
+  runtime_async_planning: false
+  runtime_dynamic_reconfiguration_enabled: false
+  runtime_online_replanning: false

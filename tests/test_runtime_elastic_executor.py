@@ -1,10 +1,14 @@
 import json
+import time
 
 import pytest
 
 from RL_Framework.config import AsyncRLConfig, HeterogeneousInstanceConfig
 from RL_Framework.infra.execution.batch_dispatcher import BatchTaskDispatcher, TaskInput
-from RL_Framework.infra.cost_model.global_resource_planner import GlobalResourcePlanner
+from RL_Framework.infra.cost_model.global_resource_planner import (
+    ElasticHybridSignal,
+    GlobalResourcePlanner,
+)
 from RL_Framework.infra.elastic.runtime_executor import (
     ManagedRolloutProcess,
     RuntimeElasticExecutor,
@@ -12,9 +16,15 @@ from RL_Framework.infra.elastic.runtime_executor import (
 from RL_Framework.infra.sync.staleness import StalenessManager
 
 try:
-    from RL_Framework.infra.elastic.hybrid_pool import ElasticHybridPool
+    from RL_Framework.infra.elastic.hybrid_pool import (
+        ElasticHybridPool,
+        JoinState,
+        ReplicaRole,
+    )
 except ModuleNotFoundError:
     ElasticHybridPool = None
+    JoinState = None
+    ReplicaRole = None
 
 
 class FakeDispatcher:
@@ -113,14 +123,14 @@ def test_runtime_executor_preserves_external_rollout_config_when_disabled():
             instance_id="external0",
             tp=1,
             gpus=[0],
-            host="10.0.0.20",
+            host="192.0.2.20",
             port=8000,
         ),
         HeterogeneousInstanceConfig(
             instance_id="external1",
             tp=1,
             gpus=[1],
-            host="10.0.0.21",
+            host="192.0.2.22",
             port=8000,
         ),
     ]
@@ -207,6 +217,116 @@ def test_runtime_executor_uses_training_pool_target_without_core_resize():
     ) == 2
     assert cfg.train_gpus == 2
     assert cfg.train_dp_size == 2
+    pool.close()
+
+
+def test_runtime_executor_applies_grp_signal_with_non_blocking_join():
+    if ElasticHybridPool is None:
+        pytest.skip("torch is not installed in this local environment")
+
+    cfg = _config()
+    cfg.global_resource_planner.runtime_reconfigure_training = True
+    cfg.global_resource_planner.runtime_training_pool_plan_only = False
+    cfg.global_resource_planner.elastic_hybrid_require_planner_signal = True
+    cfg.global_resource_planner.elastic_hybrid_max_workers = 1
+    planner, decision = _decision(cfg)
+    decision.elastic_hybrid_signal = ElasticHybridSignal(
+        step=0,
+        desired_workers=1,
+        current_workers=0,
+        max_workers=1,
+        action="join",
+        reason="training_bottleneck",
+        train_rollout_ratio=2.0,
+        rollout_pressure=0.1,
+        ttl_steps=10,
+    )
+    release_fetch = __import__("threading").Event()
+
+    def slow_fetch(*_args):
+        release_fetch.wait(timeout=2.0)
+        return 1
+
+    pool = ElasticHybridPool(
+        core_train_workers=["core0"],
+        core_rollout_workers=["rollout0"],
+        snapshot_fetcher=slow_fetch,
+        zero_sync_steps=0,
+    )
+    executor = RuntimeElasticExecutor(
+        config=cfg,
+        planner=planner,
+        elastic_pool=pool,
+    )
+
+    started = time.perf_counter()
+    result = executor.execute(decision)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.1
+    assert any(
+        action.startswith("join_training_submitted:rollout0")
+        for action in result.training_actions
+    )
+    assert executor.hybrid_runtime_state()["joining_hybrid_workers"] == 1
+    release_fetch.set()
+    pool.close()
+
+
+def test_runtime_executor_release_signal_cancels_pending_join_immediately():
+    if ElasticHybridPool is None:
+        pytest.skip("torch is not installed in this local environment")
+
+    cfg = _config()
+    cfg.global_resource_planner.runtime_reconfigure_training = True
+    cfg.global_resource_planner.runtime_training_pool_plan_only = False
+    cfg.global_resource_planner.elastic_hybrid_require_planner_signal = True
+    cfg.global_resource_planner.elastic_hybrid_max_workers = 1
+    planner, join_decision = _decision(cfg)
+    join_decision.elastic_hybrid_signal = ElasticHybridSignal(
+        step=1,
+        desired_workers=1,
+        current_workers=0,
+        max_workers=1,
+        action="join",
+        reason="training_bottleneck",
+        train_rollout_ratio=2.0,
+        rollout_pressure=0.1,
+        ttl_steps=10,
+    )
+    release_fetch = __import__("threading").Event()
+    pool = ElasticHybridPool(
+        core_train_workers=["core0"],
+        core_rollout_workers=["rollout0"],
+        snapshot_fetcher=lambda *_args: release_fetch.wait(timeout=2.0) or 1,
+        zero_sync_steps=0,
+    )
+    executor = RuntimeElasticExecutor(
+        config=cfg,
+        planner=planner,
+        elastic_pool=pool,
+    )
+    executor.execute(join_decision)
+
+    release_signal = ElasticHybridSignal(
+        step=2,
+        desired_workers=0,
+        current_workers=1,
+        max_workers=1,
+        action="release",
+        reason="protect_rollout_capacity",
+        train_rollout_ratio=0.5,
+        rollout_pressure=1.0,
+        ttl_steps=10,
+        joining_workers=1,
+    )
+    executor.accept_planner_signal(release_signal)
+
+    assert executor.hybrid_runtime_state()["pending_hybrid_joins"] == 0
+    worker = pool.snapshot()["rollout0"]
+    assert worker.role == ReplicaRole.HYBRID_ROLLOUT
+    assert worker.join_state == JoinState.CANCELLED
+    release_fetch.set()
     pool.close()
 
 
@@ -340,7 +460,8 @@ def test_runtime_executor_creates_decoupled_elastic_domain_by_default():
     assert train_engine.domain is executor.elastic_pool.gradient_domain
     assert train_engine.domain.decoupled_communication_domains
     assert train_engine.domain.process_group is None
-    assert not train_engine.core_group_requested
+    assert train_engine.core_group_requested
+    assert train_engine.domain.communication_state()["has_core_process_group"]
     executor.close()
 
 
@@ -482,7 +603,7 @@ def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path
         for action in result.training_actions
     )
     assert any(
-        action.startswith("activate_prewarmed_hybrid_worker:rollout0->")
+        action.startswith("join_training_submitted:rollout0->")
         for action in result.training_actions
     )
     assert not any(

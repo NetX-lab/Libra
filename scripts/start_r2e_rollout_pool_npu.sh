@@ -1,26 +1,61 @@
 #!/usr/bin/env bash
-# Manage one 8-NPU heterogeneous Qwen3-14B vLLM pool (TP 1+1+2+4).
+# Manage one 8-NPU Qwen3-14B vLLM pool.  The default profile is the validated
+# heterogeneous TP 1+1+2+4 layout; ROLLOUT_TP_PATTERN=2,2,2,2 selects the
+# matched homogeneous baseline.
 set -euo pipefail
 
 action="${1:?usage: $0 start|stop|status NODE_ID}"
 node_id="${2:?usage: $0 start|stop|status NODE_ID}"
-project_dir="${PROJECT_DIR:-/root/RL_Framework_npu}"
-venv_dir="${VLLM_VENV_DIR:-/root/vllm_ascend_env}"
-model_path="${MODEL_PATH:-/data/qianzhirong/models/Qwen3-14B}"
-run_root="${RUN_ROOT:-/data/qianzhirong/runs/r2e_gym_qwen3_14b_6node48}"
+project_dir="${PROJECT_DIR:-/opt/libra/RL_Framework_NPU}"
+venv_dir="${VLLM_VENV_DIR:-/opt/libra/envs/vllm_ascend}"
+model_path="${MODEL_PATH:-/opt/libra/models/Qwen3-14B}"
+run_root="${RUN_ROOT:-/opt/libra/runs/r2e_gym_qwen3_14b_6node48}"
 control_dir="${CONTROL_DIR:-${run_root}/rollout_weight_sync}"
 log_dir="${ROLLOUT_LOG_DIR:-${run_root}/rollout_logs}"
 pid_dir="${run_root}/rollout_pids/${node_id}"
 
-ids=(
-    "${node_id}_short_tp1_0"
-    "${node_id}_short_tp1_1"
-    "${node_id}_medium_tp2"
-    "${node_id}_long_tp4"
-)
-devices=("0" "1" "2,3" "4,5,6,7")
-tps=(1 1 2 4)
-ports=(8000 8001 8002 8003)
+rollout_tp_pattern="${ROLLOUT_TP_PATTERN:-1,1,2,4}"
+IFS=',' read -r -a tps <<< "$rollout_tp_pattern"
+[[ "${#tps[@]}" -gt 0 ]] || { echo "empty ROLLOUT_TP_PATTERN" >&2; exit 2; }
+
+ids=()
+devices=()
+ports=()
+declare -A tp_occurrences=()
+device_offset=0
+for index in "${!tps[@]}"; do
+    tp="${tps[$index]}"
+    [[ "$tp" =~ ^[1-9][0-9]*$ ]] || {
+        echo "invalid TP degree in ROLLOUT_TP_PATTERN: $tp" >&2
+        exit 2
+    }
+    occurrence="${tp_occurrences[$tp]:-0}"
+    if [[ "$rollout_tp_pattern" == "1,1,2,4" ]]; then
+        case "${tp}:${occurrence}" in
+            1:0) suffix="short_tp1_0" ;;
+            1:1) suffix="short_tp1_1" ;;
+            2:0) suffix="medium_tp2" ;;
+            4:0) suffix="long_tp4" ;;
+            *) echo "invalid validated heterogeneous profile" >&2; exit 2 ;;
+        esac
+    else
+        suffix="tp${tp}_${occurrence}"
+    fi
+    tp_occurrences[$tp]=$((occurrence + 1))
+    ids+=("${node_id}_${suffix}")
+    device_list=""
+    for ((device=device_offset; device<device_offset+tp; device++)); do
+        [[ -z "$device_list" ]] || device_list+=","
+        device_list+="$device"
+    done
+    devices+=("$device_list")
+    ports+=("$((8000 + index))")
+    device_offset=$((device_offset + tp))
+done
+[[ "$device_offset" -eq 8 ]] || {
+    echo "ROLLOUT_TP_PATTERN must consume exactly 8 NPUs: $rollout_tp_pattern" >&2
+    exit 2
+}
 
 mkdir -p "$control_dir" "$log_dir" "$pid_dir"
 

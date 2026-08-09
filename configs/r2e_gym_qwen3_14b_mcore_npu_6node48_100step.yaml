@@ -2,11 +2,11 @@
 # heterogeneous rollout nodes. GRP observes all 48 resources; EHP attaches one
 # logical rollout worker through the decoupled inter-replica gradient domain.
 base_config: base.yaml
-hardware_config: hardware_config/ascend_910b3_64g.yaml
+hardware_config: hardware_config/a100_80g.yaml
 model_arch_config: model_arch_config/qwen3-14b.yaml
 
-model_path: "/models/Qwen3-14B"
-tokenizer_path: "/models/Qwen3-14B"
+model_path: "/opt/libra/models/Qwen3-14B"
+tokenizer_path: "/opt/libra/models/Qwen3-14B"
 device_backend: "npu"
 distributed_backend: "hccl"
 rollout_backend: "vllm"
@@ -17,7 +17,7 @@ rollout_gpus: 16
 num_nodes: 4
 train_gpus_per_node: 8
 rollout_gpus_per_node: 0
-master_addr: "10.0.0.10"
+master_addr: "192.0.2.10"
 master_port: 29742
 
 train_tp_size: 8
@@ -57,17 +57,17 @@ recompute_logprobs: true
 
 weight_sync_mode: "disk"
 rollout_weight_sync_mode: "restart"
-rollout_weight_sync_control_dir: "/shared/libra_runs/qwen3_14b_6node48/rollout_weight_sync"
+rollout_weight_sync_control_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/rollout_weight_sync"
 rollout_weight_sync_timeout_s: 3600
 rollout_weight_sync_export_only: true
 require_rollout_weight_sync: true
-sync_path: "/shared/libra_runs/qwen3_14b_6node48/weights"
-log_dir: "/shared/libra_runs/qwen3_14b_6node48/logs"
+sync_path: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/weights"
+log_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/logs"
 wandb_project: ""
 wandb_run_name: "r2e-gym-qwen3-14b-mcore-npu-6node48-100step"
 
 enable_history_collection: true
-history_output_dir: "/shared/libra_runs/qwen3_14b_6node48/history"
+history_output_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/history"
 history_save_raw_lengths: true
 history_flush_interval: 1
 history_experiment_name: "r2e_gym_qwen3_14b_6node48_100step"
@@ -75,19 +75,19 @@ history_experiment_name: "r2e_gym_qwen3_14b_6node48_100step"
 heterogeneous_rollout:
   enabled: true
   total_gpus: 16
-  vllm_host: "10.0.0.20"
+  vllm_host: "192.0.2.20"
   vllm_base_port: 8000
   max_model_len: 32768
   gpu_memory_utilization: 0.88
   instances:
-    - {instance_id: "rollout0_short_tp1_0", host: "10.0.0.20", tp: 1, gpus: [0], port: 8000}
-    - {instance_id: "rollout0_short_tp1_1", host: "10.0.0.20", tp: 1, gpus: [1], port: 8001}
-    - {instance_id: "rollout0_medium_tp2", host: "10.0.0.20", tp: 2, gpus: [2, 3], port: 8002}
-    - {instance_id: "rollout0_long_tp4", host: "10.0.0.20", tp: 4, gpus: [4, 5, 6, 7], port: 8003}
-    - {instance_id: "rollout1_short_tp1_0", host: "10.0.0.21", tp: 1, gpus: [0], port: 8000}
-    - {instance_id: "rollout1_short_tp1_1", host: "10.0.0.21", tp: 1, gpus: [1], port: 8001}
-    - {instance_id: "rollout1_medium_tp2", host: "10.0.0.21", tp: 2, gpus: [2, 3], port: 8002}
-    - {instance_id: "rollout1_long_tp4", host: "10.0.0.21", tp: 4, gpus: [4, 5, 6, 7], port: 8003}
+    - {instance_id: "rollout_a_short_tp1_0", host: "192.0.2.20", tp: 1, gpus: [0], port: 8000}
+    - {instance_id: "rollout_a_short_tp1_1", host: "192.0.2.20", tp: 1, gpus: [1], port: 8001}
+    - {instance_id: "rollout_a_medium_tp2", host: "192.0.2.20", tp: 2, gpus: [2, 3], port: 8002}
+    - {instance_id: "rollout_a_long_tp4", host: "192.0.2.20", tp: 4, gpus: [4, 5, 6, 7], port: 8003}
+    - {instance_id: "rollout_b_short_tp1_0", host: "192.0.2.21", tp: 1, gpus: [0], port: 8000}
+    - {instance_id: "rollout_b_short_tp1_1", host: "192.0.2.21", tp: 1, gpus: [1], port: 8001}
+    - {instance_id: "rollout_b_medium_tp2", host: "192.0.2.21", tp: 2, gpus: [2, 3], port: 8002}
+    - {instance_id: "rollout_b_long_tp4", host: "192.0.2.21", tp: 4, gpus: [4, 5, 6, 7], port: 8003}
   scheduling:
     scheduler_type: "cmlfq"
     request_timeout: 3600
@@ -95,9 +95,9 @@ heterogeneous_rollout:
     max_queue_length: 3
     enable_fallback: true
     cmlfq_rebuild_interval: 5
-    cmlfq_tree_path: "/shared/libra_runs/qwen3_14b_6node48/cmlfq_tree.json"
+    cmlfq_tree_path: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/cmlfq_tree.json"
     cmlfq_tree_persist_interval: 1
-    cmlfq_shared_load_dir: "/shared/libra_runs/qwen3_14b_6node48/cmlfq_shared_load"
+    cmlfq_shared_load_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/cmlfq_shared_load"
     cmlfq_shared_load_ttl_s: 60
     cmlfq_shared_load_heartbeat_s: 10
     cmlfq_max_local_queue_length: 1
@@ -119,7 +119,12 @@ global_resource_planner:
   reconfiguration_cost_s: 0.0
   allowed_train_tp: [8]
   allowed_train_pp: [1]
-  fixed_train_gpus: 32
+  initial_allocation_strategy: "grp"
+  fixed_train_gpus: 0
+  allocation_granularity_gpus: 8
+  min_train_gpus: 8
+  min_rollout_gpus: 8
+  rollout_node_tp_pattern: [1, 1, 2, 4]
   allowed_rollout_tp: [1, 2, 4]
   require_heterogeneous_rollout_tp: true
   micro_batch_sizes: [1]
@@ -140,16 +145,19 @@ global_resource_planner:
   runtime_training_pool_target_gpus: 33
   runtime_training_pool_plan_only: false
   decouple_communication_domains: true
+  elastic_hybrid_max_workers: 0
+  elastic_hybrid_replica_size_gpus: 8
+  elastic_hybrid_min_rollout_gpus: 8
   hybrid_training_prewarm_enabled: true
   hybrid_training_prewarm_count: 1
   hybrid_training_prewarm_worker_ids: ["rollout0"]
   hybrid_worker_launch_enabled: true
-  hybrid_worker_python: "/opt/libra-env/bin/python"
-  hybrid_worker_task_dir: "/shared/libra_runs/qwen3_14b_6node48/elastic_training_tasks"
+  hybrid_worker_python: "/opt/libra/envs/rl_mindspeed/bin/python"
+  hybrid_worker_task_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/elastic_training_tasks"
   hybrid_worker_ready_timeout_s: 120
   gradient_transport_backend: "tcp"
   gradient_server_host: "0.0.0.0"
-  gradient_server_public_host: "10.0.0.10"
-  gradient_server_port: 29752
+  gradient_server_public_host: "192.0.2.10"
+  gradient_server_port: 29852
   gradient_server_authkey: "rl-framework-elastic"
   verbose: true

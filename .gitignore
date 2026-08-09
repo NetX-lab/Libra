@@ -8,53 +8,46 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .venv/
-build/
-dist/
-*.egg-info/
 
 # macOS metadata
 .DS_Store
 ._*
 
-# Runtime outputs
+# Runtime outputs and experiment artifacts
 logs/
-log/
-wandb/
-wandb_*/
-wandb-*/
-tmp/
-temp/
+**/logs/
+results/
+**/results/
+reports/
+**/reports/
 output/
 outputs/
-result/
-results/
+**/output/
+**/outputs/
 runs/
-artifacts/
+**/runs/
 checkpoints/
-checkpoint/
+**/checkpoints/
 tensorboard/
-tb/
+ray_results/
 mlruns/
-.slurm/
+wandb/
+wandb_*/
+tmp/
+*.log
 *.out
 *.err
-*.log
-
-# Experiment payloads, traces, and model checkpoints
-examples/profile/
-profiles/
-profile_outputs/
-traces/
-trace/
-profiling/
 *.ckpt
-*.pt
 *.pth
-*.safetensors
-*.bin
-*.npz
+*.pt
 *.npy
-events.out.tfevents*
+*.npz
+
+# Generated profiling and local publishing data
+examples/profile/
+.codex_publish/
+.remote_compare/
+ssh_askpass*
 
 # Local environments and offline packages
 rl_framework_env
@@ -65,18 +58,11 @@ configs/.*.yaml
 
 # Large local artifacts
 model/
-data/**/*.parquet
-data/**/*.jsonl
-data/**/*.arrow
-data/**/*.log
-data/**/.cache/
-data/DAPO-Math-17K/
+data/DAPO-Math-17K
+data
+data/r2e_gym_v1/*.parquet
 data/r2e_gym_v1/index.jsonl
 data/r2e_gym_v1/manifest.json
+data/search_r1_train.jsonl
 search_r1_raw
 *.parquet
-*.analysis.md
-
-# Local NPU validation records
-docs/npu_validation.md
-docs/ascend_megatron_validated_environment.md

@@ -19,7 +19,7 @@ queue_size: 16
 
 sync_interval: 0
 eval_interval: 0
-log_dir: "/data/qianzhirong/runs/gsm8k_npu_long_validation/logs"
-sync_path: "/data_nv2/gsm8k_npu_long_validation/weights"
+log_dir: "/opt/libra/runs/gsm8k_npu_long_validation/logs"
+sync_path: "/opt/libra/gsm8k_npu_long_validation/weights"
 wandb_project: ""
 wandb_run_name: "gsm8k-npu-long-validation"

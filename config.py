@@ -444,10 +444,18 @@ class GlobalResourcePlannerConfig:
     reconfiguration_cost_s: float = 15.0
     max_history_size: int = 4096
     allowed_rollout_tp: list[int] = field(default_factory=lambda: [1, 2, 4, 8])
+    rollout_node_tp_pattern: list[int] = field(default_factory=list)
     require_heterogeneous_rollout_tp: bool = False
     allowed_train_tp: list[int] = field(default_factory=list)
     allowed_train_pp: list[int] = field(default_factory=list)
     fixed_train_gpus: int = 0
+    # Startup placement is a GRP decision.  ``fixed_train_gpus`` is retained
+    # only for backwards-compatible, explicitly configured deployments and is
+    # ignored when this strategy is ``grp``.
+    initial_allocation_strategy: str = "grp"  # grp | configured
+    allocation_granularity_gpus: int = 1
+    min_train_gpus: int = 1
+    min_rollout_gpus: int = 1
     micro_batch_sizes: list[int] = field(default_factory=list)
     apply_to_runtime: bool = True
     verbose: bool = False
@@ -517,6 +525,21 @@ class GlobalResourcePlannerConfig:
     hybrid_worker_command_template: str = ""
     hybrid_worker_task_dir: str = "./logs/elastic_training_tasks"
     hybrid_worker_ready_timeout_s: float = 60.0
+    hybrid_worker_remote_control_enabled: bool = False
+    hybrid_worker_remote_control_dir: str = ""
+    elastic_hybrid_planning_enabled: bool = False
+    elastic_hybrid_require_planner_signal: bool = False
+    # Deprecated and ignored. EHP capacity is always derived from the currently
+    # available rollout GPUs and complete-replica width.
+    elastic_hybrid_max_workers: int = 0
+    elastic_hybrid_replica_size_gpus: int = 0
+    elastic_hybrid_min_rollout_gpus: int = 0
+    elastic_hybrid_borrow_train_rollout_ratio: float = 1.15
+    elastic_hybrid_release_train_rollout_ratio: float = 0.90
+    elastic_hybrid_max_rollout_pressure: float = 0.80
+    elastic_hybrid_join_timeout_s: float = 180.0
+    elastic_hybrid_signal_ttl_steps: int = 20
+    elastic_hybrid_require_isolated_ccl: bool = False
     gradient_transport_backend: str = "tcp"  # tcp | native_rdma
     decouple_communication_domains: bool = True
     gradient_server_host: str = "127.0.0.1"
@@ -610,6 +633,7 @@ class AsyncRLConfig:
     # environment variables.
     r2e_max_turns: int = 3
     r2e_max_prompt_tokens: int = 0
+    r2e_stop_reward: float = 0.5
     n_samples: int = 4
     temperature: float = 1.0
     top_p: float = 1.0
@@ -673,6 +697,9 @@ class AsyncRLConfig:
         """Post init."""
         if not self.tokenizer_path:
             self.tokenizer_path = self.model_path
+
+        if not 0.0 <= self.r2e_stop_reward <= 1.0:
+            raise ValueError("r2e_stop_reward must be between 0 and 1")
 
         if self.train_tp_size <= 0:
             self.train_tp_size = max(1, self.tp_size)

@@ -4,9 +4,9 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 TRAIN_VENV_DIR="${TRAIN_VENV_DIR:-${PROJECT_DIR}/.venv-npu}"
-VLLM_VENV_DIR="${VLLM_VENV_DIR:-/root/vllm_ascend_env}"
+VLLM_VENV_DIR="${VLLM_VENV_DIR:-/opt/libra/envs/vllm_ascend}"
 ASCEND_SET_ENV="${ASCEND_SET_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
-MODEL_PATH="${MODEL_PATH:-/data/qianzhirong/models/Qwen3-14B}"
+MODEL_PATH="${MODEL_PATH:-/opt/libra/models/Qwen3-14B}"
 CONFIG_PATH="${CONFIG_PATH:-${PROJECT_DIR}/configs/r2e_gym_cmlfq_qwen3_14b_npu_pilot.yaml}"
 CONTROL_DIR="${CONTROL_DIR:-${PROJECT_DIR}/logs/r2e_gym_qwen3_14b_npu_pilot/rollout_weight_sync}"
 LOG_DIR="${LOG_DIR:-${PROJECT_DIR}/logs/r2e_gym_qwen3_14b_npu_pilot/job_manual}"

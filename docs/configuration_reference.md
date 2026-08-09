@@ -40,6 +40,9 @@ commonly changed for experiments and cluster deployments.
 | Option | Meaning |
 | --- | --- |
 | `global_resource_planner.runtime_dynamic_reconfiguration_enabled` | Master switch for runtime reconfiguration |
+| `initial_allocation_strategy` | `grp` runs planning before launch; `configured` preserves an explicitly pinned legacy split |
+| `allocation_granularity_gpus` | Initial train/rollout split granularity (normally one node or one DP replica) |
+| `min_train_gpus` / `min_rollout_gpus` | Minimum viable capacity retained for each stage during startup planning |
 | `runtime_online_replanning` | Use online metrics in planner decisions |
 | `runtime_manage_rollout_processes` | Let Libra start, stop, and adopt rollout processes |
 | `runtime_rollout_reconfigure_strategy` | `diff`, `restart_all`, `blue_green`, `prewarm`, or `cluster_swap` |
@@ -47,6 +50,9 @@ commonly changed for experiments and cluster deployments.
 | `runtime_reconfigure_training` | Enable training-side pool changes |
 | `runtime_training_pool_plan_only` | Record training-pool changes without attaching workers |
 | `decouple_communication_domains` | Keep elastic gradient traffic off the core training DP process group |
+| `elastic_hybrid_replica_size_gpus` | Physical ranks in one complete TP×PP×CP DP replica; zero derives it from training topology |
+| `elastic_hybrid_min_rollout_gpus` | Rollout capacity that EHP may never borrow |
+| `elastic_hybrid_max_workers` | Deprecated and ignored; EHP has no policy maximum |
 | `runtime_batch_collection_timeout_s` | Timeout for collecting a training batch |
 | `runtime_batch_collection_max_retries` | Retries after a batch collection timeout |
 | `runtime_drain_before_reconfigure` | Drain in-flight rollout work before a runtime change |

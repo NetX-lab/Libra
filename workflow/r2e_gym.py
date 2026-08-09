@@ -40,6 +40,7 @@ class R2EGymWorkflow:
         max_new_tokens: int = 2048,
         max_seq_length: int = 8192,
         max_prompt_tokens: int | None = None,
+        stop_reward: float = 0.5,
         temperature: float = 1.0,
         top_p: float = 1.0,
         n_samples: int = 1,
@@ -52,6 +53,9 @@ class R2EGymWorkflow:
         if max_prompt_tokens is None:
             max_prompt_tokens = min(8192, max(512, self.max_seq_length // 2))
         self.max_prompt_tokens = max(128, min(max_prompt_tokens, self.max_seq_length - 128))
+        if not 0.0 <= stop_reward <= 1.0:
+            raise ValueError("stop_reward must be between 0 and 1")
+        self.stop_reward = float(stop_reward)
         self.temperature = temperature
         self.top_p = top_p
         self.n_samples = n_samples
@@ -172,6 +176,11 @@ class R2EGymWorkflow:
                     "temperature": self.temperature,
                     "top_p": self.top_p,
                     "n": 1,
+                    # The output contract has an explicit closing delimiter.
+                    # Stopping there prevents repetitive tails from consuming
+                    # the remaining 30K generation budget.
+                    "stop": ["[/ISSUE]"],
+                    "include_stop_str_in_output": True,
                     "seed": int.from_bytes(
                         hashlib.sha256(
                             f"{prompt_id}:{version}:{rollout_index}:{turn}".encode()
@@ -207,7 +216,7 @@ class R2EGymWorkflow:
                     expected_output_json=data.get("expected_output_json"),
                     modified_files=data.get("modified_files"),
                 )
-                if turn >= self.max_turns - 1 or metrics["reward"] >= 0.92:
+                if turn >= self.max_turns - 1 or metrics["reward"] >= self.stop_reward:
                     break
 
                 feedback = format_validator_feedback(metrics)
@@ -226,7 +235,7 @@ class R2EGymWorkflow:
                 tool_event = {
                     "tool_type": "r2e_issue_validator",
                     "output": feedback,
-                    "status": "success" if metrics["reward"] >= 0.5 else "failure",
+                    "status": "success" if metrics["reward"] >= self.stop_reward else "failure",
                     "payload_tokens": len(feedback_tokens),
                     "token_position": generated_tokens,
                     "turn": turn,
@@ -337,26 +346,48 @@ class R2EGymWorkflow:
             row = dataset[int(index)]
             async with semaphore:
                 prompt_text = self._build_initial_prompt(row)
+                prompt_id = str(row.get("prompt_id", index))
+                begin_cmlfq = getattr(engine, "begin_cmlfq_request", None)
+                request_id = (
+                    begin_cmlfq(prompt_id, len(self._encode(prompt_text)))
+                    if callable(begin_cmlfq)
+                    else ""
+                )
                 try:
                     current_text = prompt_text
                     completion = ""
                     turn_metrics = []
                     eval_turns = self.max_turns if use_feedback else 1
+                    generated_tokens = 0
                     for turn in range(eval_turns):
                         generation_prompt, prompt_len = self._fit_generation_prompt(current_text)
+                        remaining_budget = eval_max_new_tokens - generated_tokens
+                        if remaining_budget <= 0:
+                            break
+                        remaining_turns = max(1, eval_turns - turn)
                         max_tokens_this_call = max(
                             1,
-                            min(eval_max_new_tokens, self.max_seq_length - prompt_len - 16),
+                            min(
+                                remaining_budget,
+                                max(1, remaining_budget // remaining_turns),
+                                self.max_seq_length - prompt_len - 16,
+                            ),
                         )
-                        response = await engine.generate(
-                            prompt=generation_prompt,
-                            max_new_tokens=max_tokens_this_call,
-                            temperature=0.0,
-                            top_p=1.0,
-                            n=1,
-                            prompt_id=str(row.get("prompt_id", index)),
-                        )
+                        generate_kwargs = {
+                            "prompt": generation_prompt,
+                            "max_new_tokens": max_tokens_this_call,
+                            "temperature": 0.0,
+                            "top_p": 1.0,
+                            "n": 1,
+                            "prompt_id": prompt_id,
+                            "stop": ["[/ISSUE]"],
+                            "include_stop_str_in_output": True,
+                        }
+                        if request_id:
+                            generate_kwargs["request_id"] = request_id
+                        response = await engine.generate(**generate_kwargs)
                         completion = response.get("text", "")
+                        generated_tokens += len(self._encode(completion))
                         metrics = evaluate_issue(
                             completion=completion,
                             target_issue=row.get("target_issue", row.get("task_text", "")),
@@ -367,10 +398,35 @@ class R2EGymWorkflow:
                         if (
                             not use_feedback
                             or turn >= eval_turns - 1
-                            or metrics["reward"] >= 0.92
+                            or metrics["reward"] >= self.stop_reward
                         ):
                             break
-                        current_text += completion + "\n" + format_validator_feedback(metrics) + "\n"
+                        feedback = format_validator_feedback(metrics)
+                        feedback_tokens = len(self._encode(feedback))
+                        generated_tokens += feedback_tokens
+                        route_tool_return = getattr(engine, "route_cmlfq_tool_return", None)
+                        if request_id and callable(route_tool_return):
+                            route_tool_return(
+                                request_id,
+                                {
+                                    "tool_type": "r2e_issue_validator",
+                                    "output": feedback,
+                                    "status": (
+                                        "success"
+                                        if metrics["reward"] >= self.stop_reward
+                                        else "failure"
+                                    ),
+                                    "payload_tokens": feedback_tokens,
+                                    "token_position": generated_tokens,
+                                    "turn": turn,
+                                    "reward": metrics["reward"],
+                                },
+                                generated_tokens,
+                            )
+                        current_text += completion + "\n" + feedback + "\n"
+                    finish_cmlfq = getattr(engine, "finish_cmlfq_request", None)
+                    if request_id and callable(finish_cmlfq):
+                        finish_cmlfq(request_id, generated_tokens)
                     metrics = evaluate_issue(
                         completion=completion,
                         target_issue=row.get("target_issue", row.get("task_text", "")),
@@ -389,10 +445,13 @@ class R2EGymWorkflow:
                         "turn_metrics": turn_metrics,
                     }
                 except Exception as exc:
+                    cancel_cmlfq = getattr(engine, "cancel_cmlfq_request", None)
+                    if request_id and callable(cancel_cmlfq):
+                        cancel_cmlfq(request_id)
                     return {
                         "ok": False,
                         "index": int(index),
-                        "prompt_id": str(row.get("prompt_id", index)),
+                        "prompt_id": prompt_id,
                         "reward": 0.0,
                         "accurate": 0.0,
                         "error": str(exc),

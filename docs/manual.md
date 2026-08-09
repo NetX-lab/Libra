@@ -108,7 +108,9 @@ Important planner options:
 | `reconfiguration_cost_s` | Cost charged to runtime transitions |
 | `allowed_rollout_tp` | Candidate TP bucket sizes |
 | `allowed_train_tp` | Candidate training TP sizes |
-| `fixed_train_gpus` | Pin training GPU count if nonzero |
+| `initial_allocation_strategy` | Use `grp` to make the initial split a planner decision before launch |
+| `allocation_granularity_gpus` | Constrain startup choices to complete nodes/replicas |
+| `fixed_train_gpus` | Legacy pin, ignored when `initial_allocation_strategy=grp` |
 
 ## 4. Enable the Elastic Hybrid Pool and Cluster Swap
 
@@ -130,6 +132,14 @@ payloads through the configured elastic side channel while leaving the core
 training backend's DP/TP/PP process groups untouched. Set
 `GRP_DECOUPLE_COMMUNICATION_DOMAINS=0` only when elastic gradient reduction
 must reuse the training DP group.
+
+EHP joins are issued in complete DP replicas (`TP × PP × CP` ranks). The join
+handle returns immediately; the replica fetches state and enters zero-sync on a
+background thread, and becomes active only after every member rank reaches the
+activation barrier. A cancellation, timeout, or single-rank failure rolls the
+whole replica back to rollout. Set `elastic_hybrid_max_workers: 0` to remove a
+policy cap; GRP then derives the number of borrowable replicas from live rollout
+capacity while retaining `elastic_hybrid_min_rollout_gpus`.
 
 To force a short cluster-swap run:
 

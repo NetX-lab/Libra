@@ -106,3 +106,46 @@ def test_megatron_core_device_uses_configured_backend():
     engine.local_rank = 3
 
     assert str(engine._device()) == "npu:3"
+
+
+def test_initialize_elastic_domain_creates_distinct_local_synchronized_group(
+    monkeypatch,
+):
+    from RL_Framework.engine import megatron_core_train_engine as module
+
+    engine = MegatronCoreTrainEngine.__new__(MegatronCoreTrainEngine)
+    engine._elastic_gradient_process_group = None
+    engine._elastic_gradient_process_group_owned = False
+    engine._elastic_gradient_group_ranks = ()
+    core_group = object()
+    elastic_group = object()
+    calls = []
+    monkeypatch.setattr(engine, "get_elastic_core_process_group", lambda: core_group)
+    monkeypatch.setattr(module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        module.dist,
+        "get_process_group_ranks",
+        lambda group: [0, 8, 16, 24] if group is core_group else [],
+        raising=False,
+    )
+    monkeypatch.setattr(module.dist, "get_backend", lambda group: "hccl")
+
+    def new_group(**kwargs):
+        calls.append(kwargs)
+        return elastic_group
+
+    monkeypatch.setattr(module.dist, "new_group", new_group)
+
+    created = engine.initialize_elastic_communication_domain()
+
+    assert created is elastic_group
+    assert created is not core_group
+    assert calls == [
+        {
+            "ranks": [0, 8, 16, 24],
+            "backend": "hccl",
+            "use_local_synchronization": True,
+        }
+    ]
+    assert engine._elastic_gradient_group_ranks == (0, 8, 16, 24)

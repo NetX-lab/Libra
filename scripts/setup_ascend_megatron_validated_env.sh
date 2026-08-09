@@ -6,8 +6,8 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-BASE_PYTHON="${BASE_PYTHON:-/data/qianzhirong/envs/rl_framework_py310/bin/python}"
-VENV_DIR="${VENV_DIR:-/data/qianzhirong/envs/rl_mindspeed_260}"
+BASE_PYTHON="${BASE_PYTHON:-/opt/libra/envs/rl_framework_py310/bin/python}"
+VENV_DIR="${VENV_DIR:-/opt/libra/envs/rl_mindspeed}"
 UV_BIN="${UV_BIN:-uv}"
 CANN_ENV="${CANN_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
 
@@ -55,7 +55,7 @@ export PYTHONPATH="$(dirname "$PROJECT_DIR"):${PYTHONPATH:-}"
 export DEVICE_BACKEND=npu
 export DIST_BACKEND=hccl
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
-export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/data_nv2/qianzhirong/torch_extensions}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/opt/libra/torch_extensions}"
 export MCORE_MOE_GROUPED_GEMM=0
 export TOKENIZERS_PARALLELISM=false
 

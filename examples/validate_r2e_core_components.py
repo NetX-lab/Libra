@@ -109,7 +109,7 @@ def _measure_cmlfq(requests: int) -> dict:
 
 def _planner_config() -> AsyncRLConfig:
     config = AsyncRLConfig(
-        model_path="/data/qianzhirong/models/Qwen3-14B",
+        model_path="/opt/libra/models/Qwen3-14B",
         train_gpus=4,
         rollout_gpus=4,
         train_tp_size=1,

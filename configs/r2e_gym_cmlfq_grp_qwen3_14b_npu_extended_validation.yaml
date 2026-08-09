@@ -16,13 +16,13 @@ eval_interval: 12
 max_concurrent_rollouts: 2
 queue_size: 8
 
-log_dir: "/data/qianzhirong/runs/r2e_gym_qwen3_14b_npu_extended_validation/logs"
-sync_path: "/data_nv2/r2e_gym_qwen3_14b_npu_extended_validation/weights"
-rollout_weight_sync_control_dir: "/data_nv2/r2e_gym_qwen3_14b_npu_extended_validation/rollout_weight_sync"
-history_output_dir: "/data/qianzhirong/runs/r2e_gym_qwen3_14b_npu_extended_validation/history"
+log_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_npu_extended_validation/logs"
+sync_path: "/opt/libra/r2e_gym_qwen3_14b_npu_extended_validation/weights"
+rollout_weight_sync_control_dir: "/opt/libra/r2e_gym_qwen3_14b_npu_extended_validation/rollout_weight_sync"
+history_output_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_npu_extended_validation/history"
 history_experiment_name: "r2e_gym_qwen3_14b_npu_extended_validation"
 wandb_run_name: "r2e-gym-qwen3-14b-npu-extended-validation"
 
 heterogeneous_rollout:
   scheduling:
-    cmlfq_tree_path: "/data/qianzhirong/runs/r2e_gym_qwen3_14b_npu_extended_validation/cmlfq_tree.json"
+    cmlfq_tree_path: "/opt/libra/runs/r2e_gym_qwen3_14b_npu_extended_validation/cmlfq_tree.json"
