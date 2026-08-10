@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 
 
 MODEL_PATH="/path/to/Qwen3-4B"
-export WANDB_API_KEY="bfee760e4e267073a9eeadca3169b8bc2b2cacbe"
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
 
 TRAIN_GPUS="0,1"
 ROLLOUT_GPUS="2,3"

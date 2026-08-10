@@ -67,6 +67,9 @@ class GradientPayload:
     zero_placeholder: bool = False
     replica_rank: int = 0
     replica_world_size: int = 1
+    step: int = -1
+    state_version: int = -1
+    membership_epoch: int = 0
 
     @staticmethod
     def zeros_like(
@@ -82,6 +85,9 @@ class GradientPayload:
             zero_placeholder=True,
             replica_rank=0,
             replica_world_size=1,
+            step=-1,
+            state_version=-1,
+            membership_epoch=0,
         )
 
 
@@ -94,6 +100,7 @@ class ElasticWorker:
     target_core_id: str | None = None
     join_state: JoinState | None = None
     state_version: int = 0
+    membership_epoch: int = 0
     transition_generation: int = 0
     last_transition_ts: float = field(default_factory=time.time)
 
@@ -104,6 +111,7 @@ class ElasticWorker:
         target_core_id: str | None = None,
         join_state: JoinState | None = None,
         state_version: int | None = None,
+        membership_epoch: int | None = None,
         transition_generation: int | None = None,
     ):
         self.role = role
@@ -111,6 +119,8 @@ class ElasticWorker:
         self.join_state = join_state
         if state_version is not None:
             self.state_version = state_version
+        if membership_epoch is not None:
+            self.membership_epoch = int(membership_epoch)
         if transition_generation is not None:
             self.transition_generation = transition_generation
         self.last_transition_ts = time.time()
@@ -275,6 +285,7 @@ class InterReplicaGradientDomain:
         if not 0 <= self.local_replica_rank < self.replica_world_size:
             raise ValueError("local_replica_rank must be inside replica_world_size")
         self._hybrid_targets: dict[str, str] = {}
+        self._membership_epochs: dict[str, int] = {}
         self._joining: set[str] = set()
         self._membership_epoch = 0
         self._lock = threading.RLock()
@@ -359,12 +370,25 @@ class InterReplicaGradientDomain:
                 "decoupled": self.decoupled_communication_domains,
             }
 
-    def request_join(self, hybrid_replica_id: str, target_core_id: str):
+    def request_join(
+        self,
+        hybrid_replica_id: str,
+        target_core_id: str,
+        *,
+        membership_epoch: int | None = None,
+    ):
         self._validate_core(target_core_id)
         with self._lock:
             self._hybrid_targets[hybrid_replica_id] = target_core_id
             self._joining.add(hybrid_replica_id)
-            self._membership_epoch += 1
+            if membership_epoch is None:
+                self._membership_epoch += 1
+                membership_epoch = self._membership_epoch
+            else:
+                self._membership_epoch = max(
+                    self._membership_epoch, int(membership_epoch)
+                )
+            self._membership_epochs[hybrid_replica_id] = int(membership_epoch)
 
     def mark_active(self, hybrid_replica_id: str):
         with self._lock:
@@ -372,12 +396,14 @@ class InterReplicaGradientDomain:
                 raise KeyError(f"unknown hybrid replica: {hybrid_replica_id}")
             self._joining.discard(hybrid_replica_id)
             self._membership_epoch += 1
+            self._membership_epochs[hybrid_replica_id] = self._membership_epoch
 
     def detach(self, hybrid_replica_id: str):
         with self._lock:
             self._joining.discard(hybrid_replica_id)
             if self._hybrid_targets.pop(hybrid_replica_id, None) is not None:
                 self._membership_epoch += 1
+                self._membership_epochs.pop(hybrid_replica_id, None)
 
     def is_joining(self, hybrid_replica_id: str) -> bool:
         with self._lock:
@@ -388,6 +414,23 @@ class InterReplicaGradientDomain:
             return tuple(
                 rid for rid in self._hybrid_targets if rid not in self._joining
             )
+
+    def attached_hybrid_ids(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._hybrid_targets)
+
+    def active_hybrid_ids_for_core(self, core_replica_id: str) -> tuple[str, ...]:
+        self._validate_core(core_replica_id)
+        with self._lock:
+            return tuple(
+                replica_id
+                for replica_id, target in self._hybrid_targets.items()
+                if target == core_replica_id and replica_id not in self._joining
+            )
+
+    def membership_epoch(self, hybrid_replica_id: str) -> int:
+        with self._lock:
+            return int(self._membership_epochs.get(hybrid_replica_id, 0))
 
     def zero_payload_for(
         self,
@@ -402,6 +445,52 @@ class InterReplicaGradientDomain:
             target_core_id=target,
             reference=reference,
         )
+
+    def accumulate_local_gradients(
+        self,
+        *,
+        core_replica_id: str,
+        core_gradients: Iterable[torch.Tensor],
+        hybrid_payloads: Iterable[GradientPayload] = (),
+        step: int = -1,
+        state_version: int = -1,
+    ) -> tuple[torch.Tensor, ...]:
+        """Accumulate matching external gradients before the core DP reduce."""
+        self._validate_core(core_replica_id)
+        effective = tuple(t.clone() for t in core_gradients)
+        with self._lock:
+            targets = dict(self._hybrid_targets)
+            joining = set(self._joining)
+            epochs = dict(self._membership_epochs)
+        for payload in hybrid_payloads:
+            if targets.get(payload.replica_id) != core_replica_id:
+                continue
+            if payload.replica_id in joining or payload.zero_placeholder:
+                continue
+            if payload.membership_epoch != epochs.get(payload.replica_id, 0):
+                continue
+            if payload.step >= 0 and step >= 0 and payload.step != step:
+                continue
+            if (
+                payload.state_version >= 0
+                and state_version >= 0
+                and payload.state_version != state_version
+            ):
+                continue
+            if payload.replica_world_size != self.replica_world_size:
+                raise ValueError(
+                    f"payload replica world size mismatch for {payload.replica_id}: "
+                    f"{payload.replica_world_size} != {self.replica_world_size}"
+                )
+            if payload.replica_rank != self.local_replica_rank:
+                continue
+            if len(payload.tensors) != len(effective):
+                raise ValueError("hybrid payload tensor count mismatch")
+            effective = tuple(
+                base + extra.to(device=base.device, dtype=base.dtype)
+                for base, extra in zip(effective, payload.tensors)
+            )
+        return effective
 
     def reduce_core_gradients(
         self,
@@ -634,6 +723,7 @@ class ElasticHybridPool:
         target_core_id: str,
         *,
         activation_barrier: Callable[[str, str, int], None] | None = None,
+        replica_activation_barrier: Callable[[str, tuple[str, ...], str, int], None] | None = None,
         timeout_s: float | None = None,
     ) -> ReplicaJoinHandle:
         """Join a complete DP replica atomically and return immediately.
@@ -676,6 +766,7 @@ class ElasticHybridPool:
                 target_core_id,
                 generation,
                 activation_barrier,
+                replica_activation_barrier,
                 timeout_s,
             )
             return ReplicaJoinHandle(
@@ -862,6 +953,7 @@ class ElasticHybridPool:
         target_core_id: str,
         generation: int,
         activation_barrier: Callable[[str, str, int], None] | None,
+        replica_activation_barrier: Callable[[str, tuple[str, ...], str, int], None] | None,
         timeout_s: float | None,
     ) -> tuple[ElasticWorker, ...]:
         deadline = (
@@ -900,7 +992,19 @@ class ElasticHybridPool:
                 time.sleep(0)
 
             self._assert_replica_join_current(replica_id, generation, deadline)
-            if activation_barrier is not None:
+            if replica_activation_barrier is not None:
+                with self._lock:
+                    for worker_id in members:
+                        self._workers[worker_id].transition(
+                            ReplicaRole.HYBRID_JOINING,
+                            target_core_id=target_core_id,
+                            join_state=JoinState.ACTIVATING,
+                            state_version=version,
+                            transition_generation=generation,
+                        )
+                replica_activation_barrier(replica_id, members, target_core_id, version)
+                self._assert_replica_join_current(replica_id, generation, deadline)
+            elif activation_barrier is not None:
                 with self._lock:
                     for worker_id in members:
                         self._workers[worker_id].transition(
@@ -912,9 +1016,7 @@ class ElasticHybridPool:
                         )
                 for worker_id in members:
                     activation_barrier(worker_id, target_core_id, version)
-                    self._assert_replica_join_current(
-                        replica_id, generation, deadline
-                    )
+                    self._assert_replica_join_current(replica_id, generation, deadline)
 
             self.gradient_domain.mark_active(replica_id)
             with self._lock:

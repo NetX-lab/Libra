@@ -9,6 +9,7 @@ import glob
 import itertools
 import os
 import shutil
+import socket
 import threading
 import time
 from contextlib import contextmanager
@@ -29,7 +30,9 @@ from RL_Framework.engine.heterogeneous_engine import HeterogeneousRolloutEngine
 from RL_Framework.engine.train_engine import TrainEngine
 from RL_Framework.engine.train_factory import create_train_engine
 from RL_Framework.infra.cost_model.global_resource_planner import GlobalResourcePlanner
+from RL_Framework.infra.cost_model.startup_profile import load_length_profile_records
 from RL_Framework.infra.elastic.runtime_executor import RuntimeElasticExecutor
+from RL_Framework.infra.elastic.gradient_ipc import ElasticGradientServer, GradientUpdate
 from RL_Framework.infra.execution.async_runner import AsyncTaskRunner
 from RL_Framework.infra.execution.batch_dispatcher import BatchTaskDispatcher, TaskInput
 from RL_Framework.infra.observability.history_collector import HistoryDataCollector, ResourceConfig
@@ -102,10 +105,26 @@ class AsyncRLTrainer:
         self._runtime_follow_thread: threading.Thread | None = None
         self._rollout_engine_rebind_lock = threading.RLock()
         self._trace_train_phases = os.environ.get("RL_TRAIN_PHASE_TRACE", "0") == "1"
+        self._elastic_gradient_server: ElasticGradientServer | None = None
+        self._elastic_membership_epochs: dict[str, int] = {}
+        self._pending_hybrid_training_batches: dict[str, list[dict[str, Any]]] = {}
 
     def setup(self, workflow):
         """Setup."""
         self.workflow = workflow
+
+        planner_cfg = getattr(self.config, "global_resource_planner", None)
+        if (
+            planner_cfg is not None
+            and bool(getattr(planner_cfg, "enabled", False))
+            and str(getattr(planner_cfg, "initial_allocation_strategy", "configured")).lower() == "grp"
+            and not bool(getattr(planner_cfg, "initial_allocation_applied", False))
+        ):
+            raise RuntimeError(
+                "GRP startup allocation is mandatory: run the global resource "
+                "preflight planner and launch with its planned config; refusing "
+                "to start from a fixed train/rollout GPU split"
+            )
 
         if self.is_main_process:
             print("=" * 60)
@@ -133,6 +152,7 @@ class AsyncRLTrainer:
                     flush=True,
                 )
         self._initialize_elastic_communication_domains()
+        self._init_nonblocking_elastic_core()
 
 
         if self.is_main_process and self.train_engine.is_batch_source():
@@ -650,6 +670,19 @@ class AsyncRLTrainer:
                 self._follow_runtime_reconfiguration_if_requested()
                 self._trace_train_phase(step, "follow_reconfig_done")
 
+            self._refresh_nonblocking_elastic_membership()
+            active_hybrid_ids: list[str] = []
+            domain = getattr(self.train_engine, "elastic_gradient_domain", None)
+            if domain is not None:
+                active_hybrid_ids = list(
+                    domain.active_hybrid_ids_for_core(
+                        f"dp{self.train_engine.get_data_parallel_rank()}"
+                    )
+                )
+            set_step = getattr(self.train_engine, "set_elastic_training_step", None)
+            if callable(set_step):
+                set_step(step, active_hybrid_ids)
+
             if self._use_heterogeneous and hasattr(self.rollout_engine, "notify_epoch_start"):
                 self.rollout_engine.notify_epoch_start(epoch=step)
 
@@ -659,7 +692,7 @@ class AsyncRLTrainer:
                 self._trace_train_phase(step, "collect_batch_start")
                 batch = self._collect_complete_grpo_batch(
                     data_gen=data_gen,
-                    batch_size=local_batch_size,
+                    batch_size=local_batch_size * (1 + len(active_hybrid_ids)),
                 )
                 self._trace_train_phase(
                     step,
@@ -698,6 +731,15 @@ class AsyncRLTrainer:
             adv_start = time.time()
             self._trace_train_phase(step, "advantage_start")
             batch = self._compute_advantages(batch)
+            if active_hybrid_ids and self.is_main_process:
+                core_count = local_batch_size
+                for index, worker_id in enumerate(active_hybrid_ids):
+                    start = core_count + index * local_batch_size
+                    self._pending_hybrid_training_batches[worker_id] = list(
+                        batch[start : start + local_batch_size]
+                    )
+                batch = batch[:core_count]
+                self._dispatch_hybrid_training_batches(step)
             advantage_time = time.time() - adv_start
             self._trace_train_phase(step, "advantage_done")
 
@@ -1352,6 +1394,9 @@ class AsyncRLTrainer:
         if self.runtime_elastic_executor is not None:
             self.runtime_elastic_executor.close()
             self.runtime_elastic_executor = None
+        elif self._elastic_gradient_server is not None:
+            self._elastic_gradient_server.close()
+        self._elastic_gradient_server = None
 
         close_elastic = getattr(
             self.train_engine,
@@ -1460,6 +1505,8 @@ class AsyncRLTrainer:
             rollout_engine=self.rollout_engine,
             dispatcher=self.dispatcher,
         )
+        if self._elastic_gradient_server is not None:
+            self.runtime_elastic_executor.gradient_server = self._elastic_gradient_server
         if getattr(planner_cfg, "runtime_async_planning", True):
             self._grp_executor = ThreadPoolExecutor(
                 max_workers=max(1, int(getattr(planner_cfg, "runtime_max_pending_plans", 1) or 1)),
@@ -1478,11 +1525,14 @@ class AsyncRLTrainer:
         planner_cfg = getattr(self.config, "global_resource_planner", None)
         if planner_cfg is None or not getattr(planner_cfg, "enabled", False):
             return
+        if not any(
+            bool(getattr(planner_cfg, name, False))
+            for name in ("elastic_hybrid_planning_enabled", "hybrid_worker_launch_enabled", "elastic_hybrid_require_isolated_ccl")
+        ):
+            return
         if not bool(getattr(planner_cfg, "decouple_communication_domains", True)):
             return
-        if not bool(
-            getattr(planner_cfg, "elastic_hybrid_require_isolated_ccl", False)
-        ):
+        if not bool(getattr(planner_cfg, "elastic_hybrid_require_isolated_ccl", False)) and not bool(getattr(planner_cfg, "decouple_communication_domains", True)):
             return
         initializer = getattr(
             self.train_engine,
@@ -1497,14 +1547,68 @@ class AsyncRLTrainer:
         if self.is_main_process:
             state = self.train_engine.get_parallel_state()
             if not state.get("elastic_gradient_ccl_isolated", False):
-                raise RuntimeError(
-                    "train engine did not report an isolated elastic CCL domain"
-                )
+                raise RuntimeError("train engine did not report an isolated elastic CCL domain")
             print(
                 "[ElasticCCL] trainer setup verified isolated elastic domain "
-                f"ranks={state.get('elastic_gradient_group_ranks', [])}",
-                flush=True,
+                f"ranks={state.get('elastic_gradient_group_ranks', [])}", flush=True
             )
+
+    def _init_nonblocking_elastic_core(self) -> None:
+        """Start one gradient endpoint per training rank for EHP lanes."""
+        planner_cfg = getattr(self.config, "global_resource_planner", None)
+        if planner_cfg is None or not bool(getattr(planner_cfg, "enabled", False)):
+            return
+        if not any(bool(getattr(planner_cfg, name, False)) for name in ("elastic_hybrid_planning_enabled", "hybrid_worker_launch_enabled")):
+            return
+        configure = getattr(self.train_engine, "configure_elastic_training", None)
+        if not callable(configure):
+            raise RuntimeError("EHP requires train-engine elastic gradient hooks")
+        core_ids = list(getattr(self.train_engine, "get_elastic_core_replica_ids", lambda: ["dp0"])())
+        replica_width = (
+            max(1, int(getattr(self.config, "train_tp_size", 1) or 1))
+            * max(1, int(getattr(self.config, "train_pp_size", 1) or 1))
+            * max(1, int(getattr(self.config, "train_cp_size", 1) or 1))
+        )
+        try:
+            domain = configure(
+                core_ids,
+                decouple_communication_domains=bool(getattr(planner_cfg, "decouple_communication_domains", True)),
+                replica_world_size=replica_width,
+            )
+        except TypeError:
+            domain = configure(core_ids, decouple_communication_domains=bool(getattr(planner_cfg, "decouple_communication_domains", True)))
+        setter = getattr(self.train_engine, "set_elastic_active_gradient_timeout", None)
+        if callable(setter):
+            setter(float(getattr(planner_cfg, "hybrid_active_gradient_timeout_s", 300.0)))
+        task_dir = Path(getattr(planner_cfg, "hybrid_worker_task_dir", "./logs/elastic_training_tasks"))
+        endpoint_dir = task_dir / "core_endpoints"
+        endpoint_dir.mkdir(parents=True, exist_ok=True)
+        server = ElasticGradientServer(
+            host=str(getattr(planner_cfg, "gradient_server_host", "0.0.0.0")),
+            port=0,
+            authkey=str(getattr(planner_cfg, "gradient_server_authkey", "")),
+            on_payload=self.train_engine.enqueue_hybrid_gradient_payload,
+            update_timeout=float(getattr(planner_cfg, "hybrid_update_timeout_s", 300.0)),
+        )
+        endpoint = server.start()
+        self._elastic_gradient_server = server
+        if self.is_main_process and self.runtime_elastic_executor is not None:
+            self.runtime_elastic_executor.gradient_server = server
+        lane = getattr(self.train_engine, "get_elastic_lane_state", lambda: {})()
+        public_host = str(getattr(planner_cfg, "gradient_server_public_host", "") or socket.gethostname())
+        self._write_json_atomic(
+            endpoint_dir / f"rank_{self.rank}.json",
+            {**endpoint.to_dict(), **lane, "host": public_host, "backend": "tcp"},
+        )
+        if dist.is_initialized():
+            dist.barrier()
+
+        def publish_update(update: GradientUpdate) -> None:
+            server.publish_update(update)
+
+        callback_setter = getattr(self.train_engine, "set_elastic_gradient_update_callback", None)
+        if callable(callback_setter):
+            callback_setter(publish_update)
 
     def _start_runtime_reconfiguration_follower(self) -> None:
         planner_cfg = getattr(self.config, "global_resource_planner", None)
@@ -1987,13 +2091,114 @@ class AsyncRLTrainer:
             str(worker_id): str(target_core)
             for worker_id, target_core in (state.get("hybrid_targets") or {}).items()
         }
+        explicit_active_ids = state.get("active_hybrid_ids")
+        if explicit_active_ids is None:
+            active_hybrid_ids = (
+                set(hybrid_targets)
+                if bool(state.get("activate_hybrids", False))
+                else set()
+            )
+        else:
+            active_hybrid_ids = {
+                str(worker_id) for worker_id in explicit_active_ids
+            }
         for active_worker_id in list(domain.active_hybrid_ids()):
             if active_worker_id not in hybrid_targets:
                 domain.detach(active_worker_id)
         for worker_id, target_core in hybrid_targets.items():
             domain.request_join(worker_id, target_core)
-            if bool(state.get("activate_hybrids", False)):
+            if worker_id in active_hybrid_ids:
                 domain.mark_active(worker_id)
+
+    def _refresh_nonblocking_elastic_membership(self) -> None:
+        planner_cfg = getattr(self.config, "global_resource_planner", None)
+        domain = getattr(self.train_engine, "elastic_gradient_domain", None)
+        if domain is None or planner_cfg is None:
+            return
+        membership_dir = Path(getattr(planner_cfg, "hybrid_worker_task_dir", "./logs/elastic_training_tasks")) / "membership"
+        for path in membership_dir.glob("*.json"):
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+                worker_id = str(state.get("worker_id", ""))
+                target = str(state.get("target_core_id", ""))
+                epoch = int(state.get("membership_epoch", 0))
+                role = str(state.get("role", ""))
+                if not worker_id or epoch < self._elastic_membership_epochs.get(worker_id, -1):
+                    continue
+                if role in {"hybrid_rollout", "core_rollout"}:
+                    domain.detach(worker_id)
+                else:
+                    if epoch > self._elastic_membership_epochs.get(worker_id, -1):
+                        domain.request_join(worker_id, target, membership_epoch=epoch)
+                    if role == "hybrid_training" and domain.is_joining(worker_id):
+                        domain.mark_active(worker_id)
+                self._elastic_membership_epochs[worker_id] = epoch
+            except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+
+    def _dispatch_hybrid_training_batches(self, step: int) -> None:
+        if not self._pending_hybrid_training_batches or not self.is_main_process:
+            return
+        planner_cfg = self.config.global_resource_planner
+        task_dir = Path(getattr(planner_cfg, "hybrid_worker_task_dir", "./logs/elastic_training_tasks"))
+        task_dir.mkdir(parents=True, exist_ok=True)
+        lockstep = bool(getattr(planner_cfg, "hybrid_lockstep_gradient_sync", True))
+        for worker_id, trajectories in self._pending_hybrid_training_batches.items():
+            membership_path = task_dir / "membership" / f"{worker_id}.json"
+            if not membership_path.exists():
+                continue
+            state = json.loads(membership_path.read_text(encoding="utf-8"))
+            if str(state.get("role")) != "hybrid_training":
+                continue
+            task_path = task_dir / f"{worker_id}.step_{step}.pt"
+            tmp_path = task_path.with_suffix(task_path.suffix + ".tmp")
+            torch.save(
+                {
+                    "trajectories": trajectories,
+                    "step": int(step),
+                    "state_version": int(self.train_engine.get_version()),
+                    "membership_epoch": int(state.get("membership_epoch", 0)),
+                    "snapshot_path": "" if lockstep else str(self.train_engine.get_elastic_state_snapshot_path(int(self.train_engine.get_version()))),
+                },
+                tmp_path,
+            )
+            tmp_path.replace(task_path)
+        self._pending_hybrid_training_batches.clear()
+
+    def _runtime_length_profile_path(self) -> str:
+        planner_cfg = getattr(self.config, "global_resource_planner", None)
+        if planner_cfg is None:
+            return ""
+        if not getattr(planner_cfg, "runtime_length_profile_enabled", True):
+            return ""
+        return str(getattr(planner_cfg, "runtime_length_profile_jsonl", "") or "")
+
+    def _refresh_global_resource_history_from_profile(
+        self,
+        *,
+        step: int,
+        stats: dict,
+    ) -> int:
+        if self.global_resource_planner is None:
+            return 0
+        profile_path = self._runtime_length_profile_path()
+        if not profile_path:
+            return 0
+
+        records = load_length_profile_records(
+            profile_path,
+            max_records=self.global_resource_planner.max_history_size,
+        )
+        if not records:
+            return 0
+        loaded = self.global_resource_planner.replace_history(records)
+        stats["global_resource_planner_profile"] = {
+            "step": int(step),
+            "source": "runtime_length_profile_jsonl",
+            "path": profile_path,
+            "records": loaded,
+        }
+        return loaded
 
     def _run_global_resource_planner(self, step: int, batch: list, stats: dict):
         """Run global resource planner."""
@@ -2003,7 +2208,13 @@ class AsyncRLTrainer:
         self._consume_global_resource_planner_result(stats)
 
         planner_cfg = self.config.global_resource_planner
+        runtime_profile_path = self._runtime_length_profile_path()
         if not getattr(planner_cfg, "runtime_async_planning", True):
+            profile_records = self._refresh_global_resource_history_from_profile(
+                step=step,
+                stats=stats,
+            )
+            plan_batch = None if profile_records > 0 else batch
             dispatcher_metrics = (
                 self.dispatcher.get_runtime_metrics()
                 if self.dispatcher is not None
@@ -2028,7 +2239,7 @@ class AsyncRLTrainer:
                 decision = self.global_resource_planner.plan_if_needed(
                     step=step,
                     config=self.config,
-                    batch=batch,
+                    batch=plan_batch,
                     runtime_metrics=runtime_metrics,
                 )
                 self._apply_global_resource_planner_decision(step, decision, stats)
@@ -2036,7 +2247,10 @@ class AsyncRLTrainer:
                 self._clear_runtime_reconfiguration_pending()
             return
 
-        observed = self.global_resource_planner.observe_batch(batch)
+        observed = 0
+        history_source = "runtime_length_profile_jsonl" if runtime_profile_path else "batch"
+        if not runtime_profile_path:
+            observed = self.global_resource_planner.observe_batch(batch)
         dispatcher_metrics = (
             self.dispatcher.get_runtime_metrics()
             if self.dispatcher is not None
@@ -2060,6 +2274,7 @@ class AsyncRLTrainer:
             "step": step,
             "status": "observed",
             "observed_requests": observed,
+            "history_source": history_source,
             "runtime_metrics": runtime_metrics.to_dict(),
         }
 
@@ -2071,18 +2286,30 @@ class AsyncRLTrainer:
         )
         if trigger in {"interval_skip", "cooldown"}:
             return
-        if self.global_resource_planner.history_size < self.global_resource_planner.min_history_size:
-            print(
-                "[GlobalResourcePlanner] "
-                f"step={step} async skip reason=insufficient_history "
-                f"history={self.global_resource_planner.history_size}"
-            )
-            return
         if self._grp_future is not None and not self._grp_future.done():
             print(
                 "[GlobalResourcePlanner] "
                 f"step={step} async skip reason=planner_busy "
                 f"pending_step={self._grp_future_step}"
+            )
+            return
+
+        if runtime_profile_path:
+            observed = self._refresh_global_resource_history_from_profile(
+                step=step,
+                stats=stats,
+            )
+            if observed <= 0:
+                observed = self.global_resource_planner.observe_batch(batch)
+                history_source = "batch_fallback"
+            stats["global_resource_planner"]["observed_requests"] = observed
+            stats["global_resource_planner"]["history_source"] = history_source
+
+        if self.global_resource_planner.history_size < self.global_resource_planner.min_history_size:
+            print(
+                "[GlobalResourcePlanner] "
+                f"step={step} async skip reason=insufficient_history "
+                f"history={self.global_resource_planner.history_size}"
             )
             return
 
@@ -2111,7 +2338,11 @@ class AsyncRLTrainer:
     @staticmethod
     def _planner_step_stats(stats: dict[str, Any]) -> dict[str, Any]:
         """Exclude planner outputs from the next planner runtime observation."""
-        excluded = {"global_resource_planner", "global_resource_planner_runtime"}
+        excluded = {
+            "global_resource_planner",
+            "global_resource_planner_profile",
+            "global_resource_planner_runtime",
+        }
         return {key: value for key, value in stats.items() if key not in excluded}
 
     def _consume_global_resource_planner_result(self, stats: dict):
@@ -2293,12 +2524,32 @@ class AsyncRLTrainer:
         """Init history collector."""
         if not self.is_main_process:
             return
-        if not getattr(self.config, "enable_history_collection", False):
+        planner_cfg = getattr(self.config, "global_resource_planner", None)
+        planner_enabled = bool(
+            planner_cfg is not None and getattr(planner_cfg, "enabled", False)
+        )
+        runtime_profile_enabled = bool(
+            planner_enabled
+            and getattr(planner_cfg, "runtime_length_profile_enabled", True)
+        )
+        if not getattr(self.config, "enable_history_collection", False) and not runtime_profile_enabled:
             return
 
         output_dir = getattr(self.config, "history_output_dir", "") or ""
         if not output_dir:
             output_dir = os.path.join(self.config.log_dir, "history")
+
+        runtime_profile_path = ""
+        if runtime_profile_enabled:
+            runtime_profile_path = str(
+                getattr(planner_cfg, "runtime_length_profile_jsonl", "") or ""
+            )
+            if not runtime_profile_path:
+                runtime_profile_path = os.path.join(
+                    output_dir,
+                    "runtime_length_profile.jsonl",
+                )
+            planner_cfg.runtime_length_profile_jsonl = runtime_profile_path
 
         experiment_name = getattr(self.config, "history_experiment_name", "") or ""
         # Keep history artifacts isolated per launched run.  The validated
@@ -2317,6 +2568,7 @@ class AsyncRLTrainer:
             save_raw_lengths=getattr(self.config, "history_save_raw_lengths", False),
             flush_interval=getattr(self.config, "history_flush_interval", 10),
             experiment_name=experiment_name,
+            length_profile_path=runtime_profile_path,
         )
         self.history_collector.initialize()
 

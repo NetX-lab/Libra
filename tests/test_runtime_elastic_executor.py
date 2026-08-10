@@ -273,6 +273,43 @@ def test_runtime_executor_applies_grp_signal_with_non_blocking_join():
     pool.close()
 
 
+def test_peer_state_does_not_activate_a_joining_hybrid_replica():
+    if ElasticHybridPool is None:
+        pytest.skip("torch is not installed in this local environment")
+
+    cfg = _config()
+    cfg.global_resource_planner.runtime_reconfigure_training = True
+    cfg.global_resource_planner.runtime_training_pool_plan_only = False
+    cfg.global_resource_planner.runtime_training_pool_target_gpus = 3
+    planner, decision = _decision(cfg)
+    pool = ElasticHybridPool(
+        core_train_workers=["dp0", "dp1"],
+        core_rollout_workers=["rollout0"],
+        zero_sync_steps=1,
+    )
+    pool.gradient_domain.request_join("rollout0", "dp0")
+    executor = RuntimeElasticExecutor(
+        config=cfg,
+        planner=planner,
+        elastic_pool=pool,
+    )
+
+    joining = executor._peer_training_reconfiguration_state(
+        decision.candidate_plan
+    )
+    assert joining["hybrid_targets"] == {"rollout0": "dp0"}
+    assert joining["active_hybrid_ids"] == []
+    assert joining["activate_hybrids"] is False
+
+    pool.gradient_domain.mark_active("rollout0")
+    active = executor._peer_training_reconfiguration_state(
+        decision.candidate_plan
+    )
+    assert active["active_hybrid_ids"] == ["rollout0"]
+    assert active["activate_hybrids"] is True
+    pool.close()
+
+
 def test_runtime_executor_release_signal_cancels_pending_join_immediately():
     if ElasticHybridPool is None:
         pytest.skip("torch is not installed in this local environment")

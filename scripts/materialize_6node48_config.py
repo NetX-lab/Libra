@@ -152,6 +152,10 @@ def materialize(
         planner["hybrid_worker_remote_control_dir"] = str(
             run_root / "elastic_training_tasks"
         )
+    planner["runtime_length_profile_enabled"] = True
+    planner["runtime_length_profile_jsonl"] = str(
+        run_root / "history" / "runtime_length_profile.jsonl"
+    )
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:

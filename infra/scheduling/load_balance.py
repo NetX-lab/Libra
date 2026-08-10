@@ -122,9 +122,19 @@ class LoadBalanceScheduler(BaseScheduler):
             # low-concurrency, multi-turn workloads such as R2E-Gym.  Rotate
             # among equal-load endpoints while preserving least-connections
             # as the primary selection criterion.
-            idx = self._rr_counter % len(least_loaded)
-            self._rr_counter += 1
-            return least_loaded[idx]
+            least_loaded_ids = {id(h) for h in least_loaded}
+            start = self._rr_counter % len(self._instances)
+            for offset in range(len(self._instances)):
+                position = (start + offset) % len(self._instances)
+                handle = self._instances[position]
+                if id(handle) in least_loaded_ids:
+                    # Store the position after the selected handle.  Unlike
+                    # taking counter modulo the changing tie-set size, this
+                    # cannot permanently skip endpoints when active requests
+                    # enter and leave the candidate set.
+                    self._rr_counter = (position + 1) % len(self._instances)
+                    return handle
+            raise RuntimeError("least-connections tie set is inconsistent")
 
     def on_request_done(
         self,

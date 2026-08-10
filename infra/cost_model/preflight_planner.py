@@ -14,6 +14,7 @@ from RL_Framework.infra.cost_model.global_resource_planner import (
     GlobalResourcePlanner,
     PlannerDecision,
 )
+from RL_Framework.infra.cost_model.startup_profile import summarize_length_profile
 
 
 @dataclass
@@ -92,6 +93,9 @@ class PreflightPlanner:
         applied = applied_plan is not None
         if applied_plan is not None:
             self.planner.apply_plan_to_config(applied_plan, self.config)
+            # Persist the proof that startup allocation was decided by GRP.
+            # The trainer checks this before constructing any training engine.
+            self.config.global_resource_planner.initial_allocation_applied = True
 
         return PreflightPlannerResult(
             decision=decision,
@@ -102,6 +106,7 @@ class PreflightPlanner:
                 "num_history_records": len(batch),
                 "apply_best_candidate": self.apply_best_candidate,
                 "initial_allocation_strategy": self.planner.initial_allocation_strategy,
+                "length_profile": summarize_length_profile(batch),
             },
         )
 

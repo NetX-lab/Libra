@@ -457,32 +457,59 @@ class RuntimeElasticExecutor:
                 target_core = core_ids[(active_replicas + offset) % len(core_ids)]
                 member_ranks = {worker_id: rank for rank, worker_id in enumerate(members)}
 
-                def activate_member(
-                    worker_id: str,
+                def activate_replica(
+                    _replica_id: str,
+                    _members: tuple[str, ...],
                     target_core_id: str,
                     state_version: int,
-                    *,
-                    _replica_id: str = replica_id,
-                    _member_ranks: dict[str, int] = member_ranks,
-                    _replica_world_size: int = len(members),
                 ) -> None:
-                    self._activate_hybrid_worker(
-                        worker_id,
-                        target_core_id,
-                        state_version,
+                    slots = [self._cluster_swap_training_slot(wid) for wid in _members]
+                    hosts = {str(slot.get("host", "")) for slot in slots}
+                    if len(hosts) > 1:
+                        raise RuntimeError(
+                            "a complete DP Replica must launch as one process group "
+                            f"on one host; replica={_replica_id}, hosts={sorted(hosts)}"
+                        )
+                    gpus = [int(gpu) for slot in slots for gpu in slot.get("gpus", [])]
+                    if len(gpus) != len(_members):
+                        raise RuntimeError(
+                            f"Replica { _replica_id } has {len(gpus)} GPUs for {len(_members)} members"
+                        )
+                    snapshot_path = self._snapshot_path_for_version(state_version)
+                    command = self._build_hybrid_worker_command(
+                        worker_id=_replica_id,
+                        target_core_id=target_core_id,
+                        snapshot_path=snapshot_path,
+                        host=next(iter(hosts), ""),
+                        gpus=gpus,
                         replica_id=_replica_id,
-                        replica_rank=_member_ranks[worker_id],
-                        replica_world_size=_replica_world_size,
+                        replica_rank=0,
+                        replica_world_size=len(_members),
                     )
+                    proc = subprocess.Popen(command, shell=True, env=os.environ.copy())
+                    self._hybrid_worker_processes[_replica_id] = proc
+                    for rank, worker_id in enumerate(_members):
+                        self._hybrid_worker_processes[worker_id] = proc
+                        self._hybrid_worker_meta[worker_id] = ManagedHybridWorkerProcess(
+                            worker_id=worker_id,
+                            target_core_id=target_core_id,
+                            command=command,
+                            pid=proc.pid,
+                            snapshot_path=snapshot_path,
+                            host=next(iter(hosts), ""),
+                            gpus=gpus,
+                            replica_id=_replica_id,
+                            replica_rank=rank,
+                            replica_world_size=len(_members),
+                        )
+                    self._wait_hybrid_worker_ready(_replica_id)
 
                 handle = self.elastic_pool.join_replica(
                     replica_id,
                     members,
                     target_core,
-                    activation_barrier=(
-                        activate_member
-                        if self._hybrid_worker_launch_enabled
-                        else None
+                    replica_activation_barrier=(
+                        activate_replica if self._hybrid_worker_launch_enabled else None
                     ),
                     timeout_s=float(
                         getattr(
@@ -588,16 +615,22 @@ class RuntimeElasticExecutor:
 
     def _elastic_replica_size_gpus(self) -> int:
         cfg = self.config.global_resource_planner
-        configured = int(
-            getattr(cfg, "elastic_hybrid_replica_size_gpus", 0) or 0
-        )
-        if configured > 0:
-            return configured
-        return (
+        topology_width = (
             max(1, int(getattr(self.config, "train_tp_size", 1) or 1))
             * max(1, int(getattr(self.config, "train_pp_size", 1) or 1))
             * max(1, int(getattr(self.config, "train_cp_size", 1) or 1))
         )
+        configured = int(
+            getattr(cfg, "elastic_hybrid_replica_size_gpus", 0) or 0
+        )
+        if configured > 0:
+            if configured != topology_width:
+                raise ValueError(
+                    "elastic_hybrid_replica_size_gpus must equal one complete "
+                    f"DP Replica topology width ({topology_width}); got {configured}"
+                )
+            return configured
+        return topology_width
 
     def _elastic_replica_capacity(self) -> int:
         cfg = self.config.global_resource_planner
@@ -638,6 +671,21 @@ class RuntimeElasticExecutor:
             )
             for members in replica_snapshot.values():
                 roles = {self._role_name(worker.role) for worker in members}
+            membership_dir = Path(getattr(self.config.global_resource_planner, "hybrid_worker_task_dir", "./logs/elastic_training_tasks")) / "membership"
+            membership_dir.mkdir(parents=True, exist_ok=True)
+            domain_membership = self.elastic_pool.gradient_domain.membership_state()
+            targets = domain_membership.get("hybrid_targets") or {}
+            active_ids = set(domain_membership.get("active_replica_ids") or ())
+            for replica_id, members in replica_snapshot.items():
+                target = str(targets.get(replica_id, ""))
+                role = "hybrid_training" if replica_id in active_ids else "hybrid_joining"
+                self._write_json_atomic(
+                    membership_dir / f"{replica_id}.json",
+                    {"worker_id": replica_id, "target_core_id": target,
+                     "role": role, "membership_epoch": int(domain_membership.get("membership_epoch", 0)),
+                     "members": [worker.worker_id for worker in members],
+                     "replica_world_size": len(members)},
+                )
                 if roles == {"hybrid_training"}:
                     active += 1
                 elif "hybrid_joining" in roles:
@@ -1456,6 +1504,22 @@ class RuntimeElasticExecutor:
                     groups[:desired_replicas]
                 )
             }
+        active_hybrid_ids: list[str] = []
+        if self.elastic_pool is not None:
+            membership = self.elastic_pool.gradient_domain.membership_state()
+            actual_targets = {
+                str(worker_id): str(target_core)
+                for worker_id, target_core in (
+                    membership.get("hybrid_targets") or {}
+                ).items()
+            }
+            if actual_targets:
+                hybrid_targets = actual_targets
+            active_hybrid_ids = [
+                str(worker_id)
+                for worker_id in membership.get("active_replica_ids", ())
+                if str(worker_id) in hybrid_targets
+            ]
         return {
             "enabled": True,
             "plan_only": bool(
@@ -1465,12 +1529,13 @@ class RuntimeElasticExecutor:
             "current_train_gpus": current_train_gpus,
             "core_replica_ids": core_ids,
             "hybrid_targets": hybrid_targets,
+            "active_hybrid_ids": active_hybrid_ids,
             "replica_size_gpus": self._elastic_replica_size_gpus(),
             "elastic_hybrid_signal": dict(self._active_elastic_signal or {}),
-            "activate_hybrids": bool(
-                not getattr(planner_cfg, "runtime_training_pool_plan_only", True)
-                and desired_hybrid_workers > 0
-            ),
+            # Compatibility summary for older readers. Peers use the explicit
+            # list above so a submitted join cannot become active before its
+            # worker crosses the activation barrier.
+            "activate_hybrids": bool(active_hybrid_ids),
         }
 
     def _coordinate_peer_rank_drain(
@@ -2022,6 +2087,8 @@ class RuntimeElasticExecutor:
         template = getattr(cfg, "hybrid_worker_command_template", "")
         assigned_gpus = [int(gpu) for gpu in (gpus or [])]
         cuda_visible_devices = ",".join(str(gpu) for gpu in assigned_gpus)
+        device_backend = str(getattr(self.config, "device_backend", "cuda")).lower()
+        device_visible_devices = cuda_visible_devices
         values = {
             "python": shlex.quote(getattr(cfg, "hybrid_worker_python", sys.executable)),
             "rl_framework_path": shlex.quote(str(rl_root)),
@@ -2035,6 +2102,15 @@ class RuntimeElasticExecutor:
             "host": shlex.quote(host),
             "gpus": cuda_visible_devices,
             "cuda_visible_devices": shlex.quote(cuda_visible_devices),
+            "ascend_visible_devices": shlex.quote(device_visible_devices),
+            "device_backend": shlex.quote(device_backend),
+            "worker_mode": shlex.quote(getattr(cfg, "hybrid_worker_mode", "megatron_core")),
+            "worker_config": shlex.quote(
+                getattr(cfg, "hybrid_worker_config_path", "")
+                or os.environ.get("RUNTIME_CONFIG", os.environ.get("CONFIG_PATH", ""))
+            ),
+            "gradient_endpoint_dir": shlex.quote(getattr(cfg, "hybrid_worker_endpoint_dir", getattr(cfg, "hybrid_worker_task_dir", "")) + "/core_endpoints"),
+            "replica_gpus": len(assigned_gpus) or int(replica_world_size),
             "gradient_host": shlex.quote(gradient_host),
             "gradient_port": endpoint.port,
             "authkey": shlex.quote(endpoint.authkey),
@@ -2048,10 +2124,18 @@ class RuntimeElasticExecutor:
         if template:
             return template.format(**values)
         env_prefix = ""
-        if cuda_visible_devices:
+        if cuda_visible_devices and device_backend != "npu":
             env_prefix = f"CUDA_VISIBLE_DEVICES={values['cuda_visible_devices']} "
+        elif cuda_visible_devices:
+            env_prefix = f"ASCEND_RT_VISIBLE_DEVICES={values['ascend_visible_devices']} "
+        worker_script = f"{values['rl_framework_path']}/scripts/elastic_hybrid_worker.py"
+        launcher = ""
+        if values["worker_mode"] == "'megatron_core'" and values["replica_gpus"] > 1:
+            launcher = f"{values['python']} -m torch.distributed.run --standalone --nproc_per_node={values['replica_gpus']} "
+        else:
+            launcher = f"{values['python']} "
         return (
-            f"{env_prefix}{values['python']} {values['rl_framework_path']}/scripts/elastic_hybrid_worker.py "
+            f"{env_prefix}{launcher}{worker_script} "
             f"--worker-id {values['worker_id']} "
             f"--replica-id {values['replica_id']} "
             f"--replica-rank {values['replica_rank']} "
@@ -2060,6 +2144,9 @@ class RuntimeElasticExecutor:
             f"--snapshot-path {values['snapshot_path']} "
             f"--gradient-host {values['gradient_host']} "
             f"--gradient-port {values['gradient_port']} "
+            f"--worker-mode {values['worker_mode']} "
+            f"--config {values['worker_config']} "
+            f"--gradient-endpoint-dir {values['gradient_endpoint_dir']} "
             f"--authkey {values['authkey']} "
             f"--task-dir {values['task_dir']} "
             f"--gradient-transport {values['gradient_transport_backend']} "

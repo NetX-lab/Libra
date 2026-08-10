@@ -70,6 +70,7 @@ examples/profile/
 .codex_publish/
 .remote_compare/
 ssh_askpass*
+.tmp_paramiko/
 
 # Local environments and offline packages
 rl_framework_env

@@ -4,6 +4,7 @@ set -euo pipefail
 
 : "${NODE_PASSWORD:?set NODE_PASSWORD before invoking this script}"
 : "${INTERNAL_SSH_TIMEOUT:=120}"
+export INTERNAL_SSH_TIMEOUT
 
 hosts=()
 while [[ "$#" -gt 0 && "$1" != "--" ]]; do

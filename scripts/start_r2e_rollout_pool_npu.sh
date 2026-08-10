@@ -7,8 +7,20 @@ set -euo pipefail
 action="${1:?usage: $0 start|stop|status NODE_ID}"
 node_id="${2:?usage: $0 start|stop|status NODE_ID}"
 project_dir="${PROJECT_DIR:-/opt/libra/RL_Framework_NPU}"
-venv_dir="${VLLM_VENV_DIR:-/opt/libra/envs/vllm_ascend}"
-model_path="${MODEL_PATH:-/opt/libra/models/Qwen3-14B}"
+if [[ -n "${VLLM_VENV_DIR:-}" ]]; then
+    venv_dir="$VLLM_VENV_DIR"
+elif [[ -x /opt/libra/envs/vllm_ascend/bin/python ]]; then
+    venv_dir="/opt/libra/envs/vllm_ascend"
+else
+    venv_dir="/root/vllm_ascend_env"
+fi
+if [[ -n "${MODEL_PATH:-}" ]]; then
+    model_path="$MODEL_PATH"
+elif [[ -f /opt/libra/models/Qwen3-14B/config.json ]]; then
+    model_path="/opt/libra/models/Qwen3-14B"
+else
+    model_path="/data/qianzhirong/models/Qwen3-14B"
+fi
 run_root="${RUN_ROOT:-/opt/libra/runs/r2e_gym_qwen3_14b_6node48}"
 control_dir="${CONTROL_DIR:-${run_root}/rollout_weight_sync}"
 log_dir="${ROLLOUT_LOG_DIR:-${run_root}/rollout_logs}"

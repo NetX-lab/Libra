@@ -92,3 +92,18 @@ def test_least_connections_rotates_equal_load_endpoints():
 
     assert routed[:8] == list(range(8))
     assert routed[8:] == list(range(8))
+
+
+def test_least_connections_does_not_skip_endpoints_across_concurrent_waves():
+    scheduler = LoadBalanceScheduler(load_balance_strategy="least_connections")
+    for index in range(8):
+        scheduler.register_instance(index, f"tp2_{index}", 2)
+
+    waves = []
+    for _ in range(2):
+        wave = [scheduler.schedule(512).instance_index for _ in range(4)]
+        waves.append(wave)
+        for instance_index in wave:
+            scheduler.on_request_done(instance_index)
+
+    assert waves == [list(range(4)), list(range(4, 8))]

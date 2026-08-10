@@ -67,6 +67,11 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 MAX_WAIT="${MAX_WAIT:-1800}"
 R2E_MAX_TURNS="${R2E_MAX_TURNS:-4}"
 R2E_MAX_PROMPT_TOKENS="${R2E_MAX_PROMPT_TOKENS:-4096}"
+GRP_PROFILE_DATASET_JSONL="${GRP_PROFILE_DATASET_JSONL:-$PROJECT_DIR/data/r2e_gym_v1/index.jsonl}"
+GRP_PROFILE_SAMPLE_SIZE="${GRP_PROFILE_SAMPLE_SIZE:-64}"
+GRP_PROFILE_STRATEGY="${GRP_PROFILE_STRATEGY:-spread}"
+GRP_PROFILE_SEED="${GRP_PROFILE_SEED:-0}"
+GRP_PROFILE_SAMPLES_PER_PROMPT="${GRP_PROFILE_SAMPLES_PER_PROMPT:-1}"
 R2E_EVAL_MULTI_TURN="${R2E_EVAL_MULTI_TURN:-1}"
 R2E_EVAL_RECORD_SAMPLES="${R2E_EVAL_RECORD_SAMPLES:-16}"
 R2E_EVAL_STRATEGY="${R2E_EVAL_STRATEGY:-spread}"
@@ -444,6 +449,7 @@ export MEGATRON_USE_PRECISION_AWARE_OPTIMIZER MEGATRON_OPTIMIZER_CPU_OFFLOAD
 export MEGATRON_OPTIMIZER_OFFLOAD_FRACTION
 export RUNTIME_CONFIG PLAN_ENV
 export ALLOW_QWEN30_FALLBACK
+export GRP_PROFILE_DATASET_JSONL GRP_PROFILE_SAMPLE_SIZE GRP_PROFILE_STRATEGY GRP_PROFILE_SEED GRP_PROFILE_SAMPLES_PER_PROMPT
 export CMLFQ_TREE_PATH CMLFQ_SHARED_LOAD_DIR CMLFQ_SHARED_LOAD_TTL CMLFQ_SHARED_LOAD_HEARTBEAT CMLFQ_TREE_PERSIST_INTERVAL
 ROLLOUT_NODES_CSV="$(IFS=,; echo "${ROLLOUT_NODES[*]}")"
 export ROLLOUT_NODES_CSV
@@ -453,21 +459,38 @@ import shlex
 from pathlib import Path
 import yaml
 
+from transformers import AutoTokenizer
+
 from RL_Framework.config import AsyncRLConfig
-from RL_Framework.infra.cost_model.preflight_planner import (
-    PreflightPlanner,
-    synthetic_history,
+from RL_Framework.infra.cost_model.preflight_planner import PreflightPlanner
+from RL_Framework.infra.cost_model.startup_profile import (
+    load_jsonl_rows,
+    load_profile_summary,
+    profile_jsonl_has_records,
+    profile_metadata_matches,
+    startup_profile_metadata,
+    summarize_length_profile,
+    write_profile_jsonl,
+    write_profile_summary,
 )
+from RL_Framework.workflow.r2e_gym_profile import build_r2e_gym_length_profile
 
 project = Path(os.environ["PROJECT_DIR"])
 base = project / "configs" / "r2e_gym_cmlfq_qwen3_4b.yaml"
 seed_path = project / "configs" / f".r2e_gym_cmlfq_24gpu_seed_{os.environ['JOB_ID']}.yaml"
 runtime_path = Path(os.environ["RUNTIME_CONFIG"])
 plan_env = Path(os.environ["PLAN_ENV"])
+job_log_dir = Path(os.environ["JOB_LOG_DIR"])
 rollout_nodes = [n for n in os.environ["ROLLOUT_NODES_CSV"].split(",") if n]
 base_port = int(os.environ["VLLM_BASE_PORT"])
 max_model_len = int(os.environ["MAX_MODEL_LEN"])
 max_new_tokens = int(os.environ["MAX_NEW_TOKENS"])
+r2e_max_turns = int(os.environ["R2E_MAX_TURNS"])
+r2e_max_prompt_tokens = int(os.environ.get("R2E_MAX_PROMPT_TOKENS", "0") or "0")
+profile_dataset = Path(os.environ["GRP_PROFILE_DATASET_JSONL"])
+profile_cache_dir = project / "logs" / "r2e_gym_cmlfq_24gpu" / "startup_profile_cache"
+profile_jsonl = profile_cache_dir / "grp_startup_profile.jsonl"
+profile_summary_json = profile_cache_dir / "grp_startup_profile_summary.json"
 train_gpus = int(os.environ["TRAIN_GPUS"])
 rollout_gpus = int(os.environ["ROLLOUT_GPUS"])
 total_gpus = int(os.environ["TOTAL_GPUS"])
@@ -527,6 +550,8 @@ seed = {
     "eval_interval": int(os.environ["EVAL_INTERVAL"]),
     "max_new_tokens": int(os.environ["MAX_NEW_TOKENS"]),
     "max_seq_length": int(os.environ["MAX_MODEL_LEN"]),
+    "r2e_max_turns": r2e_max_turns,
+    "r2e_max_prompt_tokens": r2e_max_prompt_tokens,
     "max_concurrent_rollouts": int(os.environ["MAX_CONCURRENT_ROLLOUTS"]),
     "queue_size": int(os.environ["QUEUE_SIZE"]),
     "sync_path": str(project / "logs" / "r2e_gym_cmlfq_24gpu" / f"weights_{os.environ['JOB_ID']}"),
@@ -590,6 +615,16 @@ seed = {
         "allowed_train_pp": [train_pp],
         "fixed_train_gpus": train_gpus,
         "micro_batch_sizes": [1],
+        "startup_profile_enabled": True,
+        "startup_profile_sample_size": int(os.environ["GRP_PROFILE_SAMPLE_SIZE"]),
+        "startup_profile_strategy": os.environ["GRP_PROFILE_STRATEGY"],
+        "startup_profile_seed": int(os.environ["GRP_PROFILE_SEED"]),
+        "startup_profile_samples_per_prompt": int(os.environ["GRP_PROFILE_SAMPLES_PER_PROMPT"]),
+        "startup_profile_dataset_jsonl": str(profile_dataset),
+        "startup_profile_history_jsonl": str(profile_jsonl),
+        "startup_profile_summary_json": str(profile_summary_json),
+        "runtime_length_profile_enabled": True,
+        "runtime_length_profile_jsonl": str(job_log_dir / "runtime_length_profile.jsonl"),
         "apply_to_runtime": True,
         "verbose": True,
         "runtime_async_planning": os.environ["GRP_RUNTIME_ASYNC_PLANNING"] == "1",
@@ -647,11 +682,60 @@ seed = {
 seed_path.write_text(yaml.safe_dump(seed, sort_keys=False), encoding="utf-8")
 
 cfg = AsyncRLConfig.from_yaml(str(seed_path))
-history = synthetic_history(
-    num_requests=max(64, int(os.environ["TRAIN_BATCH_SIZE"]) * 4),
-    input_len=max(512, max_model_len // 2),
-    output_len=max(32, max_new_tokens),
+profile_metadata = startup_profile_metadata(
+    dataset_jsonl=profile_dataset,
+    model_path=cfg.model_path,
+    tokenizer_path=cfg.tokenizer_path if cfg.tokenizer_path else cfg.model_path,
+    sample_size=int(os.environ["GRP_PROFILE_SAMPLE_SIZE"]),
+    strategy=os.environ["GRP_PROFILE_STRATEGY"],
+    seed=int(os.environ["GRP_PROFILE_SEED"]),
+    samples_per_prompt=int(os.environ["GRP_PROFILE_SAMPLES_PER_PROMPT"]),
+    max_new_tokens=max_new_tokens,
+    max_seq_length=max_model_len,
+    r2e_max_turns=r2e_max_turns,
+    r2e_max_prompt_tokens=r2e_max_prompt_tokens,
 )
+history = None
+summary = None
+if profile_jsonl_has_records(profile_jsonl):
+    existing_summary = load_profile_summary(profile_summary_json)
+    if (
+        existing_summary is None
+        or profile_metadata_matches(existing_summary, profile_metadata)
+    ):
+        history = load_jsonl_rows(profile_jsonl)
+        if not history:
+            raise RuntimeError(f"startup profile JSONL is empty: {profile_jsonl}")
+        summary = summarize_length_profile(history)
+        summary.update(profile_metadata)
+        summary["reused"] = True
+        write_profile_summary(summary, profile_summary_json)
+if history is None:
+    rows = load_jsonl_rows(profile_dataset)
+    if not rows:
+        raise RuntimeError(f"GRP startup profile dataset is empty: {profile_dataset}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.tokenizer_path if cfg.tokenizer_path else cfg.model_path,
+        trust_remote_code=True,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    history = build_r2e_gym_length_profile(
+        rows,
+        tokenizer=tokenizer,
+        sample_size=int(os.environ["GRP_PROFILE_SAMPLE_SIZE"]),
+        strategy=os.environ["GRP_PROFILE_STRATEGY"],
+        seed=int(os.environ["GRP_PROFILE_SEED"]),
+        samples_per_prompt=int(os.environ["GRP_PROFILE_SAMPLES_PER_PROMPT"]),
+        max_turns=r2e_max_turns,
+        max_new_tokens=max_new_tokens,
+        max_seq_length=max_model_len,
+        max_prompt_tokens=r2e_max_prompt_tokens or None,
+    )
+    summary = summarize_length_profile(history)
+    summary.update(profile_metadata)
+    write_profile_jsonl(history, profile_jsonl)
+    write_profile_summary(summary, profile_summary_json)
 result = PreflightPlanner(cfg, apply_best_candidate=True).run(history)
 planned = result.planned_config
 planned.train_backend = os.environ["TRAIN_BACKEND"]
@@ -858,6 +942,8 @@ plan_env.write_text(
 )
 print(f"seed_config={seed_path}")
 print(f"runtime_config={runtime_path}")
+print(f"profile_jsonl={profile_jsonl}")
+print(f"profile_summary={summary}")
 print(f"decision={result.decision.to_dict()}")
 print(f"planned_rollout_tp={assigned_tps}")
 print(f"planned_rollout_nodes={assigned_nodes}")

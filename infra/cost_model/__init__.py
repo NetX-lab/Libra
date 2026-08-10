@@ -37,6 +37,20 @@ from .preflight_planner import (
     load_history_jsonl,
     synthetic_history,
 )
+from .startup_profile import (
+    build_length_profile,
+    load_jsonl_rows,
+    load_length_profile_records,
+    load_profile_summary,
+    profile_jsonl_has_records,
+    profile_metadata_matches,
+    profile_summary_matches,
+    sample_indices,
+    startup_profile_metadata,
+    summarize_length_profile,
+    write_profile_jsonl,
+    write_profile_summary,
+)
 
 __all__ = [
     "CostModel",
@@ -66,4 +80,16 @@ __all__ = [
     "PreflightPlannerResult",
     "load_history_jsonl",
     "synthetic_history",
+    "build_length_profile",
+    "load_jsonl_rows",
+    "load_length_profile_records",
+    "load_profile_summary",
+    "profile_jsonl_has_records",
+    "profile_metadata_matches",
+    "profile_summary_matches",
+    "sample_indices",
+    "startup_profile_metadata",
+    "summarize_length_profile",
+    "write_profile_jsonl",
+    "write_profile_summary",
 ]

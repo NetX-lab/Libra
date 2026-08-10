@@ -453,12 +453,27 @@ class GlobalResourcePlannerConfig:
     # only for backwards-compatible, explicitly configured deployments and is
     # ignored when this strategy is ``grp``.
     initial_allocation_strategy: str = "grp"  # grp | configured
+    # Set only by the preflight planner after it has applied a concrete GRP plan.
+    # A live trainer refuses to start with a fixed seed split when GRP is required.
+    initial_allocation_applied: bool = False
     allocation_granularity_gpus: int = 1
     min_train_gpus: int = 1
     min_rollout_gpus: int = 1
     micro_batch_sizes: list[int] = field(default_factory=list)
+    startup_profile_enabled: bool = True
+    startup_profile_sample_size: int = 64
+    startup_profile_strategy: str = "spread"  # spread | random | first
+    startup_profile_seed: int = 0
+    startup_profile_samples_per_prompt: int = 1
+    startup_profile_dataset_jsonl: str = ""
+    startup_profile_history_jsonl: str = ""
+    startup_profile_summary_json: str = ""
+    startup_profile_reuse_existing: bool = True
+    startup_profile_allow_synthetic_fallback: bool = False
     apply_to_runtime: bool = True
     verbose: bool = False
+    runtime_length_profile_enabled: bool = True
+    runtime_length_profile_jsonl: str = ""
     runtime_async_planning: bool = True
     runtime_max_pending_plans: int = 1
     runtime_dynamic_reconfiguration_enabled: bool = True
@@ -550,6 +565,12 @@ class GlobalResourcePlannerConfig:
     native_rdma_gid_index: int = 0
     native_rdma_ib_port: int = 1
     native_rdma_max_bytes: int = 67108864
+    hybrid_worker_mode: str = "megatron_core"
+    hybrid_worker_config_path: str = ""
+    hybrid_worker_endpoint_dir: str = ""
+    hybrid_lockstep_gradient_sync: bool = True
+    hybrid_active_gradient_timeout_s: float = 300.0
+    hybrid_update_timeout_s: float = 300.0
 
     @classmethod
     def from_dict(cls, d: dict) -> "GlobalResourcePlannerConfig":

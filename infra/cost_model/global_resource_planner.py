@@ -413,6 +413,26 @@ class GlobalResourcePlanner:
             self._history = self._history[-self.max_history_size :]
         return len(requests)
 
+    def replace_history(self, history: list[Any]) -> int:
+        """Replace the in-memory request history with a fresh profile window."""
+
+        requests = self._extract_requests(history)
+        if len(requests) > self.max_history_size:
+            requests = requests[-self.max_history_size :]
+        self._history = requests
+        return len(requests)
+
+    def extend_history(self, history: list[Any]) -> int:
+        """Append a fresh batch of request history entries."""
+
+        requests = self._extract_requests(history)
+        if not requests:
+            return 0
+        self._history.extend(requests)
+        if len(self._history) > self.max_history_size:
+            self._history = self._history[-self.max_history_size :]
+        return len(requests)
+
     def observe_runtime(
         self,
         *,
@@ -718,12 +738,18 @@ class GlobalResourcePlanner:
         replica_size = int(
             getattr(planner_cfg, "elastic_hybrid_replica_size_gpus", 0) or 0
         )
-        if replica_size <= 0:
-            replica_size = (
-                max(1, int(getattr(config, "train_tp_size", 1) or 1))
-                * max(1, int(getattr(config, "train_pp_size", 1) or 1))
-                * max(1, int(getattr(config, "train_cp_size", 1) or 1))
+        topology_width = (
+            max(1, int(getattr(config, "train_tp_size", 1) or 1))
+            * max(1, int(getattr(config, "train_pp_size", 1) or 1))
+            * max(1, int(getattr(config, "train_cp_size", 1) or 1))
+        )
+        if replica_size > 0 and replica_size != topology_width:
+            raise ValueError(
+                "elastic_hybrid_replica_size_gpus must equal one complete DP "
+                f"Replica ({topology_width}); got {replica_size}"
             )
+        if replica_size <= 0:
+            replica_size = topology_width
         min_rollout_gpus = max(
             0,
             int(getattr(planner_cfg, "elastic_hybrid_min_rollout_gpus", 0) or 0),

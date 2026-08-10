@@ -36,7 +36,21 @@ read -r -a available_hosts <<< "${available_hosts_value//,/ }"
     exit 2
 }
 
-config_python="${CONFIG_PYTHON:-/opt/libra/envs/rl_framework_py310/bin/python}"
+if [[ -n "${CONFIG_PYTHON:-}" ]]; then
+    config_python="$CONFIG_PYTHON"
+elif [[ -x /opt/libra/envs/rl_framework_py310/bin/python ]]; then
+    config_python="/opt/libra/envs/rl_framework_py310/bin/python"
+else
+    config_python="/data/qianzhirong/envs/rl_framework_py310/bin/python"
+fi
+if [[ -n "${TRAIN_PYTHON:-}" ]]; then
+    train_python="$TRAIN_PYTHON"
+elif [[ -x /opt/libra/envs/rl_mindspeed/bin/python ]]; then
+    train_python="/opt/libra/envs/rl_mindspeed/bin/python"
+else
+    train_python="/data/qianzhirong/envs/rl_mindspeed_260/bin/python"
+fi
+cluster_socket_iface="${CLUSTER_SOCKET_IFNAME:-eth0}"
 planned_config="${run_dir}/grp_initial_config.yaml"
 placement_json="${run_dir}/grp_initial_placement.json"
 if [[ "$initial_placement_mode" == "configured" ]]; then
@@ -62,6 +76,33 @@ if [[ "$initial_placement_mode" == "configured" ]]; then
         "$placement_json" "$(IFS=,; echo "${train_hosts[*]}")" "$(IFS=,; echo "${rollout_hosts[*]}")"
     echo "[ConfiguredPlacement] train_hosts=${train_hosts[*]} rollout_hosts=${rollout_hosts[*]}"
 elif [[ "$initial_placement_mode" == "grp" ]]; then
+    grp_history_args=()
+    if [[ "${GRP_STARTUP_PROFILE_ENABLED:-1}" == "1" ]]; then
+        profile_dataset_jsonl="${GRP_PROFILE_DATASET_JSONL:-$runtime_project_dir/data/r2e_gym_v1/index.jsonl}"
+        profile_cache_dir="${GRP_STARTUP_PROFILE_CACHE_DIR:-${GRP_PROFILE_CACHE_DIR:-$run_root/startup_profile_cache}}"
+        profile_jsonl="${GRP_STARTUP_PROFILE_JSONL:-${GRP_PROFILE_JSONL:-$profile_cache_dir/grp_startup_profile.jsonl}}"
+        profile_summary_json="${GRP_STARTUP_PROFILE_SUMMARY_JSON:-${GRP_PROFILE_SUMMARY_JSON:-$profile_cache_dir/grp_startup_profile_summary.json}}"
+        profile_args=(
+            --config "$runtime_project_dir/$config_path"
+            --dataset-jsonl "$profile_dataset_jsonl"
+            --output-jsonl "$profile_jsonl"
+            --summary-json "$profile_summary_json"
+            --reuse-existing
+        )
+        [[ -z "${GRP_PROFILE_SAMPLE_SIZE:-}" ]] || profile_args+=(--sample-size "$GRP_PROFILE_SAMPLE_SIZE")
+        [[ -z "${GRP_PROFILE_STRATEGY:-}" ]] || profile_args+=(--strategy "$GRP_PROFILE_STRATEGY")
+        [[ -z "${GRP_PROFILE_SEED:-}" ]] || profile_args+=(--seed "$GRP_PROFILE_SEED")
+        [[ -z "${GRP_PROFILE_SAMPLES_PER_PROMPT:-}" ]] || profile_args+=(--samples-per-prompt "$GRP_PROFILE_SAMPLES_PER_PROMPT")
+        PYTHONPATH="$runtime_pythonpath" "$config_python" \
+            "$project_dir/scripts/collect_r2e_grp_profile.py" \
+            "${profile_args[@]}"
+        grp_history_args=(--history-jsonl "$profile_jsonl")
+    elif [[ "${GRP_ALLOW_SYNTHETIC_FALLBACK:-0}" == "1" ]]; then
+        grp_history_args=(--allow-synthetic-fallback)
+    else
+        echo "GRP startup profile is disabled and synthetic fallback is not allowed" >&2
+        exit 2
+    fi
     placement_args=()
     for host in "${available_hosts[@]}"; do placement_args+=(--host "$host"); done
     PYTHONPATH="$runtime_pythonpath" "$config_python" \
@@ -70,6 +111,7 @@ elif [[ "$initial_placement_mode" == "grp" ]]; then
         --output-config "$planned_config" \
         --placement-json "$placement_json" \
         --gpus-per-host 8 \
+        "${grp_history_args[@]}" \
         "${placement_args[@]}"
     readarray -t train_hosts < <(
         "$config_python" -c 'import json,sys; print(*json.load(open(sys.argv[1]))["train_hosts"], sep="\n")' "$placement_json"
@@ -188,7 +230,7 @@ if [[ "$reuse_rollout" != "1" ]]; then
     for rollout_host in "${rollout_hosts[@]}"; do
         rollout_idle="$(NODE_PASSWORD="$NODE_PASSWORD" INTERNAL_SSH_TIMEOUT="${INTERNAL_SSH_TIMEOUT:-30}" \
             "$project_dir/scripts/internal_ssh.sh" "$rollout_host" -- \
-            "test -f '$rollout_project_dir/scripts/start_r2e_rollout_pool_npu.sh' && test -x '/opt/libra/envs/vllm_ascend/bin/python' && test -f '/opt/libra/models/Qwen3-14B/config.json' && npu-smi info | grep -c -F 'No running processes found in NPU'; true" \
+            "test -f '$rollout_project_dir/scripts/start_r2e_rollout_pool_npu.sh' && (test -x '/opt/libra/envs/vllm_ascend/bin/python' || test -x '/root/vllm_ascend_env/bin/python') && (test -f '/opt/libra/models/Qwen3-14B/config.json' || test -f '/data/qianzhirong/models/Qwen3-14B/config.json') && npu-smi info | grep -c -F 'No running processes found in NPU'; true" \
             | tr -d '\r' | grep -E '^[0-8]$' | tail -n 1)"
         [[ "$rollout_idle" -eq 8 ]] || { echo "rollout node preflight failed: $rollout_host idle=$rollout_idle" >&2; exit 3; }
     done
@@ -211,7 +253,7 @@ find "$hybrid_task_dir" -maxdepth 1 -type f \
        -o -name '.launch_*.started' -o -name '.launch_*.error' \
        -o -name '.stop_*.json' -o -name '*.ready' \) -delete
 NODE_PASSWORD="$NODE_PASSWORD" INTERNAL_SSH_TIMEOUT=30 \
-    nohup /opt/libra/envs/rl_framework_py310/bin/python \
+    nohup "$config_python" \
     "$project_dir/scripts/elastic_hybrid_controller.py" \
     --task-dir "$hybrid_task_dir" \
     --project-dir "$project_dir" \
@@ -262,7 +304,7 @@ for node_rank in "${!train_hosts[@]}"; do
 cd ${runtime_project_dir}; \
 export PYTHONPATH=${runtime_pythonpath} PYTHONDONTWRITEBYTECODE=1 DEVICE_BACKEND=npu DIST_BACKEND=hccl \
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-GLOO_SOCKET_IFNAME=eth0 HCCL_SOCKET_IFNAME=eth0 \
+GLOO_SOCKET_IFNAME=${cluster_socket_iface} HCCL_SOCKET_IFNAME=${cluster_socket_iface} \
 HCCL_CONNECT_TIMEOUT=1800 HCCL_EXEC_TIMEOUT=1800 \
 TORCH_DISTRIBUTED_TIMEOUT=3600 TOKENIZERS_PARALLELISM=false \
 WANDB_MODE=disabled RL_TRAIN_PHASE_TRACE=1 OMP_NUM_THREADS=1 \
@@ -270,7 +312,7 @@ MCORE_MOE_GROUPED_GEMM=0 JOB_ID=${run_name} \
 RL_TRAIN_START_STEP=${train_start_step} RL_INITIAL_MODEL_VERSION=${initial_model_version} \
 ELASTIC_TRAINING_STATE_DIR=${run_root}/elastic_training_state \
 R2E_GYM_INDEX=${runtime_project_dir}/data/r2e_gym_v1/index.jsonl; \
-exec /opt/libra/envs/rl_mindspeed/bin/python -m torch.distributed.run \
+exec ${train_python} -m torch.distributed.run \
 --nnodes=${#train_hosts[@]} --nproc_per_node=8 --node_rank=${node_rank} \
 --master_addr=${master_addr} --master_port=${master_port} \
 examples/r2e_gym_async_rl.py --config ${effective_config}"

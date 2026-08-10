@@ -51,6 +51,33 @@ printf '%s\n' "$run_dir" >"${run_root}/current_${ARM}_run"
 planned_config="${run_dir}/grp_initial_config.yaml"
 placement_json="${run_dir}/initial_placement.json"
 if [[ "$ARM" == "grp" ]]; then
+  grp_history_args=()
+  if [[ "${GRP_STARTUP_PROFILE_ENABLED:-1}" == "1" ]]; then
+    profile_dataset_jsonl="${GRP_PROFILE_DATASET_JSONL:-$runtime_project_dir/data/r2e_gym_v1/index.jsonl}"
+    profile_cache_dir="${GRP_STARTUP_PROFILE_CACHE_DIR:-${GRP_PROFILE_CACHE_DIR:-$run_root/startup_profile_cache}}"
+    profile_jsonl="${GRP_STARTUP_PROFILE_JSONL:-${GRP_PROFILE_JSONL:-$profile_cache_dir/grp_startup_profile.jsonl}}"
+    profile_summary_json="${GRP_STARTUP_PROFILE_SUMMARY_JSON:-${GRP_PROFILE_SUMMARY_JSON:-$profile_cache_dir/grp_startup_profile_summary.json}}"
+    profile_args=(
+      --config "$runtime_project_dir/$config_path"
+      --dataset-jsonl "$profile_dataset_jsonl"
+      --output-jsonl "$profile_jsonl"
+      --summary-json "$profile_summary_json"
+      --reuse-existing
+    )
+    [[ -z "${GRP_PROFILE_SAMPLE_SIZE:-}" ]] || profile_args+=(--sample-size "$GRP_PROFILE_SAMPLE_SIZE")
+    [[ -z "${GRP_PROFILE_STRATEGY:-}" ]] || profile_args+=(--strategy "$GRP_PROFILE_STRATEGY")
+    [[ -z "${GRP_PROFILE_SEED:-}" ]] || profile_args+=(--seed "$GRP_PROFILE_SEED")
+    [[ -z "${GRP_PROFILE_SAMPLES_PER_PROMPT:-}" ]] || profile_args+=(--samples-per-prompt "$GRP_PROFILE_SAMPLES_PER_PROMPT")
+    PYTHONPATH="$runtime_pythonpath" "$config_python" \
+      "$project_dir/scripts/collect_r2e_grp_profile.py" \
+      "${profile_args[@]}"
+    grp_history_args=(--history-jsonl "$profile_jsonl")
+  elif [[ "${GRP_ALLOW_SYNTHETIC_FALLBACK:-0}" == "1" ]]; then
+    grp_history_args=(--allow-synthetic-fallback)
+  else
+    echo "GRP startup profile is disabled and synthetic fallback is not allowed" >&2
+    exit 2
+  fi
   placement_args=()
   for host in "${available_hosts[@]}"; do placement_args+=(--host "$host"); done
   PYTHONPATH="$runtime_pythonpath" "$config_python" \
@@ -59,6 +86,7 @@ if [[ "$ARM" == "grp" ]]; then
     --output-config "$planned_config" \
     --placement-json "$placement_json" \
     --gpus-per-host 8 \
+    "${grp_history_args[@]}" \
     "${placement_args[@]}"
   readarray -t train_hosts < <(
     "$config_python" -c 'import json,sys; print(*json.load(open(sys.argv[1]))["train_hosts"], sep="\n")' "$placement_json"
