@@ -44,7 +44,7 @@ for Agentic RL Post-Training"**. Read the [paper](https://arxiv.org/abs/2606.030
   [`NPU_Support`](https://github.com/NetX-lab/Libra/tree/NPU_Support) branch,
   including Megatron-Core/HCCL training, vLLM Ascend rollout workers, Global
   Resource Planner integration, C-MLFQ scheduling, and Elastic Hybrid Pool
-  execution. The validated reference run uses Qwen3-14B on 6 nodes and 48 NPUs.
+  execution. 
 - **2026-08-03** — Libra was officially open sourced.
 
 
