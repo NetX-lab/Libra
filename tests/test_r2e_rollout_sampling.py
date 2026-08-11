@@ -55,7 +55,7 @@ async def test_r2e_rollout_index_produces_distinct_reproducible_sampling_seeds()
 
 def test_r2e_stop_reward_loads_from_production_config():
     config = AsyncRLConfig.from_yaml(
-        "configs/r2e_gym_qwen3_14b_mcore_npu_6node48_production_ehp.yaml"
+        "configs/r2e_gym_qwen3_14b_mcore_gpu_6node48_production_ehp.yaml"
     )
 
     assert config.r2e_stop_reward == pytest.approx(0.5)

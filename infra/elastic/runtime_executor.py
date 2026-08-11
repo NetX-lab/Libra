@@ -2121,8 +2121,6 @@ class RuntimeElasticExecutor:
         template = getattr(cfg, "hybrid_worker_command_template", "")
         assigned_gpus = [int(gpu) for gpu in (gpus or [])]
         cuda_visible_devices = ",".join(str(gpu) for gpu in assigned_gpus)
-        device_backend = str(getattr(self.config, "device_backend", "cuda")).lower()
-        device_visible_devices = cuda_visible_devices
         values = {
             "python": shlex.quote(getattr(cfg, "hybrid_worker_python", sys.executable)),
             "rl_framework_path": shlex.quote(str(rl_root)),
@@ -2136,8 +2134,6 @@ class RuntimeElasticExecutor:
             "host": shlex.quote(host),
             "gpus": cuda_visible_devices,
             "cuda_visible_devices": shlex.quote(cuda_visible_devices),
-            "ascend_visible_devices": shlex.quote(device_visible_devices),
-            "device_backend": shlex.quote(device_backend),
             "worker_mode": shlex.quote(getattr(cfg, "hybrid_worker_mode", "megatron_core")),
             "worker_config": shlex.quote(
                 getattr(cfg, "hybrid_worker_config_path", "")
@@ -2158,10 +2154,8 @@ class RuntimeElasticExecutor:
         if template:
             return template.format(**values)
         env_prefix = ""
-        if cuda_visible_devices and device_backend != "npu":
+        if cuda_visible_devices:
             env_prefix = f"CUDA_VISIBLE_DEVICES={values['cuda_visible_devices']} "
-        elif cuda_visible_devices:
-            env_prefix = f"ASCEND_RT_VISIBLE_DEVICES={values['ascend_visible_devices']} "
         worker_script = f"{values['rl_framework_path']}/scripts/elastic_hybrid_worker.py"
         launcher = ""
         if values["worker_mode"] == "'megatron_core'" and values["replica_gpus"] > 1:
@@ -2953,9 +2947,7 @@ class RuntimeElasticExecutor:
             or self.config.max_seq_length
         )
         public_host = host if host != "0.0.0.0" else "127.0.0.1"
-        device_backend = str(getattr(self.config, "device_backend", "auto")).lower()
-        use_npu = device_backend in {"npu", "ascend", "hccl"}
-        device_visible_name = "ASCEND_RT_VISIBLE_DEVICES" if use_npu else "CUDA_VISIBLE_DEVICES"
+        device_visible_name = "CUDA_VISIBLE_DEVICES"
         vllm_module = (
             os.environ.get("VLLM_SERVER_MODULE")
             or "vllm.entrypoints.openai.api_server"

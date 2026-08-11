@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 from RL_Framework.engine.megatron_core_checkpointing import (
     MegatronDistributedCheckpointManager,
 )
-from RL_Framework.engine.device_utils import accelerator_backend, set_device
+from RL_Framework.engine.device_utils import set_device
 from RL_Framework.infra.elastic import (
     GradientPayload,
     GradientUpdate,
@@ -61,7 +61,6 @@ class MegatronCoreTrainEngine:
         use_cpu_initialization: bool = False,
         recompute_num_layers: int = 1,
         sync_path: str = "./logs/async_rl_weights",
-        device_backend: str = "auto",
     ):
         self.train_backend = "megatron_core"
         self.model_path = model_path
@@ -97,7 +96,6 @@ class MegatronCoreTrainEngine:
         self.use_transformer_engine = use_transformer_engine
         self.use_cpu_initialization = use_cpu_initialization
         self.recompute_num_layers = recompute_num_layers
-        self.device_backend = accelerator_backend(device_backend)
 
         self.rank = int(os.getenv("RANK", "0"))
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -199,26 +197,7 @@ class MegatronCoreTrainEngine:
         self.provider.finalize()
         init_phase("provider_finalize_complete")
         init_phase("parallel_init_start")
-        if self.device_backend == "npu":
-            from RL_Framework.engine.megatron_npu_compat import (
-                apply_megatron_npu_compatibility,
-            )
-
-            apply_megatron_npu_compatibility()
-            original_init_process_group = dist.init_process_group
-
-            def hccl_init_process_group(backend=None, *args, **kwargs):
-                if backend == "nccl":
-                    backend = "hccl"
-                return original_init_process_group(backend, *args, **kwargs)
-
-            dist.init_process_group = hccl_init_process_group
-            try:
-                self.provider.initialize_model_parallel(seed=42)
-            finally:
-                dist.init_process_group = original_init_process_group
-        else:
-            self.provider.initialize_model_parallel(seed=42)
+        self.provider.initialize_model_parallel(seed=42)
         init_phase("parallel_init_complete")
 
         init_phase(
@@ -320,9 +299,8 @@ class MegatronCoreTrainEngine:
             not in {"0", "false", "no"}
         )
         provider.moe_permute_fusion = False
-        # MCore's fused bias/dropout/add path is decorated with its CUDA JIT
-        # fuser.  torch-npu redirects that decorator through Inductor/Triton,
-        # which is neither required nor available in the supported stack.
+        # MCore's fused bias/dropout/add path is disabled for the supported
+        # CUDA stack because it is not required by the SDPA adapter.
         provider.bias_dropout_fusion = False
         provider.moe_router_dtype = None
         provider.moe_token_dispatcher_type = "alltoall"
@@ -665,7 +643,7 @@ class MegatronCoreTrainEngine:
             domain.bind_hybrid_process_group(self._elastic_gradient_process_group)
 
     def initialize_elastic_communication_domain(self):
-        """Create one isolated HCCL communicator for the elastic DP lane.
+        """Create one isolated NCCL communicator for the elastic DP lane.
 
         The communicator is created once, collectively during trainer setup,
         and is never reused for Megatron's core data-parallel collectives. The
@@ -1002,9 +980,8 @@ class MegatronCoreTrainEngine:
                 updates,
                 stats.get("grad_norm", 0.0) * updates,
             ],
-            # HCCL on the validated 910B3/CANN 8.5.2 stack does not support
-            # float64 collectives. Training statistics do not require double
-            # precision, and float32 is supported by both HCCL and NCCL.
+            # Training statistics do not require double precision; float32 is
+            # supported by NCCL and avoids unnecessary conversion overhead.
             dtype=torch.float32,
             device=self._device(),
         )
@@ -1142,40 +1119,10 @@ class MegatronCoreTrainEngine:
         return parallel_state
 
     def _prepare_accelerator(self) -> None:
-        """Activate the Ascend compatibility layer before importing MCore.
-
-        Megatron-Core and Megatron Bridge still use CUDA-shaped APIs internally.
-        The project-local compatibility layer is applied after MCore imports so
-        it can rewrite those Python call sites to torch-npu and HCCL. Tensor
-        allocation in this engine remains explicit through :meth:`_device`.
-        """
-        if self.device_backend == "npu":
-            try:
-                import torch_npu  # noqa: F401
-            except Exception as exc:
-                raise RuntimeError(
-                    "Megatron-Core NPU execution requires torch-npu"
-                ) from exc
-            if not torch.npu.is_available():
-                raise RuntimeError("Megatron-Core requested NPU but no NPU is available")
-        elif self.device_backend == "cuda":
-            if not torch.cuda.is_available():
-                raise RuntimeError("Megatron-Core requested CUDA but CUDA is unavailable")
-        else:
-            raise RuntimeError(
-                "Megatron-Core requires an accelerator backend (cuda or npu); "
-                f"resolved {self.device_backend!r}"
-            )
-        set_device(self.local_rank, self.device_backend)
+        """Validate and select the CUDA device before importing MCore."""
+        if not torch.cuda.is_available():
+            raise RuntimeError("Megatron-Core requires CUDA, but CUDA is unavailable")
+        set_device(self.local_rank, "cuda")
 
     def _device(self) -> torch.device | str:
-        device = f"{self.device_backend}:{self.local_rank}"
-        try:
-            return torch.device(device)
-        except RuntimeError:
-            # torch-npu registers the ``npu`` device type at import time. Keep
-            # configuration-only inspection usable on CUDA hosts where that
-            # optional package is intentionally absent.
-            if self.device_backend == "npu":
-                return device
-            raise
+        return torch.device(f"cuda:{self.local_rank}")

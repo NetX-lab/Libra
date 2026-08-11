@@ -118,13 +118,13 @@ def main() -> None:
         "--no-ehp",
         type=Path,
         default=project
-        / "configs/r2e_gym_qwen3_14b_mcore_npu_6node48_production_no_ehp.yaml",
+        / "configs/r2e_gym_qwen3_14b_mcore_gpu_6node48_production_no_ehp.yaml",
     )
     parser.add_argument(
         "--ehp",
         type=Path,
         default=project
-        / "configs/r2e_gym_qwen3_14b_mcore_npu_6node48_production_ehp.yaml",
+        / "configs/r2e_gym_qwen3_14b_mcore_gpu_6node48_production_ehp.yaml",
     )
     args = parser.parse_args()
     validate(args.no_ehp, args.ehp)

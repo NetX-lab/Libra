@@ -1,29 +1,27 @@
-# Compact 3-node / 24-NPU validation: two TP8 Megatron training nodes and
-# one heterogeneous rollout node.  GRP observes all resources; EHP attaches
-# one logical rollout worker to the decoupled training gradient domain.
+# Six NVIDIA GPU nodes / 48 GPUs: four TP8 Megatron training nodes and two
+# heterogeneous rollout nodes. GRP observes all 48 resources; EHP attaches one
+# logical rollout worker through the decoupled inter-replica gradient domain.
 base_config: base.yaml
 hardware_config: hardware_config/a100_80g.yaml
 model_arch_config: model_arch_config/qwen3-14b.yaml
 
 model_path: "/opt/libra/models/Qwen3-14B"
 tokenizer_path: "/opt/libra/models/Qwen3-14B"
-device_backend: "npu"
-distributed_backend: "hccl"
 rollout_backend: "vllm"
 train_backend: "megatron_core"
 
-train_gpus: 16
-rollout_gpus: 8
-num_nodes: 2
+train_gpus: 32
+rollout_gpus: 16
+num_nodes: 4
 train_gpus_per_node: 8
 rollout_gpus_per_node: 0
 master_addr: "192.0.2.10"
-master_port: 29862
+master_port: 29742
 
 train_tp_size: 8
 train_pp_size: 1
 train_cp_size: 1
-train_dp_size: 2
+train_dp_size: 4
 train_ep_size: 1
 expert_tensor_parallel_size: 1
 sequence_parallel: true
@@ -31,13 +29,15 @@ use_distributed_optimizer: true
 megatron_use_transformer_engine: false
 megatron_recompute_num_layers: 1
 
-batch_size: 2
+batch_size: 4
 micro_batch_size: 1
 n_samples: 1
 total_steps: 100
 learning_rate: 1.0e-6
 ppo_epochs: 1
 sync_interval: 25
+# The former 40-step run blocked rank 0 in a 30K-token asynchronous evaluator.
+# Training rollouts still use 30K; final evaluation is launched separately.
 eval_interval: 0
 save_interval: 25
 
@@ -46,33 +46,33 @@ max_new_tokens: 30000
 r2e_max_turns: 12
 r2e_max_prompt_tokens: 2048
 r2e_stop_reward: 0.5
-max_concurrent_rollouts: 4
+max_concurrent_rollouts: 8
 max_head_offpolicyness: 2
-queue_size: 16
+queue_size: 32
 temperature: 0.8
 top_p: 0.95
 recompute_logprobs: true
 
 weight_sync_mode: "disk"
 rollout_weight_sync_mode: "restart"
-rollout_weight_sync_control_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_3node24/rollout_weight_sync"
+rollout_weight_sync_control_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/rollout_weight_sync"
 rollout_weight_sync_timeout_s: 3600
 rollout_weight_sync_export_only: true
 require_rollout_weight_sync: true
-sync_path: "/opt/libra/runs/r2e_gym_qwen3_14b_3node24/weights"
-log_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_3node24/logs"
+sync_path: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/weights"
+log_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/logs"
 wandb_project: ""
-wandb_run_name: "r2e-gym-qwen3-14b-mcore-npu-3node24-100step-ehp"
+wandb_run_name: "r2e-gym-qwen3-14b-mcore-gpu-6node48-100step"
 
 enable_history_collection: true
-history_output_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_3node24/history"
+history_output_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/history"
 history_save_raw_lengths: true
 history_flush_interval: 1
-history_experiment_name: "r2e_gym_qwen3_14b_3node24_100step_ehp"
+history_experiment_name: "r2e_gym_qwen3_14b_6node48_100step"
 
 heterogeneous_rollout:
   enabled: true
-  total_gpus: 8
+  total_gpus: 16
   vllm_host: "192.0.2.20"
   vllm_base_port: 8000
   max_model_len: 32768
@@ -82,6 +82,10 @@ heterogeneous_rollout:
     - {instance_id: "rollout_a_short_tp1_1", host: "192.0.2.20", tp: 1, gpus: [1], port: 8001}
     - {instance_id: "rollout_a_medium_tp2", host: "192.0.2.20", tp: 2, gpus: [2, 3], port: 8002}
     - {instance_id: "rollout_a_long_tp4", host: "192.0.2.20", tp: 4, gpus: [4, 5, 6, 7], port: 8003}
+    - {instance_id: "rollout_b_short_tp1_0", host: "192.0.2.21", tp: 1, gpus: [0], port: 8000}
+    - {instance_id: "rollout_b_short_tp1_1", host: "192.0.2.21", tp: 1, gpus: [1], port: 8001}
+    - {instance_id: "rollout_b_medium_tp2", host: "192.0.2.21", tp: 2, gpus: [2, 3], port: 8002}
+    - {instance_id: "rollout_b_long_tp4", host: "192.0.2.21", tp: 4, gpus: [4, 5, 6, 7], port: 8003}
   scheduling:
     scheduler_type: "cmlfq"
     request_timeout: 3600
@@ -89,9 +93,9 @@ heterogeneous_rollout:
     max_queue_length: 3
     enable_fallback: true
     cmlfq_rebuild_interval: 5
-    cmlfq_tree_path: "/opt/libra/runs/r2e_gym_qwen3_14b_3node24/cmlfq_tree.json"
+    cmlfq_tree_path: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/cmlfq_tree.json"
     cmlfq_tree_persist_interval: 1
-    cmlfq_shared_load_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_3node24/cmlfq_shared_load"
+    cmlfq_shared_load_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/cmlfq_shared_load"
     cmlfq_shared_load_ttl_s: 60
     cmlfq_shared_load_heartbeat_s: 10
     cmlfq_max_local_queue_length: 1
@@ -113,32 +117,45 @@ global_resource_planner:
   reconfiguration_cost_s: 0.0
   allowed_train_tp: [8]
   allowed_train_pp: [1]
-  fixed_train_gpus: 16
+  initial_allocation_strategy: "grp"
+  fixed_train_gpus: 0
+  allocation_granularity_gpus: 8
+  min_train_gpus: 8
+  min_rollout_gpus: 8
+  rollout_node_tp_pattern: [1, 1, 2, 4]
   allowed_rollout_tp: [1, 2, 4]
   require_heterogeneous_rollout_tp: true
   micro_batch_sizes: [1]
+  # Keep the proven external vLLM endpoints stable while still executing GRP's
+  # EHP training-pool decision. This avoids changing physical process IDs.
   apply_to_runtime: false
   runtime_async_planning: true
   runtime_dynamic_reconfiguration_enabled: true
   runtime_online_replanning: true
+  # External rollout endpoints remain unchanged (apply_to_runtime=false), so a
+  # cross-rank rollout drain would only stall already accepted requests and is
+  # not required for the decoupled EHP training-domain update.
   runtime_drain_before_reconfigure: false
   runtime_peer_request_wait_s: 120
   runtime_manage_rollout_processes: false
   runtime_reconfigure_training: true
   runtime_training_pool_only: true
-  runtime_training_pool_target_gpus: 17
+  runtime_training_pool_target_gpus: 33
   runtime_training_pool_plan_only: false
   decouple_communication_domains: true
+  elastic_hybrid_max_workers: 0
+  elastic_hybrid_replica_size_gpus: 8
+  elastic_hybrid_min_rollout_gpus: 8
   hybrid_training_prewarm_enabled: true
   hybrid_training_prewarm_count: 1
   hybrid_training_prewarm_worker_ids: ["rollout0"]
   hybrid_worker_launch_enabled: true
-  hybrid_worker_python: "/opt/libra/envs/rl_mindspeed/bin/python"
-  hybrid_worker_task_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_3node24/elastic_training_tasks_ehp"
+  hybrid_worker_python: "/opt/libra/envs/rl_framework/bin/python"
+  hybrid_worker_task_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/elastic_training_tasks"
   hybrid_worker_ready_timeout_s: 120
   gradient_transport_backend: "tcp"
   gradient_server_host: "0.0.0.0"
   gradient_server_public_host: "192.0.2.10"
-  gradient_server_port: 29872
+  gradient_server_port: 29852
   gradient_server_authkey: "rl-framework-elastic"
   verbose: true

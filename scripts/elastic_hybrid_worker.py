@@ -80,16 +80,9 @@ def _initialize_megatron_worker(args):
     from RL_Framework.engine.train_factory import create_train_engine
 
     config = AsyncRLConfig.from_yaml(args.config)
-    device_backend = str(getattr(config, "device_backend", "cuda")).lower()
-    if device_backend == "npu":
-        if not hasattr(torch, "npu"):
-            raise RuntimeError("NPU worker requested but torch.npu is unavailable")
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        torch.npu.set_device(local_rank)
-    else:
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA worker requested but CUDA is unavailable")
-        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA worker requested but CUDA is unavailable")
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     if config.train_backend != "megatron_core":
         raise ValueError("elastic hybrid workers currently require Megatron-Core")
     engine = create_train_engine(config)

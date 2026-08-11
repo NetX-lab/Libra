@@ -100,12 +100,11 @@ def test_conversion_coverage_rejects_unmapped_local_parameters():
         engine._validate_conversion_coverage()
 
 
-def test_megatron_core_device_uses_configured_backend():
+def test_megatron_core_device_uses_cuda():
     engine = MegatronCoreTrainEngine.__new__(MegatronCoreTrainEngine)
-    engine.device_backend = "npu"
     engine.local_rank = 3
 
-    assert str(engine._device()) == "npu:3"
+    assert str(engine._device()) == "cuda:3"
 
 
 def test_initialize_elastic_domain_creates_distinct_local_synchronized_group(
@@ -129,7 +128,7 @@ def test_initialize_elastic_domain_creates_distinct_local_synchronized_group(
         lambda group: [0, 8, 16, 24] if group is core_group else [],
         raising=False,
     )
-    monkeypatch.setattr(module.dist, "get_backend", lambda group: "hccl")
+    monkeypatch.setattr(module.dist, "get_backend", lambda group: "nccl")
 
     def new_group(**kwargs):
         calls.append(kwargs)
@@ -144,7 +143,7 @@ def test_initialize_elastic_domain_creates_distinct_local_synchronized_group(
     assert calls == [
         {
             "ranks": [0, 8, 16, 24],
-            "backend": "hccl",
+            "backend": "nccl",
             "use_local_synchronization": True,
         }
     ]

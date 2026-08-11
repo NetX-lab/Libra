@@ -1,7 +1,7 @@
 # Shared production-scale training configuration for the strict EHP A/B test.
 # The two experiment arms inherit this file and may differ only in the EHP
 # runtime controls plus non-semantic run labels.
-base_config: r2e_gym_qwen3_14b_mcore_npu_6node48_100step_no_ehp.yaml
+base_config: r2e_gym_qwen3_14b_mcore_gpu_6node48_100step_no_ehp.yaml
 
 # 32 trajectories = 8 prompts x 4 GRPO samples per optimizer step. With DP=4,
 # every replica receives 8 trajectories (two complete prompt groups).
@@ -29,11 +29,11 @@ max_concurrent_rollouts: 16
 max_head_offpolicyness: 4
 queue_size: 128
 
-wandb_run_name: "r2e-gym-qwen3-14b-mcore-npu-6node48-production"
+wandb_run_name: "r2e-gym-qwen3-14b-mcore-gpu-6node48-production"
 history_experiment_name: "r2e_gym_qwen3_14b_6node48_production"
 
 global_resource_planner:
-  # GRP owns the initial 48-NPU partition.  Both stage sizes remain node/DP
+  # GRP owns the initial 48-GPU partition.  Both stage sizes remain node/DP
   # replica aligned, but neither is pinned to the historical 32/16 split.
   initial_allocation_strategy: "grp"
   fixed_train_gpus: 0

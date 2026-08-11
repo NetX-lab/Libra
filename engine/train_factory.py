@@ -70,7 +70,6 @@ def create_train_engine(config: AsyncRLConfig) -> TrainEngine:
             use_cpu_initialization=config.megatron_use_cpu_initialization,
             recompute_num_layers=config.megatron_recompute_num_layers,
             sync_path=config.sync_path,
-            device_backend=config.device_backend,
         )
 
     raise ValueError(f"Unknown train_backend: {backend}")

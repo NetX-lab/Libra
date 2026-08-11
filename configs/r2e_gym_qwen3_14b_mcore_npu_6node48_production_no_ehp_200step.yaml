@@ -1,5 +1,0 @@
-# Exact 200-step control arm. All training, rollout, optimizer, data, seed and
-# scheduler settings inherit from the validated production no-EHP config.
-base_config: r2e_gym_qwen3_14b_mcore_npu_6node48_production_no_ehp.yaml
-
-total_steps: 200

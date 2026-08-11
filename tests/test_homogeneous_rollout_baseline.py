@@ -7,10 +7,10 @@ from scripts.materialize_6node48_config import load_inherited_config, materializ
 
 
 PROJECT = Path(__file__).resolve().parents[1]
-HETERO = PROJECT / "configs/r2e_gym_qwen3_14b_mcore_npu_6node48_100step.yaml"
+HETERO = PROJECT / "configs/r2e_gym_qwen3_14b_mcore_gpu_6node48_100step.yaml"
 HOMOGENEOUS = (
     PROJECT
-    / "configs/r2e_gym_qwen3_14b_mcore_npu_6node48_100step_homogeneous_lb.yaml"
+    / "configs/r2e_gym_qwen3_14b_mcore_gpu_6node48_100step_homogeneous_lb.yaml"
 )
 
 

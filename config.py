@@ -589,8 +589,6 @@ class AsyncRLConfig:
     model_path: str
     tokenizer_path: str = ""
 
-    device_backend: str = "auto"  # auto | cuda | npu | cpu
-    distributed_backend: str = "auto"  # auto | nccl | hccl | gloo
     rollout_backend: str = "vllm"  # vllm | mock
 
 

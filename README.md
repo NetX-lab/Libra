@@ -40,9 +40,8 @@ for Agentic RL Post-Training"**. Read the [paper](https://arxiv.org/abs/2606.030
 
 ## Latest News
 
-- **2026-08-11** - Integrated Ascend NPU support into the main GPU codebase,
-  including automatic device/backend selection, Megatron-Core/HCCL training,
-  vLLM Ascend rollout workers, GRP startup profiling, and EHP controls.
+- **2026-08-11** - Integrated GRP startup profiling, EHP controls, and
+  elastic runtime improvements into the CUDA training and rollout stack.
 - **2026-08-03** — Libra was officially open sourced.
 
 ## System Overview
@@ -126,12 +125,9 @@ RL_Framework/
 | [Multi-node Slurm guide](docs/slurm_multi_node_guide.md) | Distributed launch configuration and operational notes |
 | [Megatron-Core backend](docs/megatron_core_backend.md) | Backend architecture, configuration, and stability guidance |
 | [Runtime history collection](docs/history_data_collection.md) | Metrics and history data used by the online planner |
-| [Ascend NPU environment](docs/npu_environment.md) | CANN, torch-npu, Megatron-Core, and vLLM Ascend setup |
-| [Ascend cluster quick start](docs/npu_cluster_quick_start.md) | Multi-node NPU validation and launch workflow |
-
 > Libra is a research artifact. The supplied launchers target multi-node NVIDIA
-> GPU or Ascend NPU clusters. Paths, partitions, node names, network devices,
-> container runtimes, and model locations should be adapted to your own cluster.
+> GPU clusters. Paths, partitions, node names, network devices, container
+> runtimes, and model locations should be adapted to your own cluster.
 
 ## Installation
 
@@ -141,16 +137,6 @@ source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install -e .
 ```
-
-For Ascend NPU hosts, use the NPU dependency split instead:
-
-```bash
-bash scripts/setup_npu_env.sh
-```
-
-See [Ascend NPU Environment](docs/npu_environment.md) for the current CANN
-8.5.x baseline, optional Megatron/vLLM Ascend installs, and the first
-CUDA-to-NPU adaptation points.
 
 If your platform has a compatible vLLM wheel, you can simplify installation by
 using that wheel instead of a source build. On clusters, install inside the same

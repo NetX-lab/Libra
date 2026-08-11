@@ -1,4 +1,4 @@
-# Six Ascend nodes / 48 NPUs: four TP8 Megatron training nodes and two
+# Six NVIDIA GPU nodes / 48 GPUs: four TP8 Megatron training nodes and two
 # heterogeneous rollout nodes. GRP observes all 48 resources; EHP attaches one
 # logical rollout worker through the decoupled inter-replica gradient domain.
 base_config: base.yaml
@@ -7,8 +7,6 @@ model_arch_config: model_arch_config/qwen3-14b.yaml
 
 model_path: "/opt/libra/models/Qwen3-14B"
 tokenizer_path: "/opt/libra/models/Qwen3-14B"
-device_backend: "npu"
-distributed_backend: "hccl"
 rollout_backend: "vllm"
 train_backend: "megatron_core"
 
@@ -64,7 +62,7 @@ require_rollout_weight_sync: true
 sync_path: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/weights"
 log_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/logs"
 wandb_project: ""
-wandb_run_name: "r2e-gym-qwen3-14b-mcore-npu-6node48-100step"
+wandb_run_name: "r2e-gym-qwen3-14b-mcore-gpu-6node48-100step-no-ehp"
 
 enable_history_collection: true
 history_output_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/history"
@@ -142,18 +140,15 @@ global_resource_planner:
   runtime_manage_rollout_processes: false
   runtime_reconfigure_training: true
   runtime_training_pool_only: true
-  runtime_training_pool_target_gpus: 33
+  runtime_training_pool_target_gpus: 32
   runtime_training_pool_plan_only: false
   decouple_communication_domains: true
-  elastic_hybrid_max_workers: 0
-  elastic_hybrid_replica_size_gpus: 8
-  elastic_hybrid_min_rollout_gpus: 8
-  hybrid_training_prewarm_enabled: true
-  hybrid_training_prewarm_count: 1
-  hybrid_training_prewarm_worker_ids: ["rollout0"]
-  hybrid_worker_launch_enabled: true
-  hybrid_worker_python: "/opt/libra/envs/rl_mindspeed/bin/python"
-  hybrid_worker_task_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/elastic_training_tasks"
+  hybrid_training_prewarm_enabled: false
+  hybrid_training_prewarm_count: 0
+  hybrid_training_prewarm_worker_ids: []
+  hybrid_worker_launch_enabled: false
+  hybrid_worker_python: "/opt/libra/envs/rl_framework/bin/python"
+  hybrid_worker_task_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_6node48/elastic_training_tasks_no_ehp"
   hybrid_worker_ready_timeout_s: 120
   gradient_transport_backend: "tcp"
   gradient_server_host: "0.0.0.0"

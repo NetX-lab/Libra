@@ -45,8 +45,8 @@ def main():
         and world_size > 1
     ):
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        device = set_device(local_rank, getattr(config, "device_backend", "auto"))
-        backend = distributed_backend(getattr(config, "distributed_backend", "auto"))
+        device = set_device(local_rank)
+        backend = distributed_backend()
         distributed_timeout = timedelta(
             seconds=int(os.environ.get("TORCH_DISTRIBUTED_TIMEOUT", "3600"))
         )
@@ -61,7 +61,7 @@ def main():
                 backend=backend,
                 timeout=distributed_timeout,
             )
-        set_device(local_rank, getattr(config, "device_backend", "auto"))
+        set_device(local_rank)
 
     rank = dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", "0"))
     is_main_process = rank == 0

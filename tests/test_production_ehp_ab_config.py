@@ -5,8 +5,8 @@ from scripts.validate_ehp_ab_config import validate
 
 
 PROJECT = Path(__file__).resolve().parents[1]
-NO_EHP = PROJECT / "configs/r2e_gym_qwen3_14b_mcore_npu_6node48_production_no_ehp.yaml"
-EHP = PROJECT / "configs/r2e_gym_qwen3_14b_mcore_npu_6node48_production_ehp.yaml"
+NO_EHP = PROJECT / "configs/r2e_gym_qwen3_14b_mcore_gpu_6node48_production_no_ehp.yaml"
+EHP = PROJECT / "configs/r2e_gym_qwen3_14b_mcore_gpu_6node48_production_ehp.yaml"
 
 
 def test_production_ab_diff_is_ehp_only():
