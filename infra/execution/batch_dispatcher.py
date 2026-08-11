@@ -1,5 +1,7 @@
 """Support code for Batch dispatcher."""
 
+from __future__ import annotations
+
 import logging
 import queue
 import threading

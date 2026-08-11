@@ -100,34 +100,52 @@ def test_conversion_coverage_rejects_unmapped_local_parameters():
         engine._validate_conversion_coverage()
 
 
-def test_hybrid_applies_core_post_reduce_gradient_and_advances_version():
+def test_megatron_core_device_uses_configured_backend():
     engine = MegatronCoreTrainEngine.__new__(MegatronCoreTrainEngine)
-    module = torch.nn.Linear(2, 1)
-    for parameter in module.parameters():
-        parameter.main_grad = torch.zeros_like(parameter)
+    engine.device_backend = "npu"
+    engine.local_rank = 3
 
-    class Optimizer:
-        def __init__(self):
-            self.steps = 0
+    assert str(engine._device()) == "npu:3"
 
-        def step(self):
-            self.steps += 1
-            return True, torch.tensor(1.0), 0
 
-    engine.model = [module]
-    engine.optimizer = Optimizer()
-    engine.current_version = 4
-    updates = tuple(
-        torch.full_like(parameter.main_grad, 3.0)
-        for parameter in module.parameters()
+def test_initialize_elastic_domain_creates_distinct_local_synchronized_group(
+    monkeypatch,
+):
+    from RL_Framework.engine import megatron_core_train_engine as module
+
+    engine = MegatronCoreTrainEngine.__new__(MegatronCoreTrainEngine)
+    engine._elastic_gradient_process_group = None
+    engine._elastic_gradient_process_group_owned = False
+    engine._elastic_gradient_group_ranks = ()
+    core_group = object()
+    elastic_group = object()
+    calls = []
+    monkeypatch.setattr(engine, "get_elastic_core_process_group", lambda: core_group)
+    monkeypatch.setattr(module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        module.dist,
+        "get_process_group_ranks",
+        lambda group: [0, 8, 16, 24] if group is core_group else [],
+        raising=False,
     )
+    monkeypatch.setattr(module.dist, "get_backend", lambda group: "hccl")
 
-    engine.apply_elastic_gradient_update(updates, state_version=5)
+    def new_group(**kwargs):
+        calls.append(kwargs)
+        return elastic_group
 
-    assert engine.optimizer.steps == 1
-    assert engine.current_version == 5
-    for parameter in module.parameters():
-        assert torch.equal(
-            parameter.main_grad,
-            torch.full_like(parameter.main_grad, 3.0),
-        )
+    monkeypatch.setattr(module.dist, "new_group", new_group)
+
+    created = engine.initialize_elastic_communication_domain()
+
+    assert created is elastic_group
+    assert created is not core_group
+    assert calls == [
+        {
+            "ranks": [0, 8, 16, 24],
+            "backend": "hccl",
+            "use_local_synchronization": True,
+        }
+    ]
+    assert engine._elastic_gradient_group_ranks == (0, 8, 16, 24)

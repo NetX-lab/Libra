@@ -1,5 +1,7 @@
 """Support code for Rollout engine."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
@@ -10,6 +12,49 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+class MockRolloutEngine:
+    """Small rollout engine for dependency and training-loop smoke tests."""
+
+    def __init__(
+        self,
+        model_path: str = "",
+        text: str | None = None,
+    ):
+        self.model_path = model_path
+        self.text = text or os.environ.get("MOCK_ROLLOUT_TEXT", " The answer is 0.")
+        self.num_instances = 1
+        self.instance_urls = ["mock://local"]
+        self.tp_list = [1]
+
+    def wait_for_ready(self, timeout: float = 0.0):
+        del timeout
+        logger.info("Mock rollout engine is ready")
+
+    async def close(self):
+        return None
+
+    def close_sync(self):
+        return None
+
+    async def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 1024,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        n: int = 1,
+        input_tokens: int = 0,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del prompt, max_new_tokens, temperature, top_p, n, input_tokens, kwargs
+        return {
+            "text": self.text,
+            "tokens": [],
+            "logprobs": [],
+            "finish_reason": "mock",
+        }
 
 
 class VLLMRolloutEngine:
@@ -128,6 +173,7 @@ class VLLMRolloutEngine:
         top_p: float = 1.0,
         n: int = 1,
         input_tokens: int = 0,
+        seed: int | None = None,
     ) -> dict[str, Any]:
         """Generate."""
         await self._ensure_client()
@@ -141,6 +187,8 @@ class VLLMRolloutEngine:
             "n": n,
             "logprobs": 1,
         }
+        if seed is not None:
+            payload["seed"] = int(seed)
 
         try:
             response = await self.http_client.post(
@@ -348,6 +396,8 @@ class MultiInstanceRolloutEngine:
         temperature: float = 1.0,
         top_p: float = 1.0,
         n: int = 1,
+        input_tokens: int = 0,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         """Generate."""
         engine = self._next_engine()
@@ -357,6 +407,8 @@ class MultiInstanceRolloutEngine:
             temperature=temperature,
             top_p=top_p,
             n=n,
+            input_tokens=input_tokens,
+            **kwargs,
         )
 
     async def generate_batch(

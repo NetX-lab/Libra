@@ -1,0 +1,62 @@
+# Common configuration for the controlled four-node GRP ablation.
+#
+# Four physical 8-NPU hosts are available.  The no-GRP arm uses the explicit
+# 16-NPU training / 16-NPU rollout split.  The GRP arm is allowed to choose a
+# whole-node initial split from the same four hosts.  C-MLFQ stays enabled and
+# every EHP/hybrid-training control stays disabled in both arms.
+base_config: r2e_gym_qwen3_14b_mcore_npu_6node48_100step_no_ehp.yaml
+
+train_gpus: 16
+rollout_gpus: 16
+num_nodes: 2
+train_gpus_per_node: 8
+rollout_gpus_per_node: 8
+train_dp_size: 2
+
+# Fifty steps provide a useful steady-state sample and include the same
+# checkpoint/restart weight-sync path once at step 25.
+total_steps: 50
+batch_size: 4
+micro_batch_size: 1
+n_samples: 1
+seed: 42
+sync_interval: 25
+save_interval: 25
+eval_interval: 0
+
+wandb_run_name: "r2e-gym-qwen3-14b-mcore-npu-4node32-grp-ab"
+history_experiment_name: "r2e_gym_qwen3_14b_4node32_grp_ab"
+
+heterogeneous_rollout:
+  enabled: true
+  total_gpus: 16
+  scheduling:
+    scheduler_type: "cmlfq"
+
+global_resource_planner:
+  # Initial placement is overridden by the arm config/launcher.
+  allocation_granularity_gpus: 8
+  min_train_gpus: 8
+  min_rollout_gpus: 8
+  rollout_node_tp_pattern: [1, 1, 2, 4]
+  allowed_train_tp: [8]
+  allowed_train_pp: [1]
+  allowed_rollout_tp: [1, 2, 4]
+  require_heterogeneous_rollout_tp: true
+
+  # External vLLM processes are kept stable for the entire arm.  GRP may
+  # observe and report online candidates, but EHP and runtime pool borrowing
+  # are intentionally excluded from this experiment.
+  apply_to_runtime: false
+  runtime_manage_rollout_processes: false
+  runtime_reconfigure_training: false
+  runtime_training_pool_only: false
+  runtime_training_pool_target_gpus: 0
+  runtime_training_pool_plan_only: true
+  decouple_communication_domains: false
+  elastic_hybrid_max_workers: 0
+  hybrid_training_prewarm_enabled: false
+  hybrid_training_prewarm_count: 0
+  hybrid_training_prewarm_worker_ids: []
+  hybrid_worker_launch_enabled: false
+  hybrid_worker_remote_control_enabled: false

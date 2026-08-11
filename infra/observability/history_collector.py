@@ -1,5 +1,7 @@
 """Support code for History collector."""
 
+from __future__ import annotations
+
 import json
 import os
 import time
@@ -142,7 +144,6 @@ class TrainingMetrics:
     grpo_mean_group_size: float = 0.0
     grpo_singleton_groups: int = 0
     grpo_zero_variance_groups: int = 0
-    grad_norm: float = 0.0
 
 
 @dataclass
@@ -234,15 +235,18 @@ class HistoryDataCollector:
         save_raw_lengths: bool = False,
         flush_interval: int = 10,
         experiment_name: str = "",
+        length_profile_path: str = "",
     ):
         self.output_dir = output_dir
         self.save_raw_lengths = save_raw_lengths
         self.flush_interval = flush_interval
         self.experiment_name = experiment_name
+        self.length_profile_path = length_profile_path
 
         self._records: list[StepRecord] = []
         self._start_time: float = 0.0
         self._file_handle = None
+        self._length_profile_handle = None
         self._lock = threading.Lock()
         self._record_count = 0
         self._initialized = False
@@ -262,10 +266,24 @@ class HistoryDataCollector:
         )
 
         self._file_handle = open(self._jsonl_path, "w", encoding="utf-8")
+        if self.length_profile_path:
+            profile_dir = os.path.dirname(self.length_profile_path)
+            if profile_dir:
+                os.makedirs(profile_dir, exist_ok=True)
+            self._length_profile_handle = open(
+                self.length_profile_path,
+                "w",
+                encoding="utf-8",
+            )
         self._start_time = time.time()
         self._initialized = True
 
         print(f"[HistoryCollector] Initialized; data file: {self._jsonl_path}")
+        if self.length_profile_path:
+            print(
+                "[HistoryCollector] Runtime length profile: "
+                f"{self.length_profile_path}"
+            )
 
 
 
@@ -384,7 +402,6 @@ class HistoryDataCollector:
             grpo_mean_group_size=float(stats.get("grpo_mean_group_size", 0.0)),
             grpo_singleton_groups=int(stats.get("grpo_singleton_groups", 0)),
             grpo_zero_variance_groups=int(stats.get("grpo_zero_variance_groups", 0)),
-            grad_norm=float(stats.get("grad_norm", 0.0)),
         )
 
 
@@ -444,6 +461,7 @@ class HistoryDataCollector:
             self._records.append(record)
             self._record_count += 1
             self._write_record(record)
+            self._write_length_profile_records(step, now, sequences)
 
             if self._record_count % self.flush_interval == 0:
                 self._flush()
@@ -617,10 +635,49 @@ class HistoryDataCollector:
         line = json.dumps(record.to_dict(), ensure_ascii=False)
         self._file_handle.write(line + "\n")
 
+    def _write_length_profile_records(
+        self,
+        step: int,
+        timestamp: float,
+        sequences: list[dict[str, Any]],
+    ):
+        """Append flat runtime length records for online GRP replanning."""
+        if self._length_profile_handle is None:
+            return
+        for seq in sequences:
+            try:
+                prompt = int(seq.get("input_len", 0) or 0)
+                gen = int(seq.get("output_len", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if prompt <= 0 and gen <= 0:
+                continue
+            item = {
+                "step": int(step),
+                "timestamp": float(timestamp),
+                "input_len": max(1, prompt),
+                "output_len": max(1, gen),
+                "profile_source": "runtime_online",
+            }
+            for key in (
+                "prompt_id",
+                "total_output_tokens",
+                "tool_returns",
+                "cmlfq_request_id",
+            ):
+                if key in seq:
+                    item[key] = seq[key]
+            self._length_profile_handle.write(
+                json.dumps(item, ensure_ascii=False) + "\n"
+            )
+        self._length_profile_handle.flush()
+
     def _flush(self):
         """Flush."""
         if self._file_handle is not None:
             self._file_handle.flush()
+        if self._length_profile_handle is not None:
+            self._length_profile_handle.flush()
 
     def finalize(self):
         """Finalize."""
@@ -630,12 +687,20 @@ class HistoryDataCollector:
             if self._file_handle is not None:
                 self._file_handle.close()
                 self._file_handle = None
+            if self._length_profile_handle is not None:
+                self._length_profile_handle.close()
+                self._length_profile_handle = None
         print(f"[HistoryCollector] Complete; recorded {self._record_count} steps")
 
     def __del__(self):
         if self._file_handle is not None:
             try:
                 self._file_handle.close()
+            except Exception:
+                pass
+        if self._length_profile_handle is not None:
+            try:
+                self._length_profile_handle.close()
             except Exception:
                 pass
 

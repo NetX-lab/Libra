@@ -54,7 +54,7 @@ PROJECT_DIR="/path/to/RL_Framework"
 cd "$PROJECT_DIR"
 
 export NO_PROXY="localhost,127.0.0.1"
-export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
+export PYTHONPATH="${PWD}:${PYTHONPATH}"
 
 
 mkdir -p logs

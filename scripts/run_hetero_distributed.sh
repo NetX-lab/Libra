@@ -19,10 +19,10 @@ set -e
 
 
 cd "$(dirname "$0")/.."
-PROJECT_DIR="$(pwd)"
 
 
 MODEL_PATH="/path/to/Qwen3-4B"
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WANDB_MODE=offline
 export TOKENIZERS_PARALLELISM=false
 export CUDA_LAUNCH_BLOCKING=1
@@ -82,8 +82,8 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 TRAIN_LOG="$LOG_DIR/training_hetero_${TIMESTAMP}.log"
 
 # PYTHONPATH
-export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
-cd "$PROJECT_DIR"
+export PYTHONPATH=/path/to/user:$PYTHONPATH
+cd /path/to/user
 
 
 

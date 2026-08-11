@@ -7,6 +7,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=900G
+#SBATCH --exclude=gn002,gn019
 #SBATCH -p gpu
 #SBATCH --time=24:00:00
 
@@ -25,18 +26,9 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
-# sbatch executes a spool copy of this script, so BASH_SOURCE may no longer
-# point at the repository.  SLURM_SUBMIT_DIR remains the caller's directory.
-PROJECT_DIR="${PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}}"
-if [ ! -f "$PROJECT_DIR/config.py" ]; then
-    echo "ERROR: PROJECT_DIR does not contain Libra: $PROJECT_DIR" >&2
-    exit 2
-fi
+PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 VENV_PATH="${VENV_PATH:-${HOME}/rl_framework_env/bin/activate}"
 MODEL_PATH="${MODEL_PATH:-${HOME}/hf_models/Qwen3-30B-A3B}"
-# MODEL_PATH is the stable public model ID used by rollout clients.  The
-# physical checkpoint used by vLLM changes after an elastic training handoff.
-ROLLOUT_MODEL_PATH="${ROLLOUT_MODEL_PATH:-$MODEL_PATH}"
 MODEL_ARCH_CONFIG="${MODEL_ARCH_CONFIG:-model_arch_config/qwen3-30b-a3b.yaml}"
 if [ -f "$PROJECT_DIR/.slurm/slurm.conf" ]; then
     export SLURM_CONF="$PROJECT_DIR/.slurm/slurm.conf"
@@ -44,10 +36,6 @@ fi
 TOTAL_STEPS="${TOTAL_STEPS:-100}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
-LEARNING_RATE="${LEARNING_RATE:-1e-6}"
-PPO_EPOCHS="${PPO_EPOCHS:-1}"
-KL_COEF="${KL_COEF:-0.001}"
-CLIP_EPSILON="${CLIP_EPSILON:-0.2}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 TRAIN_MICRO_BATCH_SIZE="${TRAIN_MICRO_BATCH_SIZE:-1}"
 N_SAMPLES="${N_SAMPLES:-4}"
@@ -68,7 +56,6 @@ ALLOW_QWEN30_FALLBACK="${ALLOW_QWEN30_FALLBACK:-0}"
 MAX_CONCURRENT_ROLLOUTS="${MAX_CONCURRENT_ROLLOUTS:-32}"
 QUEUE_SIZE="${QUEUE_SIZE:-256}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-20}"
-EVAL_AT_START="${EVAL_AT_START:-0}"
 RL_TRAIN_PHASE_TRACE="${RL_TRAIN_PHASE_TRACE:-0}"
 EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-32}"
 EVAL_CONCURRENCY="${EVAL_CONCURRENCY:-16}"
@@ -80,6 +67,11 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 MAX_WAIT="${MAX_WAIT:-1800}"
 R2E_MAX_TURNS="${R2E_MAX_TURNS:-4}"
 R2E_MAX_PROMPT_TOKENS="${R2E_MAX_PROMPT_TOKENS:-4096}"
+GRP_PROFILE_DATASET_JSONL="${GRP_PROFILE_DATASET_JSONL:-$PROJECT_DIR/data/r2e_gym_v1/index.jsonl}"
+GRP_PROFILE_SAMPLE_SIZE="${GRP_PROFILE_SAMPLE_SIZE:-64}"
+GRP_PROFILE_STRATEGY="${GRP_PROFILE_STRATEGY:-spread}"
+GRP_PROFILE_SEED="${GRP_PROFILE_SEED:-0}"
+GRP_PROFILE_SAMPLES_PER_PROMPT="${GRP_PROFILE_SAMPLES_PER_PROMPT:-1}"
 R2E_EVAL_MULTI_TURN="${R2E_EVAL_MULTI_TURN:-1}"
 R2E_EVAL_RECORD_SAMPLES="${R2E_EVAL_RECORD_SAMPLES:-16}"
 R2E_EVAL_STRATEGY="${R2E_EVAL_STRATEGY:-spread}"
@@ -103,15 +95,8 @@ CMLFQ_SHARED_LOAD_TTL="${CMLFQ_SHARED_LOAD_TTL:-60}"
 CMLFQ_SHARED_LOAD_HEARTBEAT="${CMLFQ_SHARED_LOAD_HEARTBEAT:-10}"
 CMLFQ_TREE_PERSIST_INTERVAL="${CMLFQ_TREE_PERSIST_INTERVAL:-8}"
 CMLFQ_WARM_START_TREE="${CMLFQ_WARM_START_TREE:-}"
-CMLFQ_INITIAL_BUCKET="${CMLFQ_INITIAL_BUCKET:-short}"
-CMLFQ_LONG_TP_DEGREES="${CMLFQ_LONG_TP_DEGREES:-4,2}"
-CMLFQ_SHORT_MAX_TOKENS="${CMLFQ_SHORT_MAX_TOKENS:-3000}"
-CMLFQ_MEDIUM_MAX_TOKENS="${CMLFQ_MEDIUM_MAX_TOKENS:-6000}"
-CMLFQ_LONG_MAX_TOKENS="${CMLFQ_LONG_MAX_TOKENS:-$MAX_MODEL_LEN}"
-CMLFQ_MIN_MIGRATION_REMAINING_TOKENS="${CMLFQ_MIN_MIGRATION_REMAINING_TOKENS:-256}"
 EXPERIMENT_TAG="${EXPERIMENT_TAG:-r2e_qwen_cmlfq}"
 SCHEDULER_TYPE="${SCHEDULER_TYPE:-cmlfq}"
-SCHEDULER_LOAD_BALANCE_STRATEGY="${SCHEDULER_LOAD_BALANCE_STRATEGY:-least_connections}"
 GRP_ENABLED="${GRP_ENABLED:-1}"
 GRP_DYNAMIC_RECONFIG_ENABLED="${GRP_DYNAMIC_RECONFIG_ENABLED:-0}"
 GRP_RUNTIME_ASYNC_PLANNING="${GRP_RUNTIME_ASYNC_PLANNING:-1}"
@@ -126,31 +111,19 @@ GRP_WARMUP_STEPS="${GRP_WARMUP_STEPS:-5}"
 GRP_MIN_HISTORY="${GRP_MIN_HISTORY:-16}"
 GRP_MIN_GAIN_RATIO="${GRP_MIN_GAIN_RATIO:-${GRP_GAIN_THRESHOLD:-0.02}}"
 GRP_REQUIRE_HETEROGENEOUS_ROLLOUT_TP="${GRP_REQUIRE_HETEROGENEOUS_ROLLOUT_TP:-1}"
-GRP_MANAGE_ROLLOUT_PROCESSES="${GRP_MANAGE_ROLLOUT_PROCESSES:-1}"
+GRP_MANAGE_ROLLOUT_PROCESSES="${GRP_MANAGE_ROLLOUT_PROCESSES:-0}"
 GRP_RECONFIGURE_TRAINING="${GRP_RECONFIGURE_TRAINING:-0}"
 GRP_TRAINING_POOL_ONLY="${GRP_TRAINING_POOL_ONLY:-1}"
 GRP_TRAINING_POOL_TARGET_GPUS="${GRP_TRAINING_POOL_TARGET_GPUS:-0}"
-GRP_TRAINING_POOL_PLAN_ONLY="${GRP_TRAINING_POOL_PLAN_ONLY:-0}"
-GRP_TRAINING_RESIZE_MODE="${GRP_TRAINING_RESIZE_MODE:-hybrid_nonblocking}"
-GRP_TRAINING_HANDOFF_ENABLED="${GRP_TRAINING_HANDOFF_ENABLED:-0}"
-GRP_TRAINING_HANDOFF_DIR="${GRP_TRAINING_HANDOFF_DIR:-}"
-GRP_TRAINING_HANDOFF_TIMEOUT_S="${GRP_TRAINING_HANDOFF_TIMEOUT_S:-600}"
-GRP_CLUSTER_SWAP_ENABLED="${GRP_CLUSTER_SWAP_ENABLED:-1}"
-GRP_HYBRID_WORKER_LAUNCH_ENABLED="${GRP_HYBRID_WORKER_LAUNCH_ENABLED:-1}"
+GRP_TRAINING_POOL_PLAN_ONLY="${GRP_TRAINING_POOL_PLAN_ONLY:-1}"
+GRP_CLUSTER_SWAP_ENABLED="${GRP_CLUSTER_SWAP_ENABLED:-0}"
+GRP_HYBRID_WORKER_LAUNCH_ENABLED="${GRP_HYBRID_WORKER_LAUNCH_ENABLED:-0}"
 GRP_HYBRID_TRAINING_PREWARM_ENABLED="${GRP_HYBRID_TRAINING_PREWARM_ENABLED:-0}"
 GRP_HYBRID_TRAINING_PREWARM_COUNT="${GRP_HYBRID_TRAINING_PREWARM_COUNT:-0}"
 GRP_HYBRID_TRAINING_PREWARM_WORKER_IDS="${GRP_HYBRID_TRAINING_PREWARM_WORKER_IDS:-}"
 GRP_HYBRID_WORKER_TASK_DIR="${GRP_HYBRID_WORKER_TASK_DIR:-}"
 GRP_HYBRID_WORKER_COMMAND_TEMPLATE="${GRP_HYBRID_WORKER_COMMAND_TEMPLATE:-}"
-GRP_HYBRID_WORKER_READY_TIMEOUT_S="${GRP_HYBRID_WORKER_READY_TIMEOUT_S:-600}"
-GRP_HYBRID_WORKER_MODE="${GRP_HYBRID_WORKER_MODE:-megatron_core}"
-GRP_HYBRID_REPLICA_GPUS="${GRP_HYBRID_REPLICA_GPUS:-0}"
-GRP_HYBRID_ZERO_SYNC_STEPS="${GRP_HYBRID_ZERO_SYNC_STEPS:-1}"
-GRP_HYBRID_SNAPSHOT_INTERVAL="${GRP_HYBRID_SNAPSHOT_INTERVAL:-0}"
-GRP_HYBRID_SNAPSHOT_RETENTION="${GRP_HYBRID_SNAPSHOT_RETENTION:-2}"
-GRP_HYBRID_STATE_ALIGNMENT_TIMEOUT_S="${GRP_HYBRID_STATE_ALIGNMENT_TIMEOUT_S:-600}"
-GRP_HYBRID_ACTIVE_GRADIENT_TIMEOUT_S="${GRP_HYBRID_ACTIVE_GRADIENT_TIMEOUT_S:-600}"
-GRP_HYBRID_LOCKSTEP_GRADIENT_SYNC="${GRP_HYBRID_LOCKSTEP_GRADIENT_SYNC:-1}"
+GRP_HYBRID_WORKER_READY_TIMEOUT_S="${GRP_HYBRID_WORKER_READY_TIMEOUT_S:-120}"
 GRP_GRADIENT_TRANSPORT_BACKEND="${GRP_GRADIENT_TRANSPORT_BACKEND:-tcp}"
 GRP_DECOUPLE_COMMUNICATION_DOMAINS="${GRP_DECOUPLE_COMMUNICATION_DOMAINS:-1}"
 GRP_GRADIENT_SERVER_HOST="${GRP_GRADIENT_SERVER_HOST:-127.0.0.1}"
@@ -159,7 +132,7 @@ GRP_GRADIENT_SERVER_PORT="${GRP_GRADIENT_SERVER_PORT:-0}"
 GRP_GRADIENT_SERVER_AUTHKEY="${GRP_GRADIENT_SERVER_AUTHKEY:-rl-framework-elastic}"
 GRP_ROLLOUT_RECONFIGURE_STRATEGY="${GRP_ROLLOUT_RECONFIGURE_STRATEGY:-blue_green}"
 GRP_PREWARM_NO_SPARE_FALLBACK_STRATEGY="${GRP_PREWARM_NO_SPARE_FALLBACK_STRATEGY:-restart_all}"
-GRP_DRAIN_BEFORE_RECONFIGURE="${GRP_DRAIN_BEFORE_RECONFIGURE:-0}"
+GRP_DRAIN_BEFORE_RECONFIGURE="${GRP_DRAIN_BEFORE_RECONFIGURE:-1}"
 GRP_RUNTIME_PEER_REQUEST_WAIT_S="${GRP_RUNTIME_PEER_REQUEST_WAIT_S:-45}"
 GRP_BATCH_COLLECTION_TIMEOUT_S="${GRP_BATCH_COLLECTION_TIMEOUT_S:-300}"
 GRP_BATCH_COLLECTION_MAX_RETRIES="${GRP_BATCH_COLLECTION_MAX_RETRIES:-2}"
@@ -167,8 +140,6 @@ GRP_USE_NCCL_BARRIER_AFTER_ROLLOUT="${GRP_USE_NCCL_BARRIER_AFTER_ROLLOUT:-0}"
 GRP_USE_NCCL_BARRIER_BEFORE_WEIGHT_SYNC="${GRP_USE_NCCL_BARRIER_BEFORE_WEIGHT_SYNC:-0}"
 GRP_INITIAL_ROLLOUT_TP_LIST="${GRP_INITIAL_ROLLOUT_TP_LIST:-}"
 GRP_FORCE_TRAIN_GPUS="${GRP_FORCE_TRAIN_GPUS:-}"
-GRP_FORCE_ROLLOUT_TP_LIST="${GRP_FORCE_ROLLOUT_TP_LIST:-}"
-GRP_FORCE_RUNTIME_RECONFIGURE="${GRP_FORCE_RUNTIME_RECONFIGURE:-0}"
 GRP_ROLLOUT_MANIFEST_PATH="${GRP_ROLLOUT_MANIFEST_PATH:-}"
 GRP_ROLLOUT_PID_REGISTRY_PATH="${GRP_ROLLOUT_PID_REGISTRY_PATH:-}"
 GRP_WAIT_ROLLOUT_PROCESS_START_READY="${GRP_WAIT_ROLLOUT_PROCESS_START_READY:-1}"
@@ -179,11 +150,8 @@ ROLLOUT_WEIGHT_SYNC_MODE="${ROLLOUT_WEIGHT_SYNC_MODE:-restart}"
 REQUIRE_ROLLOUT_WEIGHT_SYNC="${REQUIRE_ROLLOUT_WEIGHT_SYNC:-1}"
 ROLLOUT_WEIGHT_SYNC_EXPORT_ONLY="${ROLLOUT_WEIGHT_SYNC_EXPORT_ONLY:-1}"
 MEGATRON_STREAMING_EXPORT="${MEGATRON_STREAMING_EXPORT:-1}"
-ELASTIC_RESUME_STEP="${ELASTIC_RESUME_STEP:-0}"
-ELASTIC_RESUME_VERSION="${ELASTIC_RESUME_VERSION:-0}"
-ELASTIC_HANDOFF_EXIT_CODE="${ELASTIC_HANDOFF_EXIT_CODE:-75}"
-PREFERRED_TRAIN_NODE="${PREFERRED_TRAIN_NODE:-}"
-AVOID_TRAIN_NODE="${AVOID_TRAIN_NODE:-}"
+PREFERRED_TRAIN_NODE="${PREFERRED_TRAIN_NODE:-gn026}"
+AVOID_TRAIN_NODE="${AVOID_TRAIN_NODE:-gn019}"
 RUN_NCCL_PREFLIGHT="${RUN_NCCL_PREFLIGHT:-1}"
 NCCL_PREFLIGHT_REQUIRED="${NCCL_PREFLIGHT_REQUIRED:-1}"
 NCCL_PREFLIGHT_ELEMENTS="${NCCL_PREFLIGHT_ELEMENTS:-1048576}"
@@ -196,28 +164,25 @@ cd "$PROJECT_DIR"
 mkdir -p logs
 JOB_ID="${SLURM_JOB_ID:-manual}"
 JOB_LOG_DIR="$PROJECT_DIR/logs/r2e_gym_cmlfq_24gpu/job_${JOB_ID}"
-EVAL_OUTPUT_DIR="${EVAL_OUTPUT_DIR:-$JOB_LOG_DIR/eval}"
 ROLLOUT_SYNC_DIR="$JOB_LOG_DIR/rollout_weight_sync"
 CMLFQ_TREE_PATH="$PROJECT_DIR/logs/r2e_gym_cmlfq_24gpu/cmlfq_tree_${JOB_ID}.json"
 CMLFQ_SHARED_LOAD_DIR="$JOB_LOG_DIR/cmlfq_shared_load"
 GRP_ROLLOUT_MANIFEST_PATH="${GRP_ROLLOUT_MANIFEST_PATH:-$JOB_LOG_DIR/global_resource_rollout_manifest.json}"
 GRP_ROLLOUT_PID_REGISTRY_PATH="${GRP_ROLLOUT_PID_REGISTRY_PATH:-$JOB_LOG_DIR/rollout_process_registry.jsonl}"
 GRP_HYBRID_WORKER_TASK_DIR="${GRP_HYBRID_WORKER_TASK_DIR:-$JOB_LOG_DIR/elastic_training_tasks}"
-GRP_TRAINING_HANDOFF_DIR="${GRP_TRAINING_HANDOFF_DIR:-$JOB_LOG_DIR/training_handoff}"
-export ELASTIC_TRAINING_STATE_DIR="${ELASTIC_TRAINING_STATE_DIR:-$JOB_LOG_DIR/elastic_training_state}"
 GRP_VLLM_READY_TIMEOUT_S="${GRP_VLLM_READY_TIMEOUT_S:-$MAX_WAIT}"
 VLLM_CUSTOM_ALL_REDUCE_FLAG=""
 if [ "$VLLM_DISABLE_CUSTOM_ALL_REDUCE" = "1" ]; then
     VLLM_CUSTOM_ALL_REDUCE_FLAG="--disable-custom-all-reduce"
 fi
 if [ "$GRP_MANAGE_ROLLOUT_PROCESSES" = "1" ] && [ -z "$GRP_VLLM_LAUNCH_COMMAND_TEMPLATE" ]; then
-    GRP_VLLM_LAUNCH_COMMAND_TEMPLATE="srun --jobid=$SLURM_JOB_ID --overlap --exact --nodes=1 --ntasks=1 --nodelist={host} --gpus={tp} --cpus-per-task=16 bash -lc \"source '$VENV_PATH' && export TOKENIZERS_PARALLELISM=false && export PLANNED_CUDA_VISIBLE_DEVICES={gpus} && if [ -z \\\"\\\${{CUDA_VISIBLE_DEVICES:-}}\\\" ]; then export CUDA_VISIBLE_DEVICES=\\\"\\\$PLANNED_CUDA_VISIBLE_DEVICES\\\"; fi && echo \\\"CUDA_VISIBLE_DEVICES=\\\${{CUDA_VISIBLE_DEVICES}} planned=\\\${{PLANNED_CUDA_VISIBLE_DEVICES}}\\\" && export MASTER_ADDR=127.0.0.1 && export MASTER_PORT=\\\$((20000 + {port})) && export NCCL_P2P_DISABLE='$VLLM_NCCL_P2P_DISABLE' && export NCCL_IB_DISABLE='$VLLM_NCCL_IB_DISABLE' && export CUDA_LAUNCH_BLOCKING='$VLLM_CUDA_LAUNCH_BLOCKING' && {python} '$PROJECT_DIR/scripts/restartable_vllm_server.py' --instance-id {instance_id} --control-dir {control_dir} --health-url {local_health_url} --initial-model {initial_model} --ready-timeout '$MAX_WAIT' -- python3 -m vllm.entrypoints.openai.api_server --model __MODEL_PATH__ --served-model-name {model_path} --host 0.0.0.0 --port {port} --tensor-parallel-size {tp} --max-model-len {max_model_len} --dtype bfloat16 --gpu-memory-utilization {gpu_memory_utilization} --trust-remote-code --enforce-eager $VLLM_CUSTOM_ALL_REDUCE_FLAG\""
+    GRP_VLLM_LAUNCH_COMMAND_TEMPLATE="srun --exclusive --nodes=1 --ntasks=1 --nodelist={host} --gpus={tp} --cpus-per-task=16 bash -lc \"source '$VENV_PATH' && export TOKENIZERS_PARALLELISM=false && export PLANNED_CUDA_VISIBLE_DEVICES={gpus} && if [ -z \\\"\\\${{CUDA_VISIBLE_DEVICES:-}}\\\" ]; then export CUDA_VISIBLE_DEVICES=\\\"\\\$PLANNED_CUDA_VISIBLE_DEVICES\\\"; fi && echo \\\"CUDA_VISIBLE_DEVICES=\\\${{CUDA_VISIBLE_DEVICES}} planned=\\\${{PLANNED_CUDA_VISIBLE_DEVICES}}\\\" && export MASTER_ADDR=127.0.0.1 && export MASTER_PORT=\\\$((20000 + {port})) && export NCCL_P2P_DISABLE='$VLLM_NCCL_P2P_DISABLE' && export NCCL_IB_DISABLE='$VLLM_NCCL_IB_DISABLE' && export CUDA_LAUNCH_BLOCKING='$VLLM_CUDA_LAUNCH_BLOCKING' && {python} '$PROJECT_DIR/scripts/restartable_vllm_server.py' --instance-id {instance_id} --control-dir {control_dir} --health-url {local_health_url} --initial-model {initial_model} --ready-timeout '$MAX_WAIT' -- python3 -m vllm.entrypoints.openai.api_server --model __MODEL_PATH__ --served-model-name {model_path} --host 0.0.0.0 --port {port} --tensor-parallel-size {tp} --max-model-len {max_model_len} --dtype bfloat16 --gpu-memory-utilization {gpu_memory_utilization} --trust-remote-code --enforce-eager $VLLM_CUSTOM_ALL_REDUCE_FLAG\""
 fi
 if [ "$GRP_MANAGE_ROLLOUT_PROCESSES" = "1" ] && [ -z "$GRP_VLLM_STOP_COMMAND_TEMPLATE" ]; then
-    GRP_VLLM_STOP_COMMAND_TEMPLATE="srun --jobid=$SLURM_JOB_ID --overlap --nodes=1 --ntasks=1 --nodelist={host} bash -lc \"pkill -TERM -f 'restartable_vllm_server.py.*--instance-id {instance_id}' || pkill -TERM -f 'vllm.entrypoints.openai.api_server.*--port {port}' || true\""
+    GRP_VLLM_STOP_COMMAND_TEMPLATE="srun --overlap --nodes=1 --ntasks=1 --nodelist={host} bash -lc \"pkill -TERM -f 'restartable_vllm_server.py.*--instance-id {instance_id}' || pkill -TERM -f 'vllm.entrypoints.openai.api_server.*--port {port}' || true\""
 fi
 if [ "$GRP_HYBRID_WORKER_LAUNCH_ENABLED" = "1" ] && [ -z "$GRP_HYBRID_WORKER_COMMAND_TEMPLATE" ]; then
-    GRP_HYBRID_WORKER_COMMAND_TEMPLATE="srun --jobid=$SLURM_JOB_ID --exclusive --nodes=1 --ntasks=1 --nodelist={host} --gpus={replica_gpus} --cpus-per-task=16 bash -lc \"source '$VENV_PATH' && export TOKENIZERS_PARALLELISM=false && export PLANNED_CUDA_VISIBLE_DEVICES={gpus} && if [ -z \\\"\\\${{CUDA_VISIBLE_DEVICES:-}}\\\" ]; then export CUDA_VISIBLE_DEVICES=\\\"\\\$PLANNED_CUDA_VISIBLE_DEVICES\\\"; fi && {python} -m torch.distributed.run --standalone --nproc_per_node={replica_gpus} {rl_framework_path}/scripts/elastic_hybrid_worker.py --worker-id {worker_id} --target-core-id {target_core_id} --snapshot-path {snapshot_path} --gradient-host {gradient_host} --gradient-port {gradient_port} --authkey {authkey} --task-dir {task_dir} --worker-mode {worker_mode} --config {worker_config} --gradient-endpoint-dir {gradient_endpoint_dir} --gradient-transport {gradient_transport_backend} --native-rdma-device {native_rdma_device} --native-rdma-gid-index {native_rdma_gid_index} --native-rdma-ib-port {native_rdma_ib_port} --native-rdma-max-bytes {native_rdma_max_bytes}\""
+    GRP_HYBRID_WORKER_COMMAND_TEMPLATE="srun --overlap --nodes=1 --ntasks=1 --nodelist={host} --gpus=1 --cpus-per-task=8 bash -lc \"source '$VENV_PATH' && export TOKENIZERS_PARALLELISM=false && export PLANNED_CUDA_VISIBLE_DEVICES={gpus} && if [ -z \\\"\\\${{CUDA_VISIBLE_DEVICES:-}}\\\" ]; then export CUDA_VISIBLE_DEVICES=\\\"\\\$PLANNED_CUDA_VISIBLE_DEVICES\\\"; fi && {python} {rl_framework_path}/scripts/elastic_hybrid_worker.py --worker-id {worker_id} --target-core-id {target_core_id} --snapshot-path {snapshot_path} --gradient-host {gradient_host} --gradient-port {gradient_port} --authkey {authkey} --task-dir {task_dir} --gradient-transport {gradient_transport_backend} --native-rdma-device {native_rdma_device} --native-rdma-gid-index {native_rdma_gid_index} --native-rdma-ib-port {native_rdma_ib_port} --native-rdma-max-bytes {native_rdma_max_bytes}\""
 fi
 export GRP_DYNAMIC_RECONFIG_ENABLED
 export GRP_RUNTIME_ASYNC_PLANNING
@@ -237,10 +202,6 @@ export GRP_RECONFIGURE_TRAINING
 export GRP_TRAINING_POOL_ONLY
 export GRP_TRAINING_POOL_TARGET_GPUS
 export GRP_TRAINING_POOL_PLAN_ONLY
-export GRP_TRAINING_RESIZE_MODE
-export GRP_TRAINING_HANDOFF_ENABLED
-export GRP_TRAINING_HANDOFF_DIR
-export GRP_TRAINING_HANDOFF_TIMEOUT_S
 export GRP_CLUSTER_SWAP_ENABLED
 export GRP_HYBRID_WORKER_LAUNCH_ENABLED
 export GRP_HYBRID_TRAINING_PREWARM_ENABLED
@@ -249,14 +210,6 @@ export GRP_HYBRID_TRAINING_PREWARM_WORKER_IDS
 export GRP_HYBRID_WORKER_TASK_DIR
 export GRP_HYBRID_WORKER_COMMAND_TEMPLATE
 export GRP_HYBRID_WORKER_READY_TIMEOUT_S
-export GRP_HYBRID_WORKER_MODE
-export GRP_HYBRID_REPLICA_GPUS
-export GRP_HYBRID_ZERO_SYNC_STEPS
-export GRP_HYBRID_SNAPSHOT_INTERVAL
-export GRP_HYBRID_SNAPSHOT_RETENTION
-export GRP_HYBRID_STATE_ALIGNMENT_TIMEOUT_S
-export GRP_HYBRID_ACTIVE_GRADIENT_TIMEOUT_S
-export GRP_HYBRID_LOCKSTEP_GRADIENT_SYNC
 export GRP_GRADIENT_TRANSPORT_BACKEND
 export GRP_DECOUPLE_COMMUNICATION_DOMAINS
 export GRP_GRADIENT_SERVER_HOST
@@ -273,8 +226,6 @@ export GRP_USE_NCCL_BARRIER_AFTER_ROLLOUT
 export GRP_USE_NCCL_BARRIER_BEFORE_WEIGHT_SYNC
 export GRP_INITIAL_ROLLOUT_TP_LIST
 export GRP_FORCE_TRAIN_GPUS
-export GRP_FORCE_ROLLOUT_TP_LIST
-export GRP_FORCE_RUNTIME_RECONFIGURE
 export GRP_ROLLOUT_MANIFEST_PATH
 export GRP_ROLLOUT_PID_REGISTRY_PATH
 export GRP_WAIT_ROLLOUT_PROCESS_START_READY
@@ -286,9 +237,6 @@ export ROLLOUT_WEIGHT_SYNC_MODE
 export REQUIRE_ROLLOUT_WEIGHT_SYNC
 export ROLLOUT_WEIGHT_SYNC_EXPORT_ONLY
 export MEGATRON_STREAMING_EXPORT
-export ELASTIC_RESUME_STEP
-export ELASTIC_RESUME_VERSION
-export ELASTIC_HANDOFF_EXIT_CODE
 mkdir -p "$JOB_LOG_DIR"
 mkdir -p "$ROLLOUT_SYNC_DIR"
 mkdir -p "$CMLFQ_SHARED_LOAD_DIR"
@@ -302,8 +250,7 @@ if [ -n "$CMLFQ_WARM_START_TREE" ] && [ ! -e "$CMLFQ_TREE_PATH" ]; then
     echo "C-MLFQ warm-start tree: $CMLFQ_WARM_START_TREE -> $CMLFQ_TREE_PATH"
 fi
 
-PROJECT_PARENT="$(dirname "$PROJECT_DIR")"
-export PYTHONPATH="$PROJECT_PARENT:$PROJECT_DIR:${PYTHONPATH:-}"
+export PYTHONPATH="$(dirname "$PROJECT_DIR"):${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM=false
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_DIR="${PROJECT_DIR}/wandb_r2e_gym_cmlfq_24gpu"
@@ -427,23 +374,6 @@ MASTER_ADDR="${TRAIN_NODES[0]}"
 RUNTIME_CONFIG="$PROJECT_DIR/configs/.r2e_gym_cmlfq_24gpu_${JOB_ID}.yaml"
 PLAN_ENV="$JOB_LOG_DIR/planned_rollout.env"
 
-# A disabled planner must be a real static baseline: do not let its preflight
-# optimizer silently pick a heterogeneous layout.  Full-node TP=4 replicas are
-# the stable default on this cluster; callers can still provide an explicit
-# static layout through GRP_INITIAL_ROLLOUT_TP_LIST.
-if [ "$GRP_ENABLED" != "1" ] && [ -z "$GRP_INITIAL_ROLLOUT_TP_LIST" ]; then
-    if [ $((ROLLOUT_GPUS % 4)) -ne 0 ]; then
-        echo "ERROR: static rollout baseline requires ROLLOUT_GPUS divisible by 4; set GRP_INITIAL_ROLLOUT_TP_LIST explicitly" >&2
-        exit 2
-    fi
-    STATIC_TP_LAYOUT=()
-    for ((gpu=0; gpu<ROLLOUT_GPUS; gpu+=4)); do
-        STATIC_TP_LAYOUT+=(4)
-    done
-    GRP_INITIAL_ROLLOUT_TP_LIST="$(IFS=,; echo "${STATIC_TP_LAYOUT[*]}")"
-    GRP_REQUIRE_HETEROGENEOUS_ROLLOUT_TP=0
-fi
-
 echo "============================================================"
 echo "R2E-Gym full RL post-training with C-MLFQ, Qwen3-30B-A3B, ${TOTAL_GPUS} GPUs"
 echo "============================================================"
@@ -455,11 +385,7 @@ echo "Train topology: TP=$TRAIN_TP_SIZE PP=$TRAIN_PP_SIZE CP=$TRAIN_CP_SIZE EP=$
 echo "Megatron CPU initialization: $MEGATRON_USE_CPU_INITIALIZATION"
 echo "Megatron grouped GEMM: ${MCORE_MOE_GROUPED_GEMM:-1}"
 echo "Train nodes: ${TRAIN_NODES[*]} (${TRAIN_GPUS} GPUs)"
-if [ "$GRP_ENABLED" = "1" ]; then
-    echo "Rollout nodes: ${ROLLOUT_NODES[*]} (GlobalResourcePlanner decides initial TP layout)"
-else
-    echo "Rollout nodes: ${ROLLOUT_NODES[*]} (static TP layout: ${GRP_INITIAL_ROLLOUT_TP_LIST})"
-fi
+echo "Rollout nodes: ${ROLLOUT_NODES[*]} (GlobalResourcePlanner decides TP layout)"
 echo "Total GPUs: $TOTAL_GPUS (train=${TRAIN_GPUS}, rollout=${ROLLOUT_GPUS})"
 echo "Total steps: $TOTAL_STEPS"
 echo "Max model len: $MAX_MODEL_LEN"
@@ -471,7 +397,7 @@ echo "Max concurrent rollouts: $MAX_CONCURRENT_ROLLOUTS"
 echo "Queue size: $QUEUE_SIZE"
 echo "R2E max turns: $R2E_MAX_TURNS"
 echo "R2E max prompt tokens: $R2E_MAX_PROMPT_TOKENS"
-echo "Eval: start=$EVAL_AT_START interval=$EVAL_INTERVAL samples=$EVAL_MAX_SAMPLES ($R2E_EVAL_STRATEGY) holdout=${R2E_EVAL_HOLDOUT_FRACTION:-0}"
+echo "Eval samples: $EVAL_MAX_SAMPLES ($R2E_EVAL_STRATEGY)"
 echo "Long-context TP first: $LONG_CONTEXT_TP_FIRST"
 echo "vLLM read timeout: $VLLM_READ_TIMEOUT"
 echo "vLLM NCCL_P2P_DISABLE: $VLLM_NCCL_P2P_DISABLE"
@@ -502,9 +428,6 @@ cleanup() {
             bash -lc "pkill -f 'vllm.entrypoints.openai.api_server.*--port ${port}' 2>/dev/null || true" \
             >/dev/null 2>&1 || true
     done
-    for pid in "${VLLM_STEP_PIDS[@]:-}"; do
-        wait "$pid" 2>/dev/null || true
-    done
     python3 "$PROJECT_DIR/scripts/merge_cmlfq_prefix_trees.py" \
         --output "$CMLFQ_TREE_PATH" || true
     echo "[cleanup] complete, exit=$exit_code"
@@ -513,12 +436,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "[1/6] Running GlobalResourcePlanner preflight for ${TOTAL_GPUS}-GPU runtime config"
-export PROJECT_DIR MODEL_PATH MODEL_ARCH_CONFIG TOTAL_STEPS MAX_MODEL_LEN MAX_NEW_TOKENS LEARNING_RATE PPO_EPOCHS KL_COEF CLIP_EPSILON EVAL_INTERVAL EVAL_AT_START MAX_WAIT SYNC_INTERVAL RL_TRAIN_PHASE_TRACE
+export PROJECT_DIR MODEL_PATH MODEL_ARCH_CONFIG TOTAL_STEPS MAX_MODEL_LEN MAX_NEW_TOKENS EVAL_INTERVAL MAX_WAIT SYNC_INTERVAL RL_TRAIN_PHASE_TRACE
 export TRAIN_BATCH_SIZE TRAIN_MICRO_BATCH_SIZE N_SAMPLES MAX_CONCURRENT_ROLLOUTS QUEUE_SIZE VLLM_BASE_PORT GPU_MEMORY_UTILIZATION JOB_ID
-export JOB_LOG_DIR EVAL_OUTPUT_DIR EXPERIMENT_TAG SCHEDULER_TYPE GRP_ENABLED CMLFQ_INITIAL_BUCKET CMLFQ_LONG_TP_DEGREES
-export CMLFQ_SHORT_MAX_TOKENS CMLFQ_MEDIUM_MAX_TOKENS CMLFQ_LONG_MAX_TOKENS
-export CMLFQ_MIN_MIGRATION_REMAINING_TOKENS
-export SCHEDULER_LOAD_BALANCE_STRATEGY
+export JOB_LOG_DIR EXPERIMENT_TAG SCHEDULER_TYPE GRP_ENABLED
 export LONG_CONTEXT_TP_FIRST VLLM_READ_TIMEOUT VLLM_CONNECT_TIMEOUT VLLM_WRITE_TIMEOUT VLLM_POOL_TIMEOUT
 export VLLM_NCCL_P2P_DISABLE VLLM_NCCL_IB_DISABLE VLLM_CUDA_LAUNCH_BLOCKING
 export NCCL_P2P_DISABLE NCCL_IB_DISABLE
@@ -529,6 +449,7 @@ export MEGATRON_USE_PRECISION_AWARE_OPTIMIZER MEGATRON_OPTIMIZER_CPU_OFFLOAD
 export MEGATRON_OPTIMIZER_OFFLOAD_FRACTION
 export RUNTIME_CONFIG PLAN_ENV
 export ALLOW_QWEN30_FALLBACK
+export GRP_PROFILE_DATASET_JSONL GRP_PROFILE_SAMPLE_SIZE GRP_PROFILE_STRATEGY GRP_PROFILE_SEED GRP_PROFILE_SAMPLES_PER_PROMPT
 export CMLFQ_TREE_PATH CMLFQ_SHARED_LOAD_DIR CMLFQ_SHARED_LOAD_TTL CMLFQ_SHARED_LOAD_HEARTBEAT CMLFQ_TREE_PERSIST_INTERVAL
 ROLLOUT_NODES_CSV="$(IFS=,; echo "${ROLLOUT_NODES[*]}")"
 export ROLLOUT_NODES_CSV
@@ -538,30 +459,38 @@ import shlex
 from pathlib import Path
 import yaml
 
+from transformers import AutoTokenizer
+
 from RL_Framework.config import AsyncRLConfig
-from RL_Framework.infra.cost_model.preflight_planner import (
-    PreflightPlanner,
-    synthetic_history,
+from RL_Framework.infra.cost_model.preflight_planner import PreflightPlanner
+from RL_Framework.infra.cost_model.startup_profile import (
+    load_jsonl_rows,
+    load_profile_summary,
+    profile_jsonl_has_records,
+    profile_metadata_matches,
+    startup_profile_metadata,
+    summarize_length_profile,
+    write_profile_jsonl,
+    write_profile_summary,
 )
+from RL_Framework.workflow.r2e_gym_profile import build_r2e_gym_length_profile
 
 project = Path(os.environ["PROJECT_DIR"])
 base = project / "configs" / "r2e_gym_cmlfq_qwen3_4b.yaml"
 seed_path = project / "configs" / f".r2e_gym_cmlfq_24gpu_seed_{os.environ['JOB_ID']}.yaml"
 runtime_path = Path(os.environ["RUNTIME_CONFIG"])
 plan_env = Path(os.environ["PLAN_ENV"])
+job_log_dir = Path(os.environ["JOB_LOG_DIR"])
 rollout_nodes = [n for n in os.environ["ROLLOUT_NODES_CSV"].split(",") if n]
 base_port = int(os.environ["VLLM_BASE_PORT"])
 max_model_len = int(os.environ["MAX_MODEL_LEN"])
 max_new_tokens = int(os.environ["MAX_NEW_TOKENS"])
-short_bucket_limit = int(os.environ["CMLFQ_SHORT_MAX_TOKENS"])
-medium_bucket_limit = int(os.environ["CMLFQ_MEDIUM_MAX_TOKENS"])
-long_bucket_limit = int(os.environ["CMLFQ_LONG_MAX_TOKENS"])
-if not 0 < short_bucket_limit < medium_bucket_limit < long_bucket_limit:
-    raise ValueError(
-        "C-MLFQ bucket limits must satisfy "
-        "0 < CMLFQ_SHORT_MAX_TOKENS < CMLFQ_MEDIUM_MAX_TOKENS "
-        "< CMLFQ_LONG_MAX_TOKENS"
-    )
+r2e_max_turns = int(os.environ["R2E_MAX_TURNS"])
+r2e_max_prompt_tokens = int(os.environ.get("R2E_MAX_PROMPT_TOKENS", "0") or "0")
+profile_dataset = Path(os.environ["GRP_PROFILE_DATASET_JSONL"])
+profile_cache_dir = project / "logs" / "r2e_gym_cmlfq_24gpu" / "startup_profile_cache"
+profile_jsonl = profile_cache_dir / "grp_startup_profile.jsonl"
+profile_summary_json = profile_cache_dir / "grp_startup_profile_summary.json"
 train_gpus = int(os.environ["TRAIN_GPUS"])
 rollout_gpus = int(os.environ["ROLLOUT_GPUS"])
 total_gpus = int(os.environ["TOTAL_GPUS"])
@@ -616,16 +545,13 @@ seed = {
     "batch_size": int(os.environ["TRAIN_BATCH_SIZE"]),
     "micro_batch_size": int(os.environ["TRAIN_MICRO_BATCH_SIZE"]),
     "n_samples": int(os.environ["N_SAMPLES"]),
-    "learning_rate": float(os.environ["LEARNING_RATE"]),
-    "ppo_epochs": int(os.environ["PPO_EPOCHS"]),
-    "kl_coef": float(os.environ["KL_COEF"]),
-    "clip_epsilon": float(os.environ["CLIP_EPSILON"]),
     "total_steps": int(os.environ["TOTAL_STEPS"]),
     "sync_interval": int(os.environ["SYNC_INTERVAL"]),
     "eval_interval": int(os.environ["EVAL_INTERVAL"]),
-    "eval_at_start": os.environ["EVAL_AT_START"] == "1",
     "max_new_tokens": int(os.environ["MAX_NEW_TOKENS"]),
     "max_seq_length": int(os.environ["MAX_MODEL_LEN"]),
+    "r2e_max_turns": r2e_max_turns,
+    "r2e_max_prompt_tokens": r2e_max_prompt_tokens,
     "max_concurrent_rollouts": int(os.environ["MAX_CONCURRENT_ROLLOUTS"]),
     "queue_size": int(os.environ["QUEUE_SIZE"]),
     "sync_path": str(project / "logs" / "r2e_gym_cmlfq_24gpu" / f"weights_{os.environ['JOB_ID']}"),
@@ -651,7 +577,7 @@ seed = {
         "instances": [],
         "scheduling": {
             "scheduler_type": os.environ["SCHEDULER_TYPE"],
-            "load_balance_strategy": os.environ["SCHEDULER_LOAD_BALANCE_STRATEGY"],
+            "load_balance_strategy": "least_connections",
             "max_queue_length": int(os.environ["QUEUE_SIZE"]),
             "enable_fallback": True,
             "cmlfq_tree_path": os.environ["CMLFQ_TREE_PATH"],
@@ -659,27 +585,16 @@ seed = {
             "cmlfq_shared_load_dir": os.environ["CMLFQ_SHARED_LOAD_DIR"],
             "cmlfq_shared_load_ttl_s": float(os.environ["CMLFQ_SHARED_LOAD_TTL"]),
             "cmlfq_shared_load_heartbeat_s": float(os.environ["CMLFQ_SHARED_LOAD_HEARTBEAT"]),
-            "cmlfq_initial_bucket": os.environ["CMLFQ_INITIAL_BUCKET"],
-            "cmlfq_min_migration_remaining_tokens": int(
-                os.environ["CMLFQ_MIN_MIGRATION_REMAINING_TOKENS"]
-            ),
             "cmlfq_buckets": {
                 "short": {
                     "tp_degrees": [2],
-                    "max_tokens": short_bucket_limit,
+                    "max_tokens": 3000,
                 },
                 "medium": {
                     "tp_degrees": [2],
-                    "max_tokens": medium_bucket_limit,
+                    "max_tokens": 6000,
                 },
-                "long": {
-                    "tp_degrees": [
-                        int(item.strip())
-                        for item in os.environ["CMLFQ_LONG_TP_DEGREES"].split(",")
-                        if item.strip()
-                    ],
-                    "max_tokens": long_bucket_limit,
-                },
+                "long": {"tp_degrees": [4, 2], "max_tokens": max_model_len},
             },
         },
     },
@@ -700,6 +615,16 @@ seed = {
         "allowed_train_pp": [train_pp],
         "fixed_train_gpus": train_gpus,
         "micro_batch_sizes": [1],
+        "startup_profile_enabled": True,
+        "startup_profile_sample_size": int(os.environ["GRP_PROFILE_SAMPLE_SIZE"]),
+        "startup_profile_strategy": os.environ["GRP_PROFILE_STRATEGY"],
+        "startup_profile_seed": int(os.environ["GRP_PROFILE_SEED"]),
+        "startup_profile_samples_per_prompt": int(os.environ["GRP_PROFILE_SAMPLES_PER_PROMPT"]),
+        "startup_profile_dataset_jsonl": str(profile_dataset),
+        "startup_profile_history_jsonl": str(profile_jsonl),
+        "startup_profile_summary_json": str(profile_summary_json),
+        "runtime_length_profile_enabled": True,
+        "runtime_length_profile_jsonl": str(job_log_dir / "runtime_length_profile.jsonl"),
         "apply_to_runtime": True,
         "verbose": True,
         "runtime_async_planning": os.environ["GRP_RUNTIME_ASYNC_PLANNING"] == "1",
@@ -711,21 +636,11 @@ seed = {
         "runtime_active_rollout_pressure_threshold": float(os.environ["GRP_ACTIVE_ROLLOUT_PRESSURE_THRESHOLD"]),
         "runtime_rejected_rollout_delta_threshold": int(os.environ["GRP_REJECTED_ROLLOUT_DELTA_THRESHOLD"]),
         "runtime_rollout_train_imbalance_threshold": float(os.environ["GRP_ROLLOUT_TRAIN_IMBALANCE_THRESHOLD"]),
-        # These are runtime-only controls.  Applying them during preflight
-        # would allocate future rollout slots before the training ranks have
-        # been released, which is physically impossible.
-        "runtime_forced_train_gpus": 0,
-        "runtime_forced_rollout_tp_list": [],
-        "runtime_force_reconfigure": False,
         "runtime_manage_rollout_processes": os.environ["GRP_MANAGE_ROLLOUT_PROCESSES"] == "1",
         "runtime_reconfigure_training": os.environ["GRP_RECONFIGURE_TRAINING"] == "1",
         "runtime_training_pool_only": os.environ["GRP_TRAINING_POOL_ONLY"] == "1",
         "runtime_training_pool_target_gpus": int(os.environ["GRP_TRAINING_POOL_TARGET_GPUS"]),
         "runtime_training_pool_plan_only": os.environ["GRP_TRAINING_POOL_PLAN_ONLY"] == "1",
-        "runtime_training_resize_mode": os.environ["GRP_TRAINING_RESIZE_MODE"],
-        "runtime_training_handoff_enabled": os.environ["GRP_TRAINING_HANDOFF_ENABLED"] == "1",
-        "runtime_training_handoff_dir": os.environ["GRP_TRAINING_HANDOFF_DIR"],
-        "runtime_training_handoff_timeout_s": float(os.environ["GRP_TRAINING_HANDOFF_TIMEOUT_S"]),
         "runtime_cluster_swap_enabled": os.environ["GRP_CLUSTER_SWAP_ENABLED"] == "1",
         "hybrid_worker_launch_enabled": os.environ["GRP_HYBRID_WORKER_LAUNCH_ENABLED"] == "1",
         "hybrid_training_prewarm_enabled": os.environ["GRP_HYBRID_TRAINING_PREWARM_ENABLED"] == "1",
@@ -738,15 +653,6 @@ seed = {
         "hybrid_worker_task_dir": os.environ["GRP_HYBRID_WORKER_TASK_DIR"],
         "hybrid_worker_command_template": os.environ["GRP_HYBRID_WORKER_COMMAND_TEMPLATE"],
         "hybrid_worker_ready_timeout_s": float(os.environ["GRP_HYBRID_WORKER_READY_TIMEOUT_S"]),
-        "hybrid_worker_mode": os.environ["GRP_HYBRID_WORKER_MODE"],
-        "hybrid_worker_config_path": os.environ["RUNTIME_CONFIG"],
-        "hybrid_replica_gpus": int(os.environ["GRP_HYBRID_REPLICA_GPUS"]),
-        "hybrid_zero_sync_steps": int(os.environ["GRP_HYBRID_ZERO_SYNC_STEPS"]),
-        "hybrid_snapshot_interval": int(os.environ["GRP_HYBRID_SNAPSHOT_INTERVAL"]),
-        "hybrid_snapshot_retention": int(os.environ["GRP_HYBRID_SNAPSHOT_RETENTION"]),
-        "hybrid_state_alignment_timeout_s": float(os.environ["GRP_HYBRID_STATE_ALIGNMENT_TIMEOUT_S"]),
-        "hybrid_active_gradient_timeout_s": float(os.environ["GRP_HYBRID_ACTIVE_GRADIENT_TIMEOUT_S"]),
-        "hybrid_lockstep_gradient_sync": os.environ["GRP_HYBRID_LOCKSTEP_GRADIENT_SYNC"] == "1",
         "gradient_transport_backend": os.environ["GRP_GRADIENT_TRANSPORT_BACKEND"],
         "decouple_communication_domains": os.environ["GRP_DECOUPLE_COMMUNICATION_DOMAINS"] == "1",
         "gradient_server_host": os.environ["GRP_GRADIENT_SERVER_HOST"],
@@ -776,25 +682,61 @@ seed = {
 seed_path.write_text(yaml.safe_dump(seed, sort_keys=False), encoding="utf-8")
 
 cfg = AsyncRLConfig.from_yaml(str(seed_path))
-history = synthetic_history(
-    num_requests=max(64, int(os.environ["TRAIN_BATCH_SIZE"]) * 4),
-    input_len=max(512, max_model_len // 2),
-    output_len=max(32, max_new_tokens),
+profile_metadata = startup_profile_metadata(
+    dataset_jsonl=profile_dataset,
+    model_path=cfg.model_path,
+    tokenizer_path=cfg.tokenizer_path if cfg.tokenizer_path else cfg.model_path,
+    sample_size=int(os.environ["GRP_PROFILE_SAMPLE_SIZE"]),
+    strategy=os.environ["GRP_PROFILE_STRATEGY"],
+    seed=int(os.environ["GRP_PROFILE_SEED"]),
+    samples_per_prompt=int(os.environ["GRP_PROFILE_SAMPLES_PER_PROMPT"]),
+    max_new_tokens=max_new_tokens,
+    max_seq_length=max_model_len,
+    r2e_max_turns=r2e_max_turns,
+    r2e_max_prompt_tokens=r2e_max_prompt_tokens,
 )
-physical_training_handoff = (
-    os.environ["GRP_TRAINING_HANDOFF_ENABLED"] == "1"
-    and os.environ["GRP_RECONFIGURE_TRAINING"] == "1"
-    and os.environ["GRP_TRAINING_RESIZE_MODE"] == "supervised_handoff"
-)
-planner_enabled = os.environ["GRP_ENABLED"] == "1"
-result = PreflightPlanner(
-    cfg,
-    apply_best_candidate=planner_enabled,
-    # A preflight prediction is still useful, but it must not alter the
-    # already allocated rank layout.  Physical changes start at the supervised
-    # checkpoint boundary inside the trainer.
-    apply_plan=planner_enabled and not physical_training_handoff,
-).run(history)
+history = None
+summary = None
+if profile_jsonl_has_records(profile_jsonl):
+    existing_summary = load_profile_summary(profile_summary_json)
+    if (
+        existing_summary is None
+        or profile_metadata_matches(existing_summary, profile_metadata)
+    ):
+        history = load_jsonl_rows(profile_jsonl)
+        if not history:
+            raise RuntimeError(f"startup profile JSONL is empty: {profile_jsonl}")
+        summary = summarize_length_profile(history)
+        summary.update(profile_metadata)
+        summary["reused"] = True
+        write_profile_summary(summary, profile_summary_json)
+if history is None:
+    rows = load_jsonl_rows(profile_dataset)
+    if not rows:
+        raise RuntimeError(f"GRP startup profile dataset is empty: {profile_dataset}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.tokenizer_path if cfg.tokenizer_path else cfg.model_path,
+        trust_remote_code=True,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    history = build_r2e_gym_length_profile(
+        rows,
+        tokenizer=tokenizer,
+        sample_size=int(os.environ["GRP_PROFILE_SAMPLE_SIZE"]),
+        strategy=os.environ["GRP_PROFILE_STRATEGY"],
+        seed=int(os.environ["GRP_PROFILE_SEED"]),
+        samples_per_prompt=int(os.environ["GRP_PROFILE_SAMPLES_PER_PROMPT"]),
+        max_turns=r2e_max_turns,
+        max_new_tokens=max_new_tokens,
+        max_seq_length=max_model_len,
+        max_prompt_tokens=r2e_max_prompt_tokens or None,
+    )
+    summary = summarize_length_profile(history)
+    summary.update(profile_metadata)
+    write_profile_jsonl(history, profile_jsonl)
+    write_profile_summary(summary, profile_summary_json)
+result = PreflightPlanner(cfg, apply_best_candidate=True).run(history)
 planned = result.planned_config
 planned.train_backend = os.environ["TRAIN_BACKEND"]
 planned.train_tp_size = train_tp
@@ -831,10 +773,7 @@ planned.megatron_use_cpu_initialization = (
     os.environ.get("MEGATRON_USE_CPU_INITIALIZATION", "0") == "1"
 )
 
-if (
-    not planned.heterogeneous_rollout.instances
-    and not os.environ.get("GRP_INITIAL_ROLLOUT_TP_LIST", "").strip()
-):
+if not planned.heterogeneous_rollout.instances:
     if os.environ.get("ALLOW_QWEN30_FALLBACK", "0") != "1":
         raise RuntimeError(
             "GlobalResourcePlanner produced no feasible candidate. "
@@ -944,14 +883,13 @@ for idx, inst in enumerate(planned.heterogeneous_rollout.instances):
     start_gpu = next_gpu[node]
     inst.gpus = list(range(start_gpu, start_gpu + tp))
     inst.host = node
-    inst.port = base_port + idx
     if not inst.instance_id:
         inst.instance_id = f"grp_tp{tp}_{idx}"
     remaining[node] -= tp
     next_gpu[node] += tp
     assigned_nodes.append(node)
     assigned_tps.append(tp)
-    assigned_ports.append(inst.port)
+    assigned_ports.append(base_port + idx)
     assigned_names.append(inst.instance_id)
     assigned_gpus.append(",".join(str(gpu) for gpu in inst.gpus))
 
@@ -979,18 +917,6 @@ grp.allowed_train_tp = [train_tp]
 grp.allowed_train_pp = [train_pp]
 grp.fixed_train_gpus = train_gpus
 grp.micro_batch_sizes = [1]
-# Restore the runtime control-plane target only after preflight has materialized
-# the initial static topology.  The executor will later request a supervised
-# checkpoint/restart handoff before this target is applied.
-grp.runtime_forced_train_gpus = int(os.environ["GRP_FORCE_TRAIN_GPUS"] or 0)
-grp.runtime_forced_rollout_tp_list = [
-    int(item.strip())
-    for item in os.environ["GRP_FORCE_ROLLOUT_TP_LIST"].replace(";", ":").replace(",", ":").split(":")
-    if item.strip()
-]
-grp.runtime_force_reconfigure = (
-    os.environ.get("GRP_FORCE_RUNTIME_RECONFIGURE", "0") == "1"
-)
 
 planned.to_yaml(str(runtime_path))
 
@@ -1016,6 +942,8 @@ plan_env.write_text(
 )
 print(f"seed_config={seed_path}")
 print(f"runtime_config={runtime_path}")
+print(f"profile_jsonl={profile_jsonl}")
+print(f"profile_summary={summary}")
 print(f"decision={result.decision.to_dict()}")
 print(f"planned_rollout_tp={assigned_tps}")
 print(f"planned_rollout_nodes={assigned_nodes}")
@@ -1026,7 +954,7 @@ echo "GlobalResourcePlanner rollout TP list: ${PLANNED_ROLLOUT_TP_LIST}"
 echo "GlobalResourcePlanner rollout nodes: ${ROLLOUT_NODE_LIST[*]}"
 TRAIN_NODE_LIST_CSV="$(IFS=,; echo "${TRAIN_NODES[*]}")"
 
-if [ "$RUN_NCCL_PREFLIGHT" = "1" ] && [ "$TRAIN_NODE_COUNT" -gt 1 ]; then
+if [ "$RUN_NCCL_PREFLIGHT" = "1" ]; then
     echo "[2/7] Running cross-node NCCL all-gather preflight"
     PREFLIGHT_PORT=$((MASTER_PORT + 1))
     PREFLIGHT_STATUS=0
@@ -1044,7 +972,7 @@ if [ "$RUN_NCCL_PREFLIGHT" = "1" ] && [ "$TRAIN_NODE_COUNT" -gt 1 ]; then
             node_rank=\"\${SLURM_PROCID:-0}\"
             preflight_log='$JOB_LOG_DIR/nccl_preflight_rank'\${node_rank}'_'\${HOSTNAME}'.log'
             {
-                export PYTHONPATH='$PROJECT_PARENT':'$PROJECT_DIR':\${PYTHONPATH:-}
+                export PYTHONPATH='$(dirname "$PROJECT_DIR")':\${PYTHONPATH:-}
                 export MASTER_ADDR='$MASTER_ADDR'
                 export MASTER_PORT='$PREFLIGHT_PORT'
                 export CUDA_VISIBLE_DEVICES=0,1,2,3
@@ -1075,8 +1003,6 @@ if [ "$RUN_NCCL_PREFLIGHT" = "1" ] && [ "$TRAIN_NODE_COUNT" -gt 1 ]; then
         fi
         echo "WARNING: NCCL preflight failed with status ${PREFLIGHT_STATUS}; continuing because NCCL_PREFLIGHT_REQUIRED=0" >&2
     fi
-elif [ "$RUN_NCCL_PREFLIGHT" = "1" ]; then
-    echo "[2/7] Skipping cross-node NCCL preflight for single-node core training"
 fi
 
 start_vllm() {
@@ -1087,7 +1013,7 @@ start_vllm() {
     local gpu_list="$5"
     local log_file="$JOB_LOG_DIR/vllm_${name}.log"
     echo "Starting $name on $node TP=$tp planned_GPUs=$gpu_list port=$port"
-    srun --overlap --exact \
+    srun --exclusive \
         --nodes=1 --ntasks=1 --nodelist="$node" \
         --gpus="$tp" \
         --cpus-per-task=16 \
@@ -1108,7 +1034,7 @@ start_vllm() {
                 --instance-id '$name' \
                 --control-dir '$ROLLOUT_SYNC_DIR' \
                 --health-url 'http://127.0.0.1:$port/health' \
-                --initial-model '$ROLLOUT_MODEL_PATH' \
+                --initial-model '$MODEL_PATH' \
                 --ready-timeout '$MAX_WAIT' \
                 -- python3 -m vllm.entrypoints.openai.api_server \
                 --model '__MODEL_PATH__' \
@@ -1168,75 +1094,52 @@ wait_for_health() {
     return 1
 }
 
-start_current_rollout_pool() {
-    local -A node_indices=()
-    local -a rollout_nodes_unique=()
-    local i node indices name gpu_list port tp log_file command launch_cases group_pid
-    for i in "${!ROLLOUT_NODE_LIST[@]}"; do
-        node="${ROLLOUT_NODE_LIST[$i]}"
-        if [ -z "${node_indices[$node]:-}" ]; then
-            rollout_nodes_unique+=("$node")
-        fi
-        node_indices["$node"]+=" $i"
-    done
+echo "[3/7] Starting GlobalResourcePlanner rollout vLLM instances"
+PRIMARY_INDICES=()
+DEFERRED_INDICES=()
+declare -A NODE_HAS_PRIMARY=()
+for i in "${!ROLLOUT_NODE_LIST[@]}"; do
+    node="${ROLLOUT_NODE_LIST[$i]}"
+    if [ -z "${NODE_HAS_PRIMARY[$node]:-}" ]; then
+        NODE_HAS_PRIMARY["$node"]=1
+        PRIMARY_INDICES+=("$i")
+    else
+        DEFERRED_INDICES+=("$i")
+    fi
+done
 
-    # This Slurm installation permits only one live nested step for the parent
-    # allocation. Launch every rollout node in one multi-node step; each task
-    # then owns that node and spawns its disjoint vLLM instances locally.
-    launch_cases=""
-    for node in "${!node_indices[@]}"; do
-        indices="${node_indices[$node]}"
-        launch_cases+=" $node)"
-        for i in $indices; do
-            name="${ROLLOUT_NAME_LIST[$i]}"
-            gpu_list="${ROLLOUT_GPU_LIST[$i]}"
-            port="${ROLLOUT_PORT_LIST[$i]}"
-            tp="${ROLLOUT_TP_LIST[$i]}"
-            log_file="$JOB_LOG_DIR/vllm_${name}.log"
-            echo "Starting $name on $node TP=$tp planned_GPUs=$gpu_list port=$port"
-            launch_cases+=" ( export CUDA_VISIBLE_DEVICES='$gpu_list'; export PLANNED_CUDA_VISIBLE_DEVICES='$gpu_list'; export MASTER_ADDR=127.0.0.1; export MASTER_PORT=$((20000 + port)); export NCCL_P2P_DISABLE='$VLLM_NCCL_P2P_DISABLE'; export NCCL_IB_DISABLE='$VLLM_NCCL_IB_DISABLE'; export CUDA_LAUNCH_BLOCKING='$VLLM_CUDA_LAUNCH_BLOCKING'; python3 '$PROJECT_DIR/scripts/restartable_vllm_server.py' --instance-id '$name' --control-dir '$ROLLOUT_SYNC_DIR' --health-url 'http://127.0.0.1:$port/health' --initial-model '$ROLLOUT_MODEL_PATH' --ready-timeout '$MAX_WAIT' -- python3 -m vllm.entrypoints.openai.api_server --model '__MODEL_PATH__' --served-model-name '$MODEL_PATH' --host 0.0.0.0 --port '$port' --tensor-parallel-size '$tp' --max-model-len '$MAX_MODEL_LEN' --dtype bfloat16 --gpu-memory-utilization '$GPU_MEMORY_UTILIZATION' --trust-remote-code --enforce-eager $VLLM_CUSTOM_ALL_REDUCE_FLAG ) >'$log_file' 2>&1 &"
-        done
-        launch_cases+=" wait ;;"
-    done
-    command="source '$VENV_PATH'; export TOKENIZERS_PARALLELISM=false; case \"\$(hostname -s)\" in$launch_cases *) echo \"Unexpected rollout host: \$(hostname -s)\" >&2; exit 2 ;; esac"
-    node_list_csv="$(IFS=,; echo "${rollout_nodes_unique[*]}")"
-    srun --overlap --exact --nodes="${#rollout_nodes_unique[@]}" \
-        --ntasks="${#rollout_nodes_unique[@]}" --ntasks-per-node=1 \
-        --nodelist="$node_list_csv" --gpus="$((4 * ${#rollout_nodes_unique[@]}))" --cpus-per-task=16 --mem=0 \
-        bash -lc "$command" >"$JOB_LOG_DIR/vllm_launch_group.log" 2>&1 &
-    group_pid="$!"
-    VLLM_STEP_PIDS+=("$group_pid")
-    for i in "${!ROLLOUT_NODE_LIST[@]}"; do
-        name="${ROLLOUT_NAME_LIST[$i]}"
-        VLLM_PID_BY_NAME["$name"]="$group_pid"
-    done
+for i in "${PRIMARY_INDICES[@]}"; do
+    start_vllm \
+        "${ROLLOUT_NODE_LIST[$i]}" \
+        "${ROLLOUT_TP_LIST[$i]}" \
+        "${ROLLOUT_PORT_LIST[$i]}" \
+        "${ROLLOUT_NAME_LIST[$i]}" \
+        "${ROLLOUT_GPU_LIST[$i]}"
+done
 
-    for i in "${!ROLLOUT_NODE_LIST[@]}"; do
-        wait_for_health "${ROLLOUT_NODE_LIST[$i]}" "${ROLLOUT_PORT_LIST[$i]}" \
+echo "[4/7] Waiting for primary rollout services"
+for i in "${PRIMARY_INDICES[@]}"; do
+    wait_for_health \
+        "${ROLLOUT_NODE_LIST[$i]}" \
+        "${ROLLOUT_PORT_LIST[$i]}" \
+        "${ROLLOUT_NAME_LIST[$i]}"
+done
+
+if [ "${#DEFERRED_INDICES[@]}" -gt 0 ]; then
+    echo "[3b/6] Starting deferred same-node rollout services"
+    for i in "${DEFERRED_INDICES[@]}"; do
+        start_vllm \
+            "${ROLLOUT_NODE_LIST[$i]}" \
+            "${ROLLOUT_TP_LIST[$i]}" \
+            "${ROLLOUT_PORT_LIST[$i]}" \
+            "${ROLLOUT_NAME_LIST[$i]}" \
+            "${ROLLOUT_GPU_LIST[$i]}"
+        wait_for_health \
+            "${ROLLOUT_NODE_LIST[$i]}" \
+            "${ROLLOUT_PORT_LIST[$i]}" \
             "${ROLLOUT_NAME_LIST[$i]}"
     done
-}
-
-stop_current_rollout_pool() {
-    local pid i
-    for pid in "${VLLM_STEP_PIDS[@]:-}"; do
-        kill "$pid" 2>/dev/null || true
-    done
-    for i in "${!ROLLOUT_NODE_LIST[@]}"; do
-        srun --overlap --nodes=1 --ntasks=1 --nodelist="${ROLLOUT_NODE_LIST[$i]}" \
-            bash -lc "pkill -TERM -f 'vllm.entrypoints.openai.api_server.*--port ${ROLLOUT_PORT_LIST[$i]}' || true" \
-            >/dev/null 2>&1 || true
-    done
-    for pid in "${VLLM_STEP_PIDS[@]:-}"; do
-        wait "$pid" 2>/dev/null || true
-    done
-    VLLM_STEP_PIDS=()
-    VLLM_PID_BY_NAME=()
-}
-
-echo "[3/7] Starting GlobalResourcePlanner rollout vLLM instances"
-echo "[4/7] Waiting for primary rollout services"
-start_current_rollout_pool
+fi
 
 echo "[5/7] Checking R2E-Gym data and C-MLFQ flow"
 python3 examples/test_r2e_gym.py
@@ -1258,9 +1161,6 @@ export R2E_EVAL_MAX_NEW_TOKENS="$EVAL_MAX_NEW_TOKENS"
 export R2E_EVAL_MULTI_TURN
 export R2E_EVAL_RECORD_SAMPLES
 export R2E_EVAL_STRATEGY
-export R2E_EVAL_HOLDOUT_FRACTION="${R2E_EVAL_HOLDOUT_FRACTION:-0}"
-export R2E_EVAL_SEED="${R2E_EVAL_SEED:-0}"
-export EVAL_OUTPUT_DIR
 export VLLM_READ_TIMEOUT
 export VLLM_CONNECT_TIMEOUT
 export VLLM_WRITE_TIMEOUT
@@ -1270,29 +1170,24 @@ export FSDP_ALIGN_SEQUENCE_LENGTHS
 export FSDP_LOCKSTEP_BARRIERS
 export FSDP_GRADIENT_CHECKPOINTING
 export FSDP_ACTIVATION_CHECKPOINTING
-# Megatron's persistent async checkpoint process transfers staged CUDA storage
-# through multiprocessing IPC. Older HPC kernels without pidfd_open cannot use
-# that path with expandable CUDA segments.
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 echo "[7/7] Starting full R2E-Gym AsyncRLTrainer run on ${TOTAL_GPUS} GPUs"
-run_training_round() {
-    local -a train_step_pids=()
-    local node_rank node train_log round_exit=0
-    for node_rank in "${!TRAIN_NODES[@]}"; do
-        node="${TRAIN_NODES[$node_rank]}"
-        train_log="$JOB_LOG_DIR/training_rank${node_rank}_${node}.log"
-        echo "Starting training rank $node_rank on $node (resume_step=$ELASTIC_RESUME_STEP)"
-        srun --overlap --exact \
-            --nodes=1 \
-            --ntasks=1 \
-            --nodelist="$node" \
-            --gpus=4 \
-            --cpus-per-task=16 \
-            bash -lc "
+TRAIN_STEP_PIDS=()
+for node_rank in "${!TRAIN_NODES[@]}"; do
+    node="${TRAIN_NODES[$node_rank]}"
+    train_log="$JOB_LOG_DIR/training_rank${node_rank}_${node}.log"
+    echo "Starting training rank $node_rank on $node"
+    srun --exclusive \
+        --nodes=1 \
+        --ntasks=1 \
+        --nodelist="$node" \
+        --gpus=4 \
+        --cpus-per-task=16 \
+        bash -lc "
             source '$VENV_PATH'
             cd '$PROJECT_DIR'
-            export PYTHONPATH='$PROJECT_PARENT':'$PROJECT_DIR':\${PYTHONPATH:-}
+            export PYTHONPATH='$(dirname "$PROJECT_DIR")':\${PYTHONPATH:-}
             export HETERO_INSTANCE_HOSTS='$HETERO_INSTANCE_HOSTS'
             export R2E_GYM_INDEX='$R2E_GYM_INDEX'
             export R2E_MAX_TURNS='$R2E_MAX_TURNS'
@@ -1303,9 +1198,6 @@ run_training_round() {
             export R2E_EVAL_MULTI_TURN='$R2E_EVAL_MULTI_TURN'
             export R2E_EVAL_RECORD_SAMPLES='$R2E_EVAL_RECORD_SAMPLES'
             export R2E_EVAL_STRATEGY='$R2E_EVAL_STRATEGY'
-            export R2E_EVAL_HOLDOUT_FRACTION='$R2E_EVAL_HOLDOUT_FRACTION'
-            export R2E_EVAL_SEED='$R2E_EVAL_SEED'
-            export EVAL_OUTPUT_DIR='$EVAL_OUTPUT_DIR'
             export VLLM_READ_TIMEOUT='$VLLM_READ_TIMEOUT'
             export VLLM_CONNECT_TIMEOUT='$VLLM_CONNECT_TIMEOUT'
             export VLLM_WRITE_TIMEOUT='$VLLM_WRITE_TIMEOUT'
@@ -1334,9 +1226,6 @@ run_training_round() {
             export TOKENIZERS_PARALLELISM=false
             export WANDB_MODE='$WANDB_MODE'
             export WANDB_DIR='$WANDB_DIR'
-            export ELASTIC_RESUME_STEP='$ELASTIC_RESUME_STEP'
-            export ELASTIC_RESUME_VERSION='$ELASTIC_RESUME_VERSION'
-            export ELASTIC_HANDOFF_EXIT_CODE='$ELASTIC_HANDOFF_EXIT_CODE'
             torchrun \
                 --nnodes='$TRAIN_NODE_COUNT' \
                 --nproc_per_node=4 \
@@ -1345,66 +1234,19 @@ run_training_round() {
                 --master_port='$MASTER_PORT' \
                 examples/r2e_gym_async_rl.py \
                 --config '$RUNTIME_CONFIG'
-            " >"$train_log" 2>&1 &
-        train_step_pids+=("$!")
-    done
-    for pid in "${train_step_pids[@]}"; do
-        if ! wait "$pid"; then
-            round_exit=1
-        fi
-    done
-    cat "$JOB_LOG_DIR"/training_rank*.log > "$JOB_LOG_DIR/training.log" 2>/dev/null || true
-    return "$round_exit"
-}
-
-HANDOFF_READY_PATH="$GRP_TRAINING_HANDOFF_DIR/ready.json"
-HANDOFF_ENV_PATH="$GRP_TRAINING_HANDOFF_DIR/relaunch.env"
-if [ "$GRP_TRAINING_HANDOFF_ENABLED" = "1" ]; then
-    mkdir -p "$GRP_TRAINING_HANDOFF_DIR"
-    rm -f "$GRP_TRAINING_HANDOFF_DIR/request.json" "$HANDOFF_READY_PATH" "$HANDOFF_ENV_PATH"
-fi
-
-while true; do
-    train_exit=0
-    run_training_round || train_exit=$?
-    if [ "$GRP_TRAINING_HANDOFF_ENABLED" != "1" ] || [ ! -s "$HANDOFF_READY_PATH" ]; then
-        break
-    fi
-    echo "[ElasticTrainingHandoff] supervisor applying $HANDOFF_READY_PATH"
-    stop_current_rollout_pool
-    NODES_CSV="$(IFS=,; echo "${NODES[*]}")"
-    python3 "$PROJECT_DIR/scripts/apply_training_handoff.py" \
-        --config "$RUNTIME_CONFIG" \
-        --handoff "$HANDOFF_READY_PATH" \
-        --nodes "$NODES_CSV" \
-        --output-env "$HANDOFF_ENV_PATH"
-    source "$HANDOFF_ENV_PATH"
-    ELASTIC_RESUME_STEP="$NEXT_ELASTIC_RESUME_STEP"
-    ELASTIC_RESUME_VERSION="$NEXT_ELASTIC_RESUME_VERSION"
-    TRAIN_NODE_COUNT="$NEXT_TRAIN_NODE_COUNT"
-    read -r -a TRAIN_NODES <<< "$NEXT_TRAIN_NODE_LIST"
-    read -r -a ROLLOUT_NODE_LIST <<< "$NEXT_ROLLOUT_INSTANCE_NODE_LIST"
-    read -r -a ROLLOUT_TP_LIST <<< "$NEXT_ROLLOUT_TP_LIST"
-    read -r -a ROLLOUT_PORT_LIST <<< "$NEXT_ROLLOUT_PORT_LIST"
-    read -r -a ROLLOUT_NAME_LIST <<< "$NEXT_ROLLOUT_NAME_LIST"
-    read -r -a ROLLOUT_GPU_LIST <<< "$NEXT_ROLLOUT_GPU_LIST"
-    ROLLOUT_MODEL_PATH="$NEXT_ROLLOUT_MODEL_PATH"
-    HETERO_INSTANCE_HOSTS="$NEXT_HETERO_INSTANCE_HOSTS"
-    MASTER_ADDR="$NEXT_MASTER_ADDR"
-    export HETERO_INSTANCE_HOSTS ELASTIC_RESUME_STEP ELASTIC_RESUME_VERSION ROLLOUT_MODEL_PATH
-    # The forced target triggers this one handoff only.  Leaving it in the
-    # inherited Slurm environment would make every later planner interval
-    # request the identical topology and pay avoidable control-plane cost.
-    unset GRP_FORCE_TRAIN_GPUS GRP_FORCE_ROLLOUT_TP_LIST
-    GRP_FORCE_RUNTIME_RECONFIGURE=0
-    export GRP_FORCE_RUNTIME_RECONFIGURE
-    rm -f "$GRP_TRAINING_HANDOFF_DIR/request.json" "$HANDOFF_READY_PATH"
-    echo "[ElasticTrainingHandoff] restarting train_nodes=${TRAIN_NODES[*]} rollout_tp=${ROLLOUT_TP_LIST[*]} rollout_model=$ROLLOUT_MODEL_PATH"
-    start_current_rollout_pool
+        " >"$train_log" 2>&1 &
+    TRAIN_STEP_PIDS+=("$!")
 done
 
+train_exit=0
+for pid in "${TRAIN_STEP_PIDS[@]}"; do
+    if ! wait "$pid"; then
+        train_exit=1
+    fi
+done
+cat "$JOB_LOG_DIR"/training_rank*.log > "$JOB_LOG_DIR/training.log" 2>/dev/null || true
 if [ "$train_exit" -ne 0 ]; then
-    echo "ERROR: one or more training ranks failed without a completed handoff" >&2
+    echo "ERROR: one or more training ranks failed" >&2
     exit "$train_exit"
 fi
 

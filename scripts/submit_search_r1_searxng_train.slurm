@@ -17,7 +17,7 @@
 #
 # Common overrides:
 #   TOTAL_STEPS=5000 TRAIN_BATCH_SIZE=8 MAX_NEW_TOKENS=1024 \
-#   SEARXNG_URL=http://searxng-host:18080 \
+#   SEARXNG_URL=http://192.0.2.30:18080 \
 #   sbatch --export=ALL,MODEL_PATH,TOTAL_STEPS,TRAIN_BATCH_SIZE,MAX_NEW_TOKENS,SEARXNG_URL \
 #     scripts/submit_search_r1_searxng_train.slurm
 # =============================================================================
@@ -31,11 +31,13 @@
 #SBATCH --cpus-per-task=16
 #SBATCH -p gpu
 #SBATCH --time=7-00:00:00
+#SBATCH --exclude=gn019
+
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/path/to/RL_Framework}"
 MODEL_PATH="${MODEL_PATH:-/path/to/Qwen3-14B}"
-SEARXNG_URL="${SEARXNG_URL:-http://127.0.0.1:18080}"
+SEARXNG_URL="${SEARXNG_URL:-http://192.0.2.30:18080}"
 SEARCH_R1_DATA="${SEARCH_R1_DATA:-$PROJECT_DIR/data/search_r1_train.jsonl}"
 SEARCH_PREFLIGHT_QUERY="${SEARCH_PREFLIGHT_QUERY:-PyTorch distributed training}"
 

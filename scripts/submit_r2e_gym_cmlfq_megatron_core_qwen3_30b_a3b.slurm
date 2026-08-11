@@ -7,6 +7,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=900G
+#SBATCH --exclude=gn002,gn019
 #SBATCH -p gpu
 #SBATCH --time=24:00:00
 

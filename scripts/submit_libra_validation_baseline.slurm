@@ -9,20 +9,21 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=900G
+#SBATCH --exclude=gn002,gn019
 #SBATCH -p gpu
 #SBATCH --time=01:00:00
 
 set -euo pipefail
 
-export PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export PROJECT_DIR="${PROJECT_DIR:-/home-ssd/Users/nsgm_xu/kwchen/RL_Framework}"
 export EXPERIMENT_TAG="${EXPERIMENT_TAG:-baseline_lenaware_qwen4}"
-export MODEL_PATH="${MODEL_PATH:-/path/to/Qwen3-4B}"
+export MODEL_PATH="${MODEL_PATH:-/home-ssd/Users/nsgm_xu/kwchen/hf_models/Qwen3-4B}"
 export MODEL_ARCH_CONFIG="${MODEL_ARCH_CONFIG:-model_arch_config/qwen3-4b.yaml}"
 export TOTAL_STEPS="${TOTAL_STEPS:-12}"
 export MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
-export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
+export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 export R2E_MAX_PROMPT_TOKENS="${R2E_MAX_PROMPT_TOKENS:-1024}"
-export R2E_MAX_TURNS="${R2E_MAX_TURNS:-2}"
+export R2E_MAX_TURNS="${R2E_MAX_TURNS:-1}"
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
 export N_SAMPLES="${N_SAMPLES:-2}"
 export MAX_CONCURRENT_ROLLOUTS="${MAX_CONCURRENT_ROLLOUTS:-8}"
@@ -34,7 +35,7 @@ export ALLOW_QWEN30_FALLBACK="${ALLOW_QWEN30_FALLBACK:-1}"
 
 export TRAIN_BACKEND="${TRAIN_BACKEND:-megatron_core}"
 export TRAIN_GPUS="${TRAIN_GPUS:-4}"
-export TRAIN_TP_SIZE="${TRAIN_TP_SIZE:-4}"
+export TRAIN_TP_SIZE="${TRAIN_TP_SIZE:-1}"
 export TRAIN_PP_SIZE="${TRAIN_PP_SIZE:-1}"
 export TRAIN_CP_SIZE="${TRAIN_CP_SIZE:-1}"
 export MEGATRON_USE_PRECISION_AWARE_OPTIMIZER="${MEGATRON_USE_PRECISION_AWARE_OPTIMIZER:-1}"

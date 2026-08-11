@@ -1,5 +1,7 @@
 """Support code for Cmlfq prefix tree."""
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -122,6 +124,9 @@ class CausalPrefixTree:
     def __init__(self):
         # prompt_id -> root_node
         self._roots: dict[str, PrefixTreeNode] = {}
+        # Aggregate causal evidence across prompts. Prompt ids are usually
+        # unique online, while tool-return states recur across tasks.
+        self._global_root: PrefixTreeNode | None = None
         self._lock = threading.RLock()
         self._total_insertions = 0
 
@@ -132,8 +137,6 @@ class CausalPrefixTree:
     def insert(self, trajectory: Trajectory):
         """Insert."""
         prompt_id = trajectory.prompt_id
-        return_states = trajectory.return_states
-        remaining_lengths = trajectory.total_remaining_lengths
 
         with self._lock:
 
@@ -143,26 +146,10 @@ class CausalPrefixTree:
                 self._roots[prompt_id] = root
 
 
-            if trajectory.total_length is not None:
-                root.update_statistics(trajectory.total_length)
-            elif remaining_lengths:
-                root.update_statistics(remaining_lengths[0])
-
-
-            current = root
-            for i, state in enumerate(return_states):
-                state_key = state.to_key()
-                child = current.children.get(state_key)
-                if child is None:
-                    child = PrefixTreeNode(
-                        key=self._make_key(prompt_id, return_states[: i + 1]),
-                        depth=current.depth + 1,
-                    )
-                    current.children[state_key] = child
-
-
-                child.update_statistics(remaining_lengths[i])
-                current = child
+            self._insert_into_root(root, trajectory, prompt_id)
+            if self._global_root is None:
+                self._global_root = PrefixTreeNode(key="__global__:root", depth=0)
+            self._insert_into_root(self._global_root, trajectory, "__global__")
 
             self._total_insertions += 1
 
@@ -190,20 +177,10 @@ class CausalPrefixTree:
         with self._lock:
             root = self._roots.get(prompt_id)
             if root is None:
-                return None
+                return self._lookup_from_root(self._global_root, return_states)
 
-            current = root
-            fallback_depth = 0
-            for i, state in enumerate(return_states):
-                state_key = state.to_key()
-                child = current.children.get(state_key)
-                if child is None:
-
-                    fallback_depth = len(return_states) - i
-                    break
-                current = child
-
-            return current
+            # Prefer the prompt's own deepest causal prefix when it exists.
+            return self._lookup_from_root(root, return_states)
 
     def get_bucket_for_node(
         self, node: PrefixTreeNode, bucket_thresholds: dict[str, int]
@@ -227,6 +204,7 @@ class CausalPrefixTree:
         """Rebuild."""
         with self._lock:
             self._roots.clear()
+            self._global_root = None
             self._total_insertions = 0
             for traj in trajectories:
                 self.insert(traj)
@@ -254,6 +232,11 @@ class CausalPrefixTree:
                 "max_depth": max_depth,
                 "total_leaves": total_leaves,
                 "total_insertions": self._total_insertions,
+                "global_nodes": (
+                    self._global_root.get_tree_stats()["total_nodes"]
+                    if self._global_root is not None
+                    else 0
+                ),
             }
 
     def merge(self, other: "CausalPrefixTree") -> None:
@@ -265,6 +248,11 @@ class CausalPrefixTree:
                 prompt_id: PrefixTreeNode.from_dict(root.to_dict())
                 for prompt_id, root in other._roots.items()
             }
+            other_global_root = (
+                PrefixTreeNode.from_dict(other._global_root.to_dict())
+                if other._global_root is not None
+                else None
+            )
             other_insertions = other._total_insertions
         with self._lock:
             for prompt_id, source in other_roots.items():
@@ -273,6 +261,11 @@ class CausalPrefixTree:
                     self._roots[prompt_id] = source
                 else:
                     self._merge_node(target, source)
+            if other_global_root is not None:
+                if self._global_root is None:
+                    self._global_root = other_global_root
+                else:
+                    self._merge_node(self._global_root, other_global_root)
             self._total_insertions += other_insertions
 
     # ----------------------------------------------------------------
@@ -283,12 +276,17 @@ class CausalPrefixTree:
         """Save the current state."""
         with self._lock:
             data = {
-                "version": 1,
+                "version": 2,
                 "total_insertions": self._total_insertions,
                 "roots": {
                     prompt_id: root.to_dict()
                     for prompt_id, root in self._roots.items()
                 },
+                "global_root": (
+                    self._global_root.to_dict()
+                    if self._global_root is not None
+                    else None
+                ),
             }
         parent = os.path.dirname(os.path.abspath(path))
         if parent:
@@ -308,9 +306,18 @@ class CausalPrefixTree:
 
         with self._lock:
             self._roots.clear()
+            self._global_root = None
             self._total_insertions = data.get("total_insertions", 0)
             for prompt_id, root_d in data.get("roots", {}).items():
                 self._roots[prompt_id] = PrefixTreeNode.from_dict(root_d)
+            global_root_d = data.get("global_root")
+            if global_root_d is not None:
+                self._global_root = PrefixTreeNode.from_dict(global_root_d)
+            elif self._roots:
+                # Version-1 checkpoints had only prompt-specific roots.
+                self._global_root = PrefixTreeNode(key="__global__:root", depth=0)
+                for root in self._roots.values():
+                    self._merge_node(self._global_root, root)
 
         logger.info(
             f"[CausalPrefixTree] Loaded from {path}: "
@@ -328,6 +335,42 @@ class CausalPrefixTree:
             return f"{prompt_id}:root"
         state_keys = ",".join(s.to_key() for s in return_states)
         return f"{prompt_id}:[{state_keys}]"
+
+    @staticmethod
+    def _lookup_from_root(
+        root: PrefixTreeNode | None, return_states: list[ToolReturnState]
+    ) -> Optional[PrefixTreeNode]:
+        if root is None:
+            return None
+        current = root
+        for state in return_states:
+            child = current.children.get(state.to_key())
+            if child is None:
+                break
+            current = child
+        return current
+
+    def _insert_into_root(
+        self, root: PrefixTreeNode, trajectory: Trajectory, key_prefix: str
+    ) -> None:
+        remaining_lengths = trajectory.total_remaining_lengths
+        if trajectory.total_length is not None:
+            root.update_statistics(trajectory.total_length)
+        elif remaining_lengths:
+            root.update_statistics(remaining_lengths[0])
+
+        current = root
+        for i, state in enumerate(trajectory.return_states):
+            state_key = state.to_key()
+            child = current.children.get(state_key)
+            if child is None:
+                child = PrefixTreeNode(
+                    key=self._make_key(key_prefix, trajectory.return_states[: i + 1]),
+                    depth=current.depth + 1,
+                )
+                current.children[state_key] = child
+            child.update_statistics(remaining_lengths[i])
+            current = child
 
     @classmethod
     def _merge_node(cls, target: PrefixTreeNode, source: PrefixTreeNode) -> None:

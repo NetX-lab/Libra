@@ -88,17 +88,34 @@ def test_preflight_applies_best_candidate_and_writes_config(tmp_path: Path):
     assert json.loads(out_json.read_text(encoding="utf-8"))["applied"] is True
 
 
-def test_preflight_can_measure_without_changing_physical_topology(tmp_path: Path):
+def test_grp_startup_ignores_legacy_fixed_train_split(tmp_path: Path):
     cfg = _config(tmp_path)
-    result = PreflightPlanner(cfg, apply_plan=False).run(
+    cfg.global_resource_planner.initial_allocation_strategy = "grp"
+    cfg.global_resource_planner.fixed_train_gpus = 3
+
+    result = PreflightPlanner(cfg).run(
         synthetic_history(num_requests=8, input_len=128, output_len=1024)
     )
 
+    assert result.applied
+    assert result.planned_config.train_gpus != 3
+    assert result.planned_config.train_gpus + result.planned_config.rollout_gpus == 4
+    assert result.metadata["initial_allocation_strategy"] == "grp"
+
+
+def test_preflight_still_plans_when_runtime_replanning_is_disabled(tmp_path: Path):
+    cfg = _config(tmp_path)
+    cfg.global_resource_planner.initial_allocation_strategy = "grp"
+    cfg.global_resource_planner.runtime_online_replanning = False
+    preflight = PreflightPlanner(cfg)
+
+    result = preflight.run(
+        synthetic_history(num_requests=8, input_len=128, output_len=1024)
+    )
+
+    assert result.applied
     assert result.decision.candidate_plan is not None
-    assert result.applied is False
-    assert result.applied_plan is None
-    assert result.planned_config.train_gpus == cfg.train_gpus
-    assert result.planned_config.rollout_gpus == cfg.rollout_gpus
+    assert preflight.planner.online_replanning is False
 
 
 def test_history_jsonl_loader(tmp_path: Path):

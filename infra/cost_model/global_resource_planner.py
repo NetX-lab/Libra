@@ -59,6 +59,7 @@ class GlobalResourcePlan:
                 "tp": self.train_config.tp,
                 "pp": self.train_config.pp,
                 "dp": self.train_config.dp,
+                "cp": self.train_config.cp,
                 "b_micro": self.train_config.b_micro,
                 "n_gpus": self.train_gpus,
             },
@@ -113,6 +114,66 @@ class RuntimeResourceMetrics:
 
 
 @dataclass
+class ElasticHybridSignal:
+    """Versioned GRP command for the Elastic Hybrid Pool.
+
+    The historical ``*_workers`` names are kept on the wire for compatibility,
+    but every count is a *complete DP replica*, never an individual GPU/rank.
+    ``max_workers`` is the instantaneous physical capacity, not a configured
+    EHP limit.
+    """
+
+    step: int
+    desired_workers: int
+    current_workers: int
+    max_workers: int
+    action: str
+    reason: str
+    train_rollout_ratio: float
+    rollout_pressure: float
+    ttl_steps: int
+    active_workers: int = 0
+    joining_workers: int = 0
+    replica_size_gpus: int = 1
+
+    @property
+    def desired_replicas(self) -> int:
+        return self.desired_workers
+
+    @property
+    def current_replicas(self) -> int:
+        return self.current_workers
+
+    @property
+    def capacity_replicas(self) -> int:
+        return self.max_workers
+
+    @property
+    def should_adjust(self) -> bool:
+        return self.desired_workers != self.current_workers
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "step": self.step,
+            "desired_workers": self.desired_workers,
+            "current_workers": self.current_workers,
+            "max_workers": self.max_workers,
+            "action": self.action,
+            "reason": self.reason,
+            "train_rollout_ratio": self.train_rollout_ratio,
+            "rollout_pressure": self.rollout_pressure,
+            "ttl_steps": self.ttl_steps,
+            "expires_step": self.step + self.ttl_steps,
+            "active_workers": self.active_workers,
+            "joining_workers": self.joining_workers,
+            "desired_replicas": self.desired_replicas,
+            "current_replicas": self.current_replicas,
+            "capacity_replicas": self.capacity_replicas,
+            "replica_size_gpus": self.replica_size_gpus,
+        }
+
+
+@dataclass
 class PlannerDecision:
     """Planner output for one invocation."""
 
@@ -125,6 +186,7 @@ class PlannerDecision:
     num_requests: int = 0
     trigger: str = ""
     runtime_metrics: RuntimeResourceMetrics | None = None
+    elastic_hybrid_signal: ElasticHybridSignal | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -141,6 +203,11 @@ class PlannerDecision:
             ),
             "candidate_plan": (
                 self.candidate_plan.to_dict() if self.candidate_plan else None
+            ),
+            "elastic_hybrid_signal": (
+                self.elastic_hybrid_signal.to_dict()
+                if self.elastic_hybrid_signal
+                else None
             ),
         }
 
@@ -167,6 +234,10 @@ class GlobalResourcePlanner:
         allowed_train_tp: list[int] | None = None,
         allowed_train_pp: list[int] | None = None,
         fixed_train_gpus: int = 0,
+        initial_allocation_strategy: str = "grp",
+        allocation_granularity_gpus: int = 1,
+        min_train_gpus: int = 1,
+        min_rollout_gpus: int = 1,
         micro_batch_sizes: list[int] | None = None,
         max_history_size: int = 4096,
         online_replanning: bool = True,
@@ -175,6 +246,12 @@ class GlobalResourcePlanner:
         active_rollout_pressure_threshold: float = 0.85,
         rejected_rollout_delta_threshold: int = 8,
         rollout_train_imbalance_threshold: float = 1.25,
+        elastic_hybrid_planning_enabled: bool = False,
+        elastic_hybrid_max_workers: int = 0,
+        elastic_hybrid_borrow_train_rollout_ratio: float = 1.15,
+        elastic_hybrid_release_train_rollout_ratio: float = 0.90,
+        elastic_hybrid_max_rollout_pressure: float = 0.80,
+        elastic_hybrid_signal_ttl_steps: int = 20,
         verbose: bool = False,
     ):
         self.evaluator = evaluator
@@ -189,6 +266,12 @@ class GlobalResourcePlanner:
         self.allowed_train_tp = allowed_train_tp
         self.allowed_train_pp = allowed_train_pp
         self.fixed_train_gpus = int(fixed_train_gpus or 0)
+        self.initial_allocation_strategy = str(initial_allocation_strategy or "grp")
+        if self.initial_allocation_strategy not in {"grp", "configured"}:
+            raise ValueError("initial_allocation_strategy must be 'grp' or 'configured'")
+        self.allocation_granularity_gpus = max(1, int(allocation_granularity_gpus))
+        self.min_train_gpus = max(1, int(min_train_gpus))
+        self.min_rollout_gpus = max(1, int(min_rollout_gpus))
         self.micro_batch_sizes = micro_batch_sizes
         self.max_history_size = max(1, int(max_history_size))
         self.online_replanning = bool(online_replanning)
@@ -202,6 +285,29 @@ class GlobalResourcePlanner:
         )
         self.rollout_train_imbalance_threshold = max(
             0.0, float(rollout_train_imbalance_threshold)
+        )
+        self.elastic_hybrid_planning_enabled = bool(
+            elastic_hybrid_planning_enabled
+        )
+        self.elastic_hybrid_max_workers = max(0, int(elastic_hybrid_max_workers))
+        self.elastic_hybrid_borrow_train_rollout_ratio = max(
+            0.0, float(elastic_hybrid_borrow_train_rollout_ratio)
+        )
+        self.elastic_hybrid_release_train_rollout_ratio = max(
+            0.0, float(elastic_hybrid_release_train_rollout_ratio)
+        )
+        if (
+            self.elastic_hybrid_release_train_rollout_ratio
+            > self.elastic_hybrid_borrow_train_rollout_ratio
+        ):
+            raise ValueError(
+                "elastic hybrid release ratio cannot exceed borrow ratio"
+            )
+        self.elastic_hybrid_max_rollout_pressure = max(
+            0.0, float(elastic_hybrid_max_rollout_pressure)
+        )
+        self.elastic_hybrid_signal_ttl_steps = max(
+            1, int(elastic_hybrid_signal_ttl_steps)
         )
         self.verbose = verbose
 
@@ -235,6 +341,14 @@ class GlobalResourcePlanner:
             allowed_train_tp=planner_cfg.allowed_train_tp or None,
             allowed_train_pp=planner_cfg.allowed_train_pp or None,
             fixed_train_gpus=planner_cfg.fixed_train_gpus,
+            initial_allocation_strategy=getattr(
+                planner_cfg, "initial_allocation_strategy", "grp"
+            ),
+            allocation_granularity_gpus=getattr(
+                planner_cfg, "allocation_granularity_gpus", 1
+            ),
+            min_train_gpus=getattr(planner_cfg, "min_train_gpus", 1),
+            min_rollout_gpus=getattr(planner_cfg, "min_rollout_gpus", 1),
             micro_batch_sizes=planner_cfg.micro_batch_sizes or None,
             max_history_size=planner_cfg.max_history_size,
             online_replanning=getattr(planner_cfg, "runtime_online_replanning", True),
@@ -252,6 +366,24 @@ class GlobalResourcePlanner:
             ),
             rollout_train_imbalance_threshold=getattr(
                 planner_cfg, "runtime_rollout_train_imbalance_threshold", 1.25
+            ),
+            elastic_hybrid_planning_enabled=getattr(
+                planner_cfg, "elastic_hybrid_planning_enabled", False
+            ),
+            elastic_hybrid_max_workers=getattr(
+                planner_cfg, "elastic_hybrid_max_workers", 0
+            ),
+            elastic_hybrid_borrow_train_rollout_ratio=getattr(
+                planner_cfg, "elastic_hybrid_borrow_train_rollout_ratio", 1.15
+            ),
+            elastic_hybrid_release_train_rollout_ratio=getattr(
+                planner_cfg, "elastic_hybrid_release_train_rollout_ratio", 0.90
+            ),
+            elastic_hybrid_max_rollout_pressure=getattr(
+                planner_cfg, "elastic_hybrid_max_rollout_pressure", 0.80
+            ),
+            elastic_hybrid_signal_ttl_steps=getattr(
+                planner_cfg, "elastic_hybrid_signal_ttl_steps", 20
             ),
             verbose=planner_cfg.verbose,
         )
@@ -274,6 +406,26 @@ class GlobalResourcePlanner:
 
     def observe_batch(self, batch: list[Any]) -> int:
         requests = self._extract_requests(batch)
+        if not requests:
+            return 0
+        self._history.extend(requests)
+        if len(self._history) > self.max_history_size:
+            self._history = self._history[-self.max_history_size :]
+        return len(requests)
+
+    def replace_history(self, history: list[Any]) -> int:
+        """Replace the in-memory request history with a fresh profile window."""
+
+        requests = self._extract_requests(history)
+        if len(requests) > self.max_history_size:
+            requests = requests[-self.max_history_size :]
+        self._history = requests
+        return len(requests)
+
+    def extend_history(self, history: list[Any]) -> int:
+        """Append a fresh batch of request history entries."""
+
+        requests = self._extract_requests(history)
         if not requests:
             return 0
         self._history.extend(requests)
@@ -401,27 +553,23 @@ class GlobalResourcePlanner:
             allowed_train_tp=self.allowed_train_tp,
             allowed_train_pp=self.allowed_train_pp,
             micro_batch_sizes=self.micro_batch_sizes,
-            fixed_train_gpus=self.fixed_train_gpus,
+            fixed_train_gpus=(
+                0
+                if self.initial_allocation_strategy == "grp"
+                else self.fixed_train_gpus
+            ),
+            allocation_granularity_gpus=self.allocation_granularity_gpus,
+            min_train_gpus=self.min_train_gpus,
+            min_rollout_gpus=self.min_rollout_gpus,
+            rollout_node_tp_pattern=list(
+                getattr(config.global_resource_planner, "rollout_node_tp_pattern", [])
+                or []
+            ),
+            train_cp_size=max(1, int(getattr(config, "train_cp_size", 1) or 1)),
+            dp_batch_group_size=max(1, int(getattr(config, "n_samples", 1) or 1)),
         )
         candidate = self._plan_from_result(result, config)
-        # Forced runtime plans are an explicit control-plane request.  They
-        # must still be evaluated when the analytic optimizer prunes every
-        # training configuration (for example, a long-context MoE model can
-        # make the optimizer's conservative memory check return no candidate).
-        # Previously this early return made GRP_FORCE_* a no-op in exactly that
-        # situation and hid the real runtime reconfiguration path.
-        forced_rollout_tp = self._forced_rollout_tp_list(config)
-        forced_train = self._forced_train_config(
-            config,
-            current,
-            rollout_gpus=(
-                sum(forced_rollout_tp)
-                if forced_rollout_tp is not None
-                else int(getattr(config, "rollout_gpus", 0) or 0)
-            ),
-        )
-        forced_candidate = forced_rollout_tp is not None or forced_train is not None
-        if candidate is None and not forced_candidate:
+        if candidate is None:
             self._mark_rejected_trigger_observed(trigger, runtime_metrics)
             return self._remember(
                 PlannerDecision(
@@ -436,6 +584,17 @@ class GlobalResourcePlanner:
                 )
             )
 
+        forced_rollout_tp = self._forced_rollout_tp_list(config)
+        forced_train = self._forced_train_config(
+            config,
+            current,
+            rollout_gpus=(
+                sum(forced_rollout_tp)
+                if forced_rollout_tp is not None
+                else int(getattr(config, "rollout_gpus", 0) or 0)
+            ),
+        )
+        forced_candidate = forced_rollout_tp is not None or forced_train is not None
         if forced_rollout_tp is not None:
             forced_rollout = RolloutClusterConfig(tp_list=forced_rollout_tp)
             forced_rollout_time, forced_rollout_details = self.evaluator.evaluate_rollout(
@@ -506,14 +665,20 @@ class GlobalResourcePlanner:
         candidate.reconfiguration_cost_s = self.reconfiguration_cost_s
 
         same_plan = self._same_plan(current, candidate)
-        force_runtime_reconfigure = bool(
-            getattr(
-                config.global_resource_planner,
-                "runtime_force_reconfigure",
-                False,
-            )
-        ) or os.environ.get("GRP_FORCE_RUNTIME_RECONFIGURE", "0") == "1"
-        should = (
+        elastic_signal = self._build_elastic_hybrid_signal(
+            step=step,
+            config=config,
+            current=current,
+            candidate=candidate,
+            runtime_metrics=runtime_metrics,
+        )
+        elastic_adjust = bool(
+            elastic_signal is not None and elastic_signal.should_adjust
+        )
+        force_runtime_reconfigure = (
+            os.environ.get("GRP_FORCE_RUNTIME_RECONFIGURE", "0") == "1"
+        )
+        resource_should = (
             (not same_plan or force_runtime_reconfigure)
             and (
                 forced_candidate
@@ -521,7 +686,11 @@ class GlobalResourcePlanner:
                 or (net_gain > 0.0 and gain_ratio >= self.min_gain_ratio)
             )
         )
+        should = resource_should or elastic_adjust
         reason = (
+            "elastic_hybrid_adjustment"
+            if elastic_adjust
+            else
             "forced_reconfigure"
             if should and forced_candidate
             else "forced_runtime_reconfigure"
@@ -543,6 +712,7 @@ class GlobalResourcePlanner:
             num_requests=len(self._history),
             trigger=trigger,
             runtime_metrics=runtime_metrics,
+            elastic_hybrid_signal=elastic_signal,
         )
         if should:
             self._active_plan = candidate
@@ -551,6 +721,139 @@ class GlobalResourcePlanner:
             self._active_plan = current
         self._mark_rejected_trigger_observed(trigger, runtime_metrics)
         return self._remember(decision)
+
+    def _build_elastic_hybrid_signal(
+        self,
+        *,
+        step: int,
+        config: AsyncRLConfig,
+        current: GlobalResourcePlan,
+        candidate: GlobalResourcePlan,
+        runtime_metrics: RuntimeResourceMetrics | None,
+    ) -> ElasticHybridSignal | None:
+        if not self.elastic_hybrid_planning_enabled:
+            return None
+
+        planner_cfg = config.global_resource_planner
+        replica_size = int(
+            getattr(planner_cfg, "elastic_hybrid_replica_size_gpus", 0) or 0
+        )
+        topology_width = (
+            max(1, int(getattr(config, "train_tp_size", 1) or 1))
+            * max(1, int(getattr(config, "train_pp_size", 1) or 1))
+            * max(1, int(getattr(config, "train_cp_size", 1) or 1))
+        )
+        if replica_size > 0 and replica_size != topology_width:
+            raise ValueError(
+                "elastic_hybrid_replica_size_gpus must equal one complete DP "
+                f"Replica ({topology_width}); got {replica_size}"
+            )
+        if replica_size <= 0:
+            replica_size = topology_width
+        min_rollout_gpus = max(
+            0,
+            int(getattr(planner_cfg, "elastic_hybrid_min_rollout_gpus", 0) or 0),
+        )
+        capacity_replicas = max(
+            0,
+            (int(config.rollout_gpus) - min_rollout_gpus) // replica_size,
+        )
+        raw_step_stats = (
+            runtime_metrics.raw.get("step_stats", {})
+            if runtime_metrics is not None
+            else {}
+        )
+        active_workers = max(
+            0,
+            int(
+                raw_step_stats.get(
+                    "active_hybrid_replicas",
+                    raw_step_stats.get("active_hybrid_workers", 0),
+                )
+                or 0
+            ),
+        )
+        joining_workers = max(
+            int(
+                raw_step_stats.get(
+                    "joining_hybrid_replicas",
+                    raw_step_stats.get("joining_hybrid_workers", 0),
+                )
+                or 0
+            ),
+            int(
+                raw_step_stats.get(
+                    "pending_hybrid_replica_joins",
+                    raw_step_stats.get("pending_hybrid_joins", 0),
+                )
+                or 0
+            ),
+            0,
+        )
+        # A worker in ACTIVATING/JOINING already consumes rollout capacity.  It
+        # must therefore count as allocated so a GRP release signal can cancel
+        # an in-flight non-blocking join immediately.
+        current_workers = active_workers + joining_workers
+
+        train_time = (
+            float(runtime_metrics.train_time_s)
+            if runtime_metrics is not None and runtime_metrics.train_time_s > 0
+            else float(candidate.t_train or current.t_train)
+        )
+        rollout_time = (
+            float(runtime_metrics.rollout_time_s)
+            if runtime_metrics is not None and runtime_metrics.rollout_time_s > 0
+            else float(candidate.t_rollout or current.t_rollout)
+        )
+        train_rollout_ratio = train_time / max(rollout_time, 1e-6)
+        rollout_pressure = (
+            max(runtime_metrics.queue_pressure, runtime_metrics.active_rollout_pressure)
+            if runtime_metrics is not None
+            else 0.0
+        )
+
+        planned_extra = max(
+            0,
+            (int(candidate.train_gpus) - int(config.train_gpus)) // replica_size,
+        )
+        if capacity_replicas <= 0:
+            desired = 0
+            reason = "no_complete_replica_capacity"
+        elif rollout_pressure >= self.elastic_hybrid_max_rollout_pressure:
+            desired = 0
+            reason = "protect_rollout_capacity"
+        elif planned_extra > 0:
+            desired = min(capacity_replicas, planned_extra)
+            reason = "candidate_requests_more_training_capacity"
+        elif train_rollout_ratio >= self.elastic_hybrid_borrow_train_rollout_ratio:
+            desired = capacity_replicas
+            reason = "training_bottleneck"
+        elif train_rollout_ratio <= self.elastic_hybrid_release_train_rollout_ratio:
+            desired = 0
+            reason = "rollout_bottleneck"
+        else:
+            desired = current_workers
+            reason = "hysteresis_hold"
+
+        action = (
+            "join" if desired > current_workers
+            else "release" if desired < current_workers
+            else "hold"
+        )
+        return ElasticHybridSignal(
+            step=int(step),
+            desired_workers=int(desired),
+            current_workers=int(current_workers),
+            max_workers=int(capacity_replicas),
+            action=action,
+            reason=reason,
+            train_rollout_ratio=float(train_rollout_ratio),
+            rollout_pressure=float(rollout_pressure),
+            ttl_steps=int(self.elastic_hybrid_signal_ttl_steps),
+            active_workers=int(active_workers),
+            joining_workers=int(joining_workers),
+            replica_size_gpus=int(replica_size),
+        )
 
     def _mark_rejected_trigger_observed(
         self,
@@ -561,47 +864,24 @@ class GlobalResourcePlanner:
             self._last_rejected_rollouts = runtime_metrics.rejected_rollouts
 
     def _forced_rollout_tp_list(self, config: AsyncRLConfig) -> list[int] | None:
-        configured = list(
-            getattr(
-                config.global_resource_planner,
-                "runtime_forced_rollout_tp_list",
-                [],
-            )
-            or []
-        )
         raw = os.environ.get("GRP_FORCE_ROLLOUT_TP_LIST", "").strip()
-        if configured:
-            tp_list = [int(item) for item in configured]
-        elif raw:
-            try:
-                tp_list = [
-                    int(item.strip())
-                    for item in re.split(r"[,;:]", raw)
-                    if item.strip()
-                ]
-            except ValueError as exc:
-                raise ValueError(
-                    f"Invalid GRP_FORCE_ROLLOUT_TP_LIST={raw!r}"
-                ) from exc
-        else:
+        if not raw:
             return None
+        try:
+            tp_list = [
+                int(item.strip())
+                for item in re.split(r"[,;:]", raw)
+                if item.strip()
+            ]
+        except ValueError as exc:
+            raise ValueError(f"Invalid GRP_FORCE_ROLLOUT_TP_LIST={raw!r}") from exc
         if not tp_list:
             return None
         if any(tp <= 0 for tp in tp_list):
             raise ValueError(f"GRP_FORCE_ROLLOUT_TP_LIST must be positive: {tp_list}")
-        forced_train = int(
-            getattr(
-                config.global_resource_planner,
-                "runtime_forced_train_gpus",
-                0,
-            )
-            or 0
-        )
         forced_train_raw = os.environ.get("GRP_FORCE_TRAIN_GPUS", "").strip()
         rollout_gpus = int(getattr(config, "rollout_gpus", 0) or sum(tp_list))
-        if forced_train > 0:
-            rollout_gpus = int(self.n_total_gpus) - forced_train
-        elif forced_train_raw:
+        if forced_train_raw:
             try:
                 forced_train_gpus = int(forced_train_raw)
             except ValueError as exc:
@@ -623,24 +903,13 @@ class GlobalResourcePlanner:
         *,
         rollout_gpus: int,
     ) -> TrainParallelConfig | None:
-        configured = int(
-            getattr(
-                config.global_resource_planner,
-                "runtime_forced_train_gpus",
-                0,
-            )
-            or 0
-        )
         raw = os.environ.get("GRP_FORCE_TRAIN_GPUS", "").strip()
-        if configured > 0:
-            train_gpus = configured
-        elif raw:
-            try:
-                train_gpus = int(raw)
-            except ValueError as exc:
-                raise ValueError(f"Invalid GRP_FORCE_TRAIN_GPUS={raw!r}") from exc
-        else:
+        if not raw:
             return None
+        try:
+            train_gpus = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"Invalid GRP_FORCE_TRAIN_GPUS={raw!r}") from exc
         if train_gpus <= 0:
             raise ValueError(f"GRP_FORCE_TRAIN_GPUS must be positive: {train_gpus}")
         if train_gpus + rollout_gpus > self.n_total_gpus:
@@ -650,15 +919,17 @@ class GlobalResourcePlanner:
             )
         tp = int(current.train_config.tp)
         pp = int(current.train_config.pp)
-        model_parallel = max(1, tp * pp)
+        cp = max(1, int(getattr(config, "train_cp_size", 1) or 1))
+        model_parallel = max(1, tp * pp * cp)
         if train_gpus % model_parallel != 0:
             raise ValueError(
-                "GRP_FORCE_TRAIN_GPUS must be divisible by train TP*PP="
+                "GRP_FORCE_TRAIN_GPUS must be divisible by train TP*PP*CP="
                 f"{model_parallel}, got {train_gpus}"
             )
         return TrainParallelConfig(
             tp=tp,
             pp=pp,
+            cp=cp,
             dp=train_gpus // model_parallel,
             b_micro=int(current.train_config.b_micro),
             zero_level=int(current.train_config.zero_level),
@@ -669,11 +940,17 @@ class GlobalResourcePlanner:
         step: int,
         metrics: RuntimeResourceMetrics | None,
     ) -> str:
+        # Startup planning is handled explicitly by PreflightPlanner. Once the
+        # job is running, disabling online replanning must also disable the
+        # periodic interval trigger; otherwise a nominally fixed control arm
+        # can still receive runtime resource decisions every plan_interval.
+        if not self.online_replanning:
+            return "interval_skip"
         if step - self._last_replan_step < self.replan_cooldown_steps:
             return "cooldown"
         if step % self.plan_interval == 0:
             return "interval"
-        if not self.online_replanning or metrics is None:
+        if metrics is None:
             return "interval_skip"
 
         if metrics.queue_pressure >= self.queue_pressure_threshold:
@@ -704,6 +981,7 @@ class GlobalResourcePlanner:
         config.train_tp_size = plan.train_config.tp
         config.tp_size = plan.train_config.tp
         config.train_pp_size = plan.train_config.pp
+        config.train_cp_size = plan.train_config.cp
         config.train_dp_size = plan.train_config.dp
         config.micro_batch_size = plan.train_config.b_micro
         config.max_concurrent_rollouts = plan.max_concurrent_rollouts
@@ -779,16 +1057,8 @@ class GlobalResourcePlanner:
                 allocated = gpus[:tp]
                 pools[idx] = (host, gpus[tp:])
                 return host, allocated
-        capacity = sum(len(gpus) for _, gpus in pools)
-        layout = ", ".join(
-            f"{host}:{gpus}" for host, gpus in pools
-        ) or "no rollout slots"
-        raise ValueError(
-            "insufficient physical rollout slots for TP="
-            f"{tp}: remaining_capacity={capacity}, pools={layout}. "
-            "A cluster swap that increases rollout GPUs requires an elastic "
-            "training launcher to release the corresponding training ranks first."
-        )
+        host = pools[0][0] if pools else ""
+        return host, list(range(tp))
 
     def _remember(self, decision: PlannerDecision) -> PlannerDecision:
         self._last_decision = decision
@@ -824,6 +1094,7 @@ class GlobalResourcePlanner:
             tp=config.train_tp_size,
             pp=config.train_pp_size,
             dp=config.train_dp_size,
+            cp=config.train_cp_size,
             b_micro=config.micro_batch_size,
         )
         rollout_tp = list(config.heterogeneous_rollout.tp_list)
@@ -887,6 +1158,7 @@ class GlobalResourcePlanner:
             a.train_config.tp == b.train_config.tp
             and a.train_config.pp == b.train_config.pp
             and a.train_config.dp == b.train_config.dp
+            and a.train_config.cp == b.train_config.cp
             and a.train_config.b_micro == b.train_config.b_micro
             and sorted(a.rollout_tp_list) == sorted(b.rollout_tp_list)
         )

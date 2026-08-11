@@ -1,5 +1,7 @@
 """Support code for Optimizer."""
 
+from __future__ import annotations
+
 import logging
 import time
 from dataclasses import dataclass, field
@@ -190,6 +192,12 @@ class TwoLevelNestedOptimizer:
         allowed_train_pp: list[int] | None = None,
         micro_batch_sizes: list[int] | None = None,
         fixed_train_gpus: int = 0,
+        allocation_granularity_gpus: int = 1,
+        min_train_gpus: int = 1,
+        min_rollout_gpus: int = 1,
+        rollout_node_tp_pattern: list[int] | None = None,
+        train_cp_size: int = 1,
+        dp_batch_group_size: int = 1,
     ) -> OptimizationResult:
         """Optimize."""
         start_time = time.perf_counter()
@@ -215,6 +223,18 @@ class TwoLevelNestedOptimizer:
             allowed_pp=allowed_train_pp,
             micro_batch_sizes=micro_batch_sizes,
         )
+        cp_size = max(1, int(train_cp_size))
+        for train_config in train_configs:
+            train_config.cp = cp_size
+        granularity = max(1, int(allocation_granularity_gpus))
+        min_train = max(1, int(min_train_gpus))
+        min_rollout = max(1, int(min_rollout_gpus))
+        train_configs = [
+            tc for tc in train_configs
+            if tc.n_gpus >= min_train
+            and tc.n_gpus % granularity == 0
+            and n_total_gpus - tc.n_gpus >= min_rollout
+        ]
         if fixed_train_gpus > 0:
             train_configs = [
                 tc for tc in train_configs
@@ -226,6 +246,15 @@ class TwoLevelNestedOptimizer:
 
         for tc in train_configs:
             result.n_configs_explored += 1
+
+            # A startup plan must be loadable as a real training topology, not
+            # merely cheap in the simulator. Keep global/micro batches and
+            # grouped GRPO samples integral on every DP replica.
+            if B_global % max(1, tc.dp * tc.b_micro) != 0:
+                continue
+            local_batch = B_global // tc.dp
+            if local_batch % max(1, int(dp_batch_group_size)) != 0:
+                continue
 
 
             if self.cost_model.check_train_oom(tc, B_global, L_avg):
@@ -245,11 +274,27 @@ class TwoLevelNestedOptimizer:
             if n_rollout_gpus <= 0:
                 continue
 
-            rollout_configs = generate_rollout_configs(
-                n_gpus=n_rollout_gpus,
-                allowed_tp_sizes=self.allowed_rollout_tp,
-                max_instances=self.max_rollout_instances,
-            )
+            pattern = [int(tp) for tp in (rollout_node_tp_pattern or [])]
+            if pattern:
+                pattern_gpus = sum(pattern)
+                if n_rollout_gpus % pattern_gpus:
+                    rollout_configs = []
+                else:
+                    # The deployment template is already a complete feasible
+                    # layout, so construct it directly instead of enumerating
+                    # an exponential number of integer partitions on large
+                    # (for example 20-node) clusters.
+                    rollout_configs = [
+                        RolloutClusterConfig(
+                            tp_list=pattern * (n_rollout_gpus // pattern_gpus)
+                        )
+                    ]
+            else:
+                rollout_configs = generate_rollout_configs(
+                    n_gpus=n_rollout_gpus,
+                    allowed_tp_sizes=self.allowed_rollout_tp,
+                    max_instances=self.max_rollout_instances,
+                )
             if self.require_heterogeneous_rollout_tp:
                 rollout_configs = [
                     rc for rc in rollout_configs
@@ -274,7 +319,13 @@ class TwoLevelNestedOptimizer:
 
             if self.verbose:
                 result.all_evaluated.append({
-                    "train": {"tp": tc.tp, "pp": tc.pp, "dp": tc.dp, "b_micro": tc.b_micro},
+                    "train": {
+                        "tp": tc.tp,
+                        "pp": tc.pp,
+                        "cp": tc.cp,
+                        "dp": tc.dp,
+                        "b_micro": tc.b_micro,
+                    },
                     "rollout": best_rc_for_tc.tp_list if best_rc_for_tc else [],
                     "t_train": t_train,
                     "t_rollout": min_t_rollout,

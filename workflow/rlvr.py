@@ -31,8 +31,14 @@ class RLVRWorkflow:
         engine: Any,  # VLLMRolloutEngine
         data: dict[str, Any],
         version: int = 0,
+        rollout_index: int = 0,
     ) -> dict[str, torch.Tensor]:
-        """Run episode."""
+        """Run one rollout episode.
+
+        ``AsyncRLTrainer`` supplies ``rollout_index`` for GRPO grouping.  The
+        math workflow does not otherwise need it, but accepting it keeps this
+        workflow compatible with the common asynchronous rollout interface.
+        """
 
         question = data.get("question", "")
 
@@ -94,6 +100,7 @@ class RLVRWorkflow:
             "versions": torch.tensor([version], dtype=torch.long),
             "input_len": input_len,
             "output_len": output_len,
+            "rollout_index": rollout_index,
         }
 
         return trajectory
@@ -109,8 +116,10 @@ class RLVRWorkflow:
 
 
         tasks = [
-            self.run_episode(engine, data, version=version)
-            for data in batch_data
+            self.run_episode(
+                engine, data, version=version, rollout_index=rollout_index
+            )
+            for rollout_index, data in enumerate(batch_data)
         ]
 
         trajectories = await asyncio.gather(*tasks, return_exceptions=True)

@@ -1,5 +1,7 @@
 """Support code for Async runner."""
 
+from __future__ import annotations
+
 import asyncio
 import queue
 import threading

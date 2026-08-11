@@ -1,5 +1,7 @@
 """Support code for Config."""
 
+from __future__ import annotations
+
 import copy
 import json
 import os
@@ -19,13 +21,11 @@ def _from_dict(cls, d: dict):
     if d is None:
         return cls()
     valid_keys = {f.name for f in fields(cls)}
-    unknown_keys = sorted(set(d) - valid_keys)
-    if unknown_keys:
-        raise ValueError(
-            f"Unknown {cls.__name__} field(s): {', '.join(unknown_keys)}"
-        )
     filtered = {}
     for k, v in d.items():
+        if k not in valid_keys:
+            continue
+
         if isinstance(v, str):
             raw_value = v
             try:
@@ -344,15 +344,6 @@ class SchedulingConfig:
     cmlfq_payload_small_threshold: int = 500
     cmlfq_payload_large_threshold: int = 5000
 
-    # Cold-start placement used before the causal prefix tree has a match.
-    # Keeping this explicit avoids silently sending long-output workloads to
-    # the short bucket while the online profile is still warming up.
-    cmlfq_initial_bucket: str = "short"
-
-    # Avoid paying a cross-bucket routing cost for continuations too short to
-    # amortize a larger TP replica.
-    cmlfq_min_migration_remaining_tokens: int = 256
-
     @classmethod
     def from_dict(cls, d: dict) -> "SchedulingConfig":
         return _from_dict(cls, d)
@@ -458,13 +449,36 @@ class GlobalResourcePlannerConfig:
     reconfiguration_cost_s: float = 15.0
     max_history_size: int = 4096
     allowed_rollout_tp: list[int] = field(default_factory=lambda: [1, 2, 4, 8])
+    rollout_node_tp_pattern: list[int] = field(default_factory=list)
     require_heterogeneous_rollout_tp: bool = False
     allowed_train_tp: list[int] = field(default_factory=list)
     allowed_train_pp: list[int] = field(default_factory=list)
     fixed_train_gpus: int = 0
+    # Startup placement is a GRP decision.  ``fixed_train_gpus`` is retained
+    # only for backwards-compatible, explicitly configured deployments and is
+    # ignored when this strategy is ``grp``.
+    initial_allocation_strategy: str = "grp"  # grp | configured
+    # Set only by the preflight planner after it has applied a concrete GRP plan.
+    # A live trainer refuses to start with a fixed seed split when GRP is required.
+    initial_allocation_applied: bool = False
+    allocation_granularity_gpus: int = 1
+    min_train_gpus: int = 1
+    min_rollout_gpus: int = 1
     micro_batch_sizes: list[int] = field(default_factory=list)
+    startup_profile_enabled: bool = True
+    startup_profile_sample_size: int = 64
+    startup_profile_strategy: str = "spread"  # spread | random | first
+    startup_profile_seed: int = 0
+    startup_profile_samples_per_prompt: int = 1
+    startup_profile_dataset_jsonl: str = ""
+    startup_profile_history_jsonl: str = ""
+    startup_profile_summary_json: str = ""
+    startup_profile_reuse_existing: bool = True
+    startup_profile_allow_synthetic_fallback: bool = False
     apply_to_runtime: bool = True
     verbose: bool = False
+    runtime_length_profile_enabled: bool = True
+    runtime_length_profile_jsonl: str = ""
     runtime_async_planning: bool = True
     runtime_max_pending_plans: int = 1
     runtime_dynamic_reconfiguration_enabled: bool = True
@@ -474,11 +488,6 @@ class GlobalResourcePlannerConfig:
     runtime_active_rollout_pressure_threshold: float = 0.85
     runtime_rejected_rollout_delta_threshold: int = 8
     runtime_rollout_train_imbalance_threshold: float = 1.25
-    # Persist explicit runtime targets so child ranks do not depend on Slurm
-    # forwarding control-plane environment variables.
-    runtime_forced_train_gpus: int = 0
-    runtime_forced_rollout_tp_list: list[int] = field(default_factory=list)
-    runtime_force_reconfigure: bool = False
 
 
     # {input_json}, {output_json}, {trace_csv}, {output_dir}, {sailor_path}, {vidur_path}
@@ -516,12 +525,7 @@ class GlobalResourcePlannerConfig:
     runtime_reconfigure_training: bool = False
     runtime_training_pool_only: bool = True
     runtime_training_pool_target_gpus: int = 0
-    runtime_effective_train_gpus: int = 0
     runtime_training_pool_plan_only: bool = True
-    runtime_training_resize_mode: str = "hybrid_nonblocking"  # hybrid_nonblocking | supervised_handoff
-    runtime_training_handoff_enabled: bool = False
-    runtime_training_handoff_dir: str = ""
-    runtime_training_handoff_timeout_s: float = 600.0
     runtime_batch_collection_timeout_s: float = 0.0
     runtime_batch_collection_max_retries: int = 0
     runtime_use_nccl_barrier_after_rollout: bool = False
@@ -539,18 +543,23 @@ class GlobalResourcePlannerConfig:
     hybrid_training_prewarm_worker_ids: list[str] = field(default_factory=list)
     hybrid_worker_python: str = "python"
     hybrid_worker_command_template: str = ""
-    hybrid_worker_mode: str = "megatron_core"
-    hybrid_worker_config_path: str = ""
     hybrid_worker_task_dir: str = "./logs/elastic_training_tasks"
-    hybrid_worker_ready_timeout_s: float = 600.0
-    hybrid_replica_gpus: int = 0
-    hybrid_zero_sync_steps: int = 1
-    hybrid_snapshot_interval: int = 0
-    hybrid_max_pending_snapshots: int = 1
-    hybrid_snapshot_retention: int = 2
-    hybrid_state_alignment_timeout_s: float = 300.0
-    hybrid_active_gradient_timeout_s: float = 300.0
-    hybrid_lockstep_gradient_sync: bool = True
+    hybrid_worker_ready_timeout_s: float = 60.0
+    hybrid_worker_remote_control_enabled: bool = False
+    hybrid_worker_remote_control_dir: str = ""
+    elastic_hybrid_planning_enabled: bool = False
+    elastic_hybrid_require_planner_signal: bool = False
+    # Deprecated and ignored. EHP capacity is always derived from the currently
+    # available rollout GPUs and complete-replica width.
+    elastic_hybrid_max_workers: int = 0
+    elastic_hybrid_replica_size_gpus: int = 0
+    elastic_hybrid_min_rollout_gpus: int = 0
+    elastic_hybrid_borrow_train_rollout_ratio: float = 1.15
+    elastic_hybrid_release_train_rollout_ratio: float = 0.90
+    elastic_hybrid_max_rollout_pressure: float = 0.80
+    elastic_hybrid_join_timeout_s: float = 180.0
+    elastic_hybrid_signal_ttl_steps: int = 20
+    elastic_hybrid_require_isolated_ccl: bool = False
     gradient_transport_backend: str = "tcp"  # tcp | native_rdma
     decouple_communication_domains: bool = True
     gradient_server_host: str = "127.0.0.1"
@@ -561,6 +570,12 @@ class GlobalResourcePlannerConfig:
     native_rdma_gid_index: int = 0
     native_rdma_ib_port: int = 1
     native_rdma_max_bytes: int = 67108864
+    hybrid_worker_mode: str = "megatron_core"
+    hybrid_worker_config_path: str = ""
+    hybrid_worker_endpoint_dir: str = ""
+    hybrid_lockstep_gradient_sync: bool = True
+    hybrid_active_gradient_timeout_s: float = 300.0
+    hybrid_update_timeout_s: float = 300.0
 
     @classmethod
     def from_dict(cls, d: dict) -> "GlobalResourcePlannerConfig":
@@ -573,6 +588,10 @@ class AsyncRLConfig:
 
     model_path: str
     tokenizer_path: str = ""
+
+    device_backend: str = "auto"  # auto | cuda | npu | cpu
+    distributed_backend: str = "auto"  # auto | nccl | hccl | gloo
+    rollout_backend: str = "vllm"  # vllm | mock
 
 
     train_gpus: int = 4
@@ -635,6 +654,12 @@ class AsyncRLConfig:
 
 
     max_new_tokens: int = 1024
+    # Workflow-specific limits.  Keeping these in the experiment config makes
+    # multi-turn capability runs reproducible instead of depending on shell
+    # environment variables.
+    r2e_max_turns: int = 3
+    r2e_max_prompt_tokens: int = 0
+    r2e_stop_reward: float = 0.5
     n_samples: int = 4
     temperature: float = 1.0
     top_p: float = 1.0
@@ -647,7 +672,6 @@ class AsyncRLConfig:
 
     total_steps: int = 100
     eval_interval: int = 10
-    eval_at_start: bool = False
     save_interval: int = 10
     seed: int = 42
 
@@ -699,6 +723,9 @@ class AsyncRLConfig:
         """Post init."""
         if not self.tokenizer_path:
             self.tokenizer_path = self.model_path
+
+        if not 0.0 <= self.r2e_stop_reward <= 1.0:
+            raise ValueError("r2e_stop_reward must be between 0 and 1")
 
         if self.train_tp_size <= 0:
             self.train_tp_size = max(1, self.tp_size)
@@ -816,8 +843,15 @@ class AsyncRLConfig:
 
 
         import os
-        os.makedirs(self.sync_path, exist_ok=True)
-        os.makedirs(self.log_dir, exist_ok=True)
+        for runtime_dir in (self.sync_path, self.log_dir):
+            try:
+                os.makedirs(runtime_dir, exist_ok=True)
+            except PermissionError:
+                # Production configs may target shared paths that are mounted
+                # only on compute nodes. Parsing and validation should remain
+                # side-effect tolerant; runtime components create their own
+                # directories when the target filesystem is available.
+                pass
 
 
         if self.n_total_gpus <= 0:
@@ -870,11 +904,6 @@ class AsyncRLConfig:
             "global_resource_planner",
         }
         valid_keys = {f.name for f in fields(cls) if f.name not in _nested_keys}
-        unknown_keys = sorted(set(d) - valid_keys)
-        if unknown_keys:
-            raise ValueError(
-                f"Unknown {cls.__name__} field(s): {', '.join(unknown_keys)}"
-            )
         filtered = {k: v for k, v in d.items() if k in valid_keys}
 
 

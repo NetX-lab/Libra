@@ -1,0 +1,24 @@
+# 24-step long-context validation run.  This is launched in its own session so
+# an SSH/control-plane timeout cannot propagate SIGTERM into torchrun.
+base_config: r2e_gym_cmlfq_grp_qwen3_14b_npu_multiturn_validation.yaml
+
+total_steps: 24
+max_new_tokens: 640
+r2e_max_turns: 7
+r2e_max_prompt_tokens: 1024
+
+sync_interval: 12
+eval_interval: 12
+max_concurrent_rollouts: 2
+queue_size: 8
+
+log_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_npu_extended_detached_validation/logs"
+sync_path: "/opt/libra/r2e_gym_qwen3_14b_npu_extended_detached_validation/weights"
+rollout_weight_sync_control_dir: "/opt/libra/r2e_gym_qwen3_14b_npu_extended_detached_validation/rollout_weight_sync"
+history_output_dir: "/opt/libra/runs/r2e_gym_qwen3_14b_npu_extended_detached_validation/history"
+history_experiment_name: "r2e_gym_qwen3_14b_npu_extended_detached_validation"
+wandb_run_name: "r2e-gym-qwen3-14b-npu-extended-detached-validation"
+
+heterogeneous_rollout:
+  scheduling:
+    cmlfq_tree_path: "/opt/libra/runs/r2e_gym_qwen3_14b_npu_extended_detached_validation/cmlfq_tree.json"

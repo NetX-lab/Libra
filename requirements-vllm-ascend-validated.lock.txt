@@ -1,0 +1,9 @@
+# Direct rollout pins validated with Qwen3-14B on Ascend 910B3 / CANN 8.5.2.
+# Install vllm-ascend first, then vllm with --no-deps so a CUDA torch wheel
+# cannot replace Huawei's aarch64 torch/torch-npu pair.
+torch==2.7.1
+torch-npu==2.7.1
+vllm-ascend==0.11.0
+vllm==0.11.0
+transformers==4.57.1
+tokenizers==0.22.2

@@ -47,8 +47,14 @@ class JoinState(str, enum.Enum):
     REQUESTED = "requested"
     FETCHING_STATE = "fetching_state"
     ZERO_SYNC = "zero_sync"
+    ACTIVATING = "activating"
     ACTIVE = "active"
+    CANCELLED = "cancelled"
     FAILED = "failed"
+
+
+class JoinCancelledError(RuntimeError):
+    """Raised inside a stale background join after GRP changed its target."""
 
 
 @dataclass(frozen=True)
@@ -59,6 +65,8 @@ class GradientPayload:
     target_core_id: str
     tensors: tuple[torch.Tensor, ...]
     zero_placeholder: bool = False
+    replica_rank: int = 0
+    replica_world_size: int = 1
     step: int = -1
     state_version: int = -1
     membership_epoch: int = 0
@@ -69,18 +77,17 @@ class GradientPayload:
         replica_id: str,
         target_core_id: str,
         reference: Iterable[torch.Tensor],
-        step: int = -1,
-        state_version: int = -1,
-        membership_epoch: int = 0,
     ) -> "GradientPayload":
         return GradientPayload(
             replica_id=replica_id,
             target_core_id=target_core_id,
             tensors=tuple(torch.zeros_like(t) for t in reference),
             zero_placeholder=True,
-            step=step,
-            state_version=state_version,
-            membership_epoch=membership_epoch,
+            replica_rank=0,
+            replica_world_size=1,
+            step=-1,
+            state_version=-1,
+            membership_epoch=0,
         )
 
 
@@ -94,8 +101,7 @@ class ElasticWorker:
     join_state: JoinState | None = None
     state_version: int = 0
     membership_epoch: int = 0
-    activate_after_step: int | None = None
-    last_error: str = ""
+    transition_generation: int = 0
     last_transition_ts: float = field(default_factory=time.time)
 
     def transition(
@@ -106,8 +112,7 @@ class ElasticWorker:
         join_state: JoinState | None = None,
         state_version: int | None = None,
         membership_epoch: int | None = None,
-        activate_after_step: int | None = None,
-        last_error: str | None = None,
+        transition_generation: int | None = None,
     ):
         self.role = role
         self.target_core_id = target_core_id
@@ -115,10 +120,9 @@ class ElasticWorker:
         if state_version is not None:
             self.state_version = state_version
         if membership_epoch is not None:
-            self.membership_epoch = membership_epoch
-        self.activate_after_step = activate_after_step
-        if last_error is not None:
-            self.last_error = str(last_error)
+            self.membership_epoch = int(membership_epoch)
+        if transition_generation is not None:
+            self.transition_generation = transition_generation
         self.last_transition_ts = time.time()
 
 
@@ -129,12 +133,40 @@ class JoinHandle:
     worker_id: str
     target_core_id: str
     future: Future
+    generation: int = 0
+    cancel_callback: Callable[[str, int], None] | None = None
 
     def done(self) -> bool:
         return self.future.done()
 
     def result(self, timeout: float | None = None) -> ElasticWorker:
         return self.future.result(timeout=timeout)
+
+    def cancel(self) -> None:
+        if self.cancel_callback is not None:
+            self.cancel_callback(self.worker_id, self.generation)
+
+
+@dataclass
+class ReplicaJoinHandle:
+    """Non-blocking, atomic join handle for one complete DP replica."""
+
+    replica_id: str
+    member_worker_ids: tuple[str, ...]
+    target_core_id: str
+    future: Future
+    generation: int = 0
+    cancel_callback: Callable[[str, int], None] | None = None
+
+    def done(self) -> bool:
+        return self.future.done()
+
+    def result(self, timeout: float | None = None) -> tuple[ElasticWorker, ...]:
+        return self.future.result(timeout=timeout)
+
+    def cancel(self) -> None:
+        if self.cancel_callback is not None:
+            self.cancel_callback(self.replica_id, self.generation)
 
 
 class GradientTransport(Protocol):
@@ -229,6 +261,9 @@ class InterReplicaGradientDomain:
         communication_domains: GradientCommunicationDomains | None = None,
         decouple_communication_domains: bool = True,
         average_core_replicas: bool = True,
+        require_isolated_process_group: bool = False,
+        local_replica_rank: int = 0,
+        replica_world_size: int = 1,
     ):
         core_ids = list(core_replica_ids)
         if not core_ids:
@@ -244,9 +279,15 @@ class InterReplicaGradientDomain:
             decoupled=decouple_communication_domains,
         )
         self.average_core_replicas = average_core_replicas
+        self.require_isolated_process_group = bool(require_isolated_process_group)
+        self.replica_world_size = max(1, int(replica_world_size))
+        self.local_replica_rank = int(local_replica_rank)
+        if not 0 <= self.local_replica_rank < self.replica_world_size:
+            raise ValueError("local_replica_rank must be inside replica_world_size")
         self._hybrid_targets: dict[str, str] = {}
         self._membership_epochs: dict[str, int] = {}
         self._joining: set[str] = set()
+        self._membership_epoch = 0
         self._lock = threading.RLock()
 
     @property
@@ -280,32 +321,89 @@ class InterReplicaGradientDomain:
                 and self.communication_domains.gradient_process_group
                 is self.communication_domains.core_process_group
             ),
+            "isolated_group_verified": (
+                self.communication_domains.hybrid_process_group is not None
+                and self.communication_domains.hybrid_process_group
+                is not self.communication_domains.core_process_group
+            ),
         }
+
+    def validate_communication_isolation(self) -> None:
+        """Fail closed when the elastic collective can alias Megatron DP."""
+        if not self.decoupled_communication_domains:
+            return
+        hybrid_group = self.communication_domains.hybrid_process_group
+        core_group = self.communication_domains.core_process_group
+        if hybrid_group is not None and hybrid_group is core_group:
+            raise RuntimeError(
+                "elastic gradient process group aliases the Megatron core group"
+            )
+        if self.require_isolated_process_group and hybrid_group is None:
+            raise RuntimeError(
+                "isolated elastic CCL process group is required but not initialized"
+            )
+
+    def bind_hybrid_process_group(self, process_group) -> None:
+        if (
+            self.decoupled_communication_domains
+            and process_group is not None
+            and process_group is self.communication_domains.core_process_group
+        ):
+            raise ValueError(
+                "decoupled elastic gradients cannot reuse the core process group"
+            )
+        self.communication_domains.hybrid_process_group = process_group
+
+    def membership_state(self) -> dict[str, object]:
+        """Describe the independently versioned elastic domain membership."""
+        with self._lock:
+            targets = dict(self._hybrid_targets)
+            joining = tuple(sorted(self._joining))
+            return {
+                "membership_epoch": self._membership_epoch,
+                "core_replica_ids": self.core_replica_ids,
+                "hybrid_targets": targets,
+                "joining_replica_ids": joining,
+                "active_replica_ids": tuple(
+                    sorted(replica_id for replica_id in targets if replica_id not in self._joining)
+                ),
+                "decoupled": self.decoupled_communication_domains,
+            }
 
     def request_join(
         self,
         hybrid_replica_id: str,
         target_core_id: str,
         *,
-        membership_epoch: int = 0,
+        membership_epoch: int | None = None,
     ):
         self._validate_core(target_core_id)
         with self._lock:
             self._hybrid_targets[hybrid_replica_id] = target_core_id
-            self._membership_epochs[hybrid_replica_id] = int(membership_epoch)
             self._joining.add(hybrid_replica_id)
+            if membership_epoch is None:
+                self._membership_epoch += 1
+                membership_epoch = self._membership_epoch
+            else:
+                self._membership_epoch = max(
+                    self._membership_epoch, int(membership_epoch)
+                )
+            self._membership_epochs[hybrid_replica_id] = int(membership_epoch)
 
     def mark_active(self, hybrid_replica_id: str):
         with self._lock:
             if hybrid_replica_id not in self._hybrid_targets:
                 raise KeyError(f"unknown hybrid replica: {hybrid_replica_id}")
             self._joining.discard(hybrid_replica_id)
+            self._membership_epoch += 1
+            self._membership_epochs[hybrid_replica_id] = self._membership_epoch
 
     def detach(self, hybrid_replica_id: str):
         with self._lock:
             self._joining.discard(hybrid_replica_id)
-            self._hybrid_targets.pop(hybrid_replica_id, None)
-            self._membership_epochs.pop(hybrid_replica_id, None)
+            if self._hybrid_targets.pop(hybrid_replica_id, None) is not None:
+                self._membership_epoch += 1
+                self._membership_epochs.pop(hybrid_replica_id, None)
 
     def is_joining(self, hybrid_replica_id: str) -> bool:
         with self._lock:
@@ -318,7 +416,6 @@ class InterReplicaGradientDomain:
             )
 
     def attached_hybrid_ids(self) -> tuple[str, ...]:
-        """Return joining and active replicas in the elastic side domain."""
         with self._lock:
             return tuple(self._hybrid_targets)
 
@@ -347,7 +444,6 @@ class InterReplicaGradientDomain:
             replica_id=hybrid_replica_id,
             target_core_id=target,
             reference=reference,
-            membership_epoch=self._membership_epochs.get(hybrid_replica_id, 0),
         )
 
     def accumulate_local_gradients(
@@ -359,26 +455,19 @@ class InterReplicaGradientDomain:
         step: int = -1,
         state_version: int = -1,
     ) -> tuple[torch.Tensor, ...]:
-        """Accumulate matching external gradients before core DP All-Reduce.
-
-        This is the ordering required by Libra Appendix D. The method performs
-        no collective; Megatron's immutable core communicator reduces the
-        resulting local gradients afterwards.
-        """
+        """Accumulate matching external gradients before the core DP reduce."""
         self._validate_core(core_replica_id)
         effective = tuple(t.clone() for t in core_gradients)
         with self._lock:
             targets = dict(self._hybrid_targets)
             joining = set(self._joining)
             epochs = dict(self._membership_epochs)
-
         for payload in hybrid_payloads:
-            replica_id = payload.replica_id
-            if targets.get(replica_id) != core_replica_id:
+            if targets.get(payload.replica_id) != core_replica_id:
                 continue
-            if replica_id in joining or payload.zero_placeholder:
+            if payload.replica_id in joining or payload.zero_placeholder:
                 continue
-            if payload.membership_epoch != epochs.get(replica_id, 0):
+            if payload.membership_epoch != epochs.get(payload.replica_id, 0):
                 continue
             if payload.step >= 0 and step >= 0 and payload.step != step:
                 continue
@@ -387,6 +476,13 @@ class InterReplicaGradientDomain:
                 and state_version >= 0
                 and payload.state_version != state_version
             ):
+                continue
+            if payload.replica_world_size != self.replica_world_size:
+                raise ValueError(
+                    f"payload replica world size mismatch for {payload.replica_id}: "
+                    f"{payload.replica_world_size} != {self.replica_world_size}"
+                )
+            if payload.replica_rank != self.local_replica_rank:
                 continue
             if len(payload.tensors) != len(effective):
                 raise ValueError("hybrid payload tensor count mismatch")
@@ -413,6 +509,8 @@ class InterReplicaGradientDomain:
             and dist.is_available()
             and dist.is_initialized()
         )
+        if distributed and self.decoupled_communication_domains:
+            self.validate_communication_isolation()
         provided_core_ids = tuple(rid for rid in self.core_replica_ids if rid in core_gradients)
         missing = set(self.core_replica_ids) - set(core_gradients)
         if missing and not distributed:
@@ -442,6 +540,15 @@ class InterReplicaGradientDomain:
                     f"{payload.target_core_id} != {target}"
                 )
             if payload.replica_id in joining or payload.zero_placeholder:
+                continue
+            if payload.replica_world_size != self.replica_world_size:
+                raise ValueError(
+                    f"payload replica world size mismatch for {payload.replica_id}: "
+                    f"{payload.replica_world_size} != {self.replica_world_size}"
+                )
+            if payload.replica_rank != self.local_replica_rank:
+                # Each fixed TP/PP/CP lane consumes only the matching rank from
+                # the complete hybrid DP replica.
                 continue
             if len(payload.tensors) != len(effective[target]):
                 raise ValueError("hybrid payload tensor count mismatch")
@@ -510,20 +617,15 @@ class ElasticHybridPool:
         gradient_domain: InterReplicaGradientDomain | None = None,
         snapshot_fetcher: Callable[[str, str], int] | None = None,
         zero_sync_steps: int = 1,
-        max_background_workers: int = 4,
-        require_training_boundary: bool = False,
-        join_preparer: Callable[[str, str, int], None] | None = None,
-        state_aligner: Callable[[str, str, int, int], None] | None = None,
-        state_listener: Callable[[ElasticWorker], None] | None = None,
+        max_background_workers: int = 0,
     ):
         if zero_sync_steps < 0:
             raise ValueError("zero_sync_steps cannot be negative")
+        core_train_workers = tuple(core_train_workers)
+        core_rollout_workers = tuple(core_rollout_workers)
+        hybrid_workers = tuple(hybrid_workers)
         self.zero_sync_steps = zero_sync_steps
         self.snapshot_fetcher = snapshot_fetcher or self._default_snapshot_fetcher
-        self.require_training_boundary = bool(require_training_boundary)
-        self.join_preparer = join_preparer
-        self.state_aligner = state_aligner
-        self.state_listener = state_listener
         self.gradient_domain = gradient_domain or InterReplicaGradientDomain(
             core_replica_ids=core_train_workers
         )
@@ -537,14 +639,17 @@ class ElasticHybridPool:
         if not self._workers:
             raise ValueError("ElasticHybridPool requires at least one worker")
 
-        self._executor = ThreadPoolExecutor(max_workers=max_background_workers)
+        background_capacity = (
+            int(max_background_workers)
+            if int(max_background_workers) > 0
+            else max(1, len(core_rollout_workers) + len(hybrid_workers))
+        )
+        self._executor = ThreadPoolExecutor(max_workers=background_capacity)
         self._lock = threading.RLock()
-        self._condition = threading.Condition(self._lock)
-        self._membership_epoch: dict[str, int] = {
-            worker_id: 0 for worker_id in self._workers
-        }
-        self._last_completed_step = -1
         self._closed = False
+        self._join_generations: dict[str, int] = {}
+        self._replica_generations: dict[str, int] = {}
+        self._replica_members: dict[str, tuple[str, ...]] = {}
 
     def snapshot(self) -> dict[str, ElasticWorker]:
         with self._lock:
@@ -555,9 +660,7 @@ class ElasticHybridPool:
                     target_core_id=w.target_core_id,
                     join_state=w.join_state,
                     state_version=w.state_version,
-                    membership_epoch=w.membership_epoch,
-                    activate_after_step=w.activate_after_step,
-                    last_error=w.last_error,
+                    transition_generation=w.transition_generation,
                     last_transition_ts=w.last_transition_ts,
                 )
                 for wid, w in self._workers.items()
@@ -573,7 +676,14 @@ class ElasticHybridPool:
             worker.transition(ReplicaRole.HYBRID_ROLLOUT)
             return worker
 
-    def join_training(self, worker_id: str, target_core_id: str) -> JoinHandle:
+    def join_training(
+        self,
+        worker_id: str,
+        target_core_id: str,
+        *,
+        activation_barrier: Callable[[str, str, int], None] | None = None,
+        timeout_s: float | None = None,
+    ) -> JoinHandle:
         """Start rollout->training transition and return immediately."""
         with self._lock:
             self._ensure_open()
@@ -581,27 +691,152 @@ class ElasticHybridPool:
                 worker_id,
                 allowed={ReplicaRole.CORE_ROLLOUT, ReplicaRole.HYBRID_ROLLOUT},
             )
+            generation = self._join_generations.get(worker.worker_id, 0) + 1
+            self._join_generations[worker.worker_id] = generation
             worker.transition(
                 ReplicaRole.HYBRID_JOINING,
                 target_core_id=target_core_id,
                 join_state=JoinState.REQUESTED,
-                membership_epoch=self._membership_epoch[worker.worker_id] + 1,
-                last_error="",
+                transition_generation=generation,
             )
-            self._membership_epoch[worker.worker_id] = worker.membership_epoch
-            self.gradient_domain.request_join(
-                worker.worker_id,
-                target_core_id,
-                membership_epoch=worker.membership_epoch,
-            )
-            self._emit_state(worker)
+            self.gradient_domain.request_join(worker.worker_id, target_core_id)
             future = self._executor.submit(
                 self._finish_join,
                 worker.worker_id,
                 target_core_id,
-                worker.membership_epoch,
+                generation,
+                activation_barrier,
+                timeout_s,
             )
-            return JoinHandle(worker.worker_id, target_core_id, future)
+            return JoinHandle(
+                worker.worker_id,
+                target_core_id,
+                future,
+                generation=generation,
+                cancel_callback=self.cancel_join,
+            )
+
+    def join_replica(
+        self,
+        replica_id: str,
+        member_worker_ids: Iterable[str],
+        target_core_id: str,
+        *,
+        activation_barrier: Callable[[str, str, int], None] | None = None,
+        replica_activation_barrier: Callable[[str, tuple[str, ...], str, int], None] | None = None,
+        timeout_s: float | None = None,
+    ) -> ReplicaJoinHandle:
+        """Join a complete DP replica atomically and return immediately.
+
+        Member ranks fetch and activate in the background.  The logical
+        replica enters the elastic gradient domain only after *all* members are
+        ready; cancellation or a single-rank failure rolls every member back.
+        """
+        members = tuple(str(wid) for wid in member_worker_ids)
+        if not members:
+            raise ValueError("a DP replica must contain at least one worker")
+        if len(members) != len(set(members)):
+            raise ValueError("DP replica member_worker_ids must be unique")
+        with self._lock:
+            self._ensure_open()
+            if replica_id in self._replica_members:
+                raise RuntimeError(f"replica is already registered: {replica_id}")
+            workers = [
+                self._select_worker(
+                    wid,
+                    allowed={ReplicaRole.CORE_ROLLOUT, ReplicaRole.HYBRID_ROLLOUT},
+                )
+                for wid in members
+            ]
+            generation = self._replica_generations.get(replica_id, 0) + 1
+            self._replica_generations[replica_id] = generation
+            self._replica_members[replica_id] = members
+            for worker in workers:
+                worker.transition(
+                    ReplicaRole.HYBRID_JOINING,
+                    target_core_id=target_core_id,
+                    join_state=JoinState.REQUESTED,
+                    transition_generation=generation,
+                )
+            self.gradient_domain.request_join(replica_id, target_core_id)
+            future = self._executor.submit(
+                self._finish_replica_join,
+                replica_id,
+                members,
+                target_core_id,
+                generation,
+                activation_barrier,
+                replica_activation_barrier,
+                timeout_s,
+            )
+            return ReplicaJoinHandle(
+                replica_id=replica_id,
+                member_worker_ids=members,
+                target_core_id=target_core_id,
+                future=future,
+                generation=generation,
+                cancel_callback=self.cancel_replica_join,
+            )
+
+    def cancel_replica_join(self, replica_id: str, generation: int) -> None:
+        with self._lock:
+            if self._replica_generations.get(replica_id) != generation:
+                return
+            self._replica_generations[replica_id] = generation + 1
+            self.gradient_domain.detach(replica_id)
+            for worker_id in self._replica_members.get(replica_id, ()):
+                worker = self._workers[worker_id]
+                worker.transition(
+                    ReplicaRole.HYBRID_ROLLOUT,
+                    target_core_id=None,
+                    join_state=JoinState.CANCELLED,
+                    transition_generation=generation + 1,
+                )
+            self._replica_members.pop(replica_id, None)
+
+    def release_replica_to_rollout(self, replica_id: str) -> None:
+        """Atomically detach all ranks of an active/joining DP replica."""
+        with self._lock:
+            members = self._replica_members.get(replica_id)
+            if not members:
+                raise KeyError(f"unknown hybrid replica: {replica_id}")
+            generation = self._replica_generations.get(replica_id, 0) + 1
+            self._replica_generations[replica_id] = generation
+            self.gradient_domain.detach(replica_id)
+            for worker_id in members:
+                worker = self._workers[worker_id]
+                if worker.role not in {
+                    ReplicaRole.HYBRID_TRAINING,
+                    ReplicaRole.HYBRID_JOINING,
+                }:
+                    raise RuntimeError(
+                        f"replica {replica_id} member {worker_id} is {worker.role}"
+                    )
+                worker.transition(ReplicaRole.HYBRID_ROLLOUT)
+            self._replica_members.pop(replica_id, None)
+
+    def replica_snapshot(self) -> dict[str, tuple[ElasticWorker, ...]]:
+        """Return logical replica membership without exposing mutable state."""
+        workers = self.snapshot()
+        with self._lock:
+            memberships = dict(self._replica_members)
+        return {
+            replica_id: tuple(workers[wid] for wid in members)
+            for replica_id, members in memberships.items()
+        }
+
+    def cancel_join(self, worker_id: str, generation: int) -> None:
+        with self._lock:
+            worker = self._workers.get(worker_id)
+            if worker is None or self._join_generations.get(worker_id) != generation:
+                return
+            self._join_generations[worker_id] = generation + 1
+            self.gradient_domain.detach(worker_id)
+            worker.transition(
+                ReplicaRole.HYBRID_ROLLOUT,
+                join_state=JoinState.CANCELLED,
+                transition_generation=generation + 1,
+            )
 
     def release_to_rollout(self, worker_id: str):
         """Detach a hybrid training worker and return it to rollout service."""
@@ -610,172 +845,250 @@ class ElasticHybridPool:
                 worker_id,
                 allowed={ReplicaRole.HYBRID_TRAINING, ReplicaRole.HYBRID_JOINING},
             )
-            self._membership_epoch[worker.worker_id] += 1
-            self.gradient_domain.detach(worker.worker_id)
-            worker.transition(
-                ReplicaRole.HYBRID_ROLLOUT,
-                membership_epoch=self._membership_epoch[worker.worker_id],
+            self._join_generations[worker.worker_id] = (
+                self._join_generations.get(worker.worker_id, 0) + 1
             )
-            self._emit_state(worker)
-            self._condition.notify_all()
-
-    def advance_training_boundary(self, step: int, state_version: int | None = None):
-        """Advance joining workers without blocking the immutable core pool."""
-        with self._condition:
-            self._last_completed_step = max(self._last_completed_step, int(step))
-            if state_version is not None:
-                for worker in self._workers.values():
-                    if worker.role == ReplicaRole.HYBRID_JOINING:
-                        next_version = max(worker.state_version, int(state_version))
-                        if next_version != worker.state_version:
-                            worker.state_version = next_version
-                            worker.last_transition_ts = time.time()
-                            self._emit_state(worker)
-            self._condition.notify_all()
+            self.gradient_domain.detach(worker.worker_id)
+            worker.transition(ReplicaRole.HYBRID_ROLLOUT)
 
     def close(self):
-        with self._condition:
+        with self._lock:
             self._closed = True
-            for worker in self._workers.values():
-                if worker.role == ReplicaRole.HYBRID_JOINING:
-                    self._membership_epoch[worker.worker_id] += 1
-                    worker.transition(
-                        ReplicaRole.HYBRID_ROLLOUT,
-                        membership_epoch=self._membership_epoch[worker.worker_id],
-                    )
-                    self.gradient_domain.detach(worker.worker_id)
-                    self._emit_state(worker)
-            self._condition.notify_all()
-        self._executor.shutdown(wait=True)
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _finish_join(
         self,
         worker_id: str,
         target_core_id: str,
-        membership_epoch: int,
+        generation: int,
+        activation_barrier: Callable[[str, str, int], None] | None,
+        timeout_s: float | None,
     ) -> ElasticWorker:
+        deadline = (
+            time.monotonic() + max(float(timeout_s), 0.0)
+            if timeout_s is not None
+            else None
+        )
         try:
+            self._assert_join_current(worker_id, generation, deadline)
             with self._lock:
                 worker = self._workers[worker_id]
-                self._assert_current_join(worker, membership_epoch)
                 worker.transition(
                     ReplicaRole.HYBRID_JOINING,
                     target_core_id=target_core_id,
                     join_state=JoinState.FETCHING_STATE,
                 )
-                self._emit_state(worker)
             version = self.snapshot_fetcher(worker_id, target_core_id)
+            self._assert_join_current(worker_id, generation, deadline)
 
-            # Lease the snapshot before the physical worker starts reading it.
-            # The asynchronous reaper must retain this version until alignment.
             with self._lock:
                 worker = self._workers[worker_id]
-                self._assert_current_join(worker, membership_epoch)
-                worker.transition(
-                    ReplicaRole.HYBRID_JOINING,
-                    target_core_id=target_core_id,
-                    join_state=JoinState.FETCHING_STATE,
-                    state_version=int(version),
-                    membership_epoch=membership_epoch,
-                )
-                self._emit_state(worker)
-
-            if self.join_preparer is not None:
-                self.join_preparer(worker_id, target_core_id, int(version))
-
-            with self._condition:
-                worker = self._workers[worker_id]
-                self._assert_current_join(worker, membership_epoch)
-                activate_after_step = (
-                    self._last_completed_step + self.zero_sync_steps
-                    if self.require_training_boundary
-                    else None
-                )
                 worker.transition(
                     ReplicaRole.HYBRID_JOINING,
                     target_core_id=target_core_id,
                     join_state=JoinState.ZERO_SYNC,
                     state_version=version,
-                    membership_epoch=membership_epoch,
-                    activate_after_step=activate_after_step,
                 )
-                self._emit_state(worker)
 
-                while (
-                    self.require_training_boundary
-                    and self._last_completed_step < int(activate_after_step)
-                ):
-                    self._condition.wait(timeout=0.5)
-                    self._assert_current_join(worker, membership_epoch)
+            for _ in range(self.zero_sync_steps):
+                time.sleep(0)
 
-            if not self.require_training_boundary:
-                for _ in range(self.zero_sync_steps):
-                    time.sleep(0)
-
-            with self._lock:
-                aligned_version = int(self._workers[worker_id].state_version)
-            if self.state_aligner is not None:
-                self.state_aligner(
-                    worker_id,
-                    target_core_id,
-                    aligned_version,
-                    membership_epoch,
-                )
+            self._assert_join_current(worker_id, generation, deadline)
+            if activation_barrier is not None:
+                with self._lock:
+                    worker = self._workers[worker_id]
+                    worker.transition(
+                        ReplicaRole.HYBRID_JOINING,
+                        target_core_id=target_core_id,
+                        join_state=JoinState.ACTIVATING,
+                        state_version=version,
+                        transition_generation=generation,
+                    )
+                activation_barrier(worker_id, target_core_id, version)
+                self._assert_join_current(worker_id, generation, deadline)
 
             self.gradient_domain.mark_active(worker_id)
             with self._lock:
                 worker = self._workers[worker_id]
-                self._assert_current_join(worker, membership_epoch)
                 worker.transition(
                     ReplicaRole.HYBRID_TRAINING,
                     target_core_id=target_core_id,
                     join_state=JoinState.ACTIVE,
-                    state_version=aligned_version,
-                    membership_epoch=membership_epoch,
+                    state_version=version,
+                    transition_generation=generation,
                 )
-                self._emit_state(worker)
                 return worker
-        except Exception as exc:
+        except JoinCancelledError:
+            # Cancellation may race with the background state transition.  If
+            # this is still the cancelled generation, make the rollback
+            # visible before the future is observed by the planner.
+            with self._lock:
+                worker = self._workers.get(worker_id)
+                if worker is not None and self._join_generations.get(worker_id) == generation + 1:
+                    self.gradient_domain.detach(worker_id)
+                    worker.transition(
+                        ReplicaRole.HYBRID_ROLLOUT,
+                        target_core_id=None,
+                        join_state=JoinState.CANCELLED,
+                        transition_generation=generation + 1,
+                    )
+            raise
+        except Exception:
             with self._lock:
                 worker = self._workers[worker_id]
-                if worker.membership_epoch != membership_epoch:
-                    raise
-                worker.transition(
-                    ReplicaRole.HYBRID_JOINING,
-                    target_core_id=target_core_id,
-                    join_state=JoinState.FAILED,
-                    last_error=f"{type(exc).__name__}: {exc}",
-                )
-                self._emit_state(worker)
-            self.gradient_domain.detach(worker_id)
+                if self._join_generations.get(worker_id) == generation:
+                    worker.transition(
+                        ReplicaRole.HYBRID_ROLLOUT,
+                        target_core_id=None,
+                        join_state=JoinState.FAILED,
+                        transition_generation=generation,
+                    )
+                    self.gradient_domain.detach(worker_id)
             raise
 
-    @staticmethod
-    def _assert_current_join(worker: ElasticWorker, membership_epoch: int) -> None:
-        if (
-            worker.membership_epoch != membership_epoch
-            or worker.role != ReplicaRole.HYBRID_JOINING
-        ):
-            raise RuntimeError(
-                f"join cancelled for {worker.worker_id}: epoch={membership_epoch}"
-            )
-
-    def _emit_state(self, worker: ElasticWorker) -> None:
-        if self.state_listener is None:
-            return
-        self.state_listener(
-            ElasticWorker(
-                worker_id=worker.worker_id,
-                role=worker.role,
-                target_core_id=worker.target_core_id,
-                join_state=worker.join_state,
-                state_version=worker.state_version,
-                membership_epoch=worker.membership_epoch,
-                activate_after_step=worker.activate_after_step,
-                last_error=worker.last_error,
-                last_transition_ts=worker.last_transition_ts,
-            )
+    def _finish_replica_join(
+        self,
+        replica_id: str,
+        members: tuple[str, ...],
+        target_core_id: str,
+        generation: int,
+        activation_barrier: Callable[[str, str, int], None] | None,
+        replica_activation_barrier: Callable[[str, tuple[str, ...], str, int], None] | None,
+        timeout_s: float | None,
+    ) -> tuple[ElasticWorker, ...]:
+        deadline = (
+            time.monotonic() + max(float(timeout_s), 0.0)
+            if timeout_s is not None
+            else None
         )
+        try:
+            self._assert_replica_join_current(replica_id, generation, deadline)
+            with self._lock:
+                for worker_id in members:
+                    self._workers[worker_id].transition(
+                        ReplicaRole.HYBRID_JOINING,
+                        target_core_id=target_core_id,
+                        join_state=JoinState.FETCHING_STATE,
+                    )
+            versions = tuple(
+                int(self.snapshot_fetcher(worker_id, target_core_id))
+                for worker_id in members
+            )
+            self._assert_replica_join_current(replica_id, generation, deadline)
+            if len(set(versions)) != 1:
+                raise RuntimeError(
+                    f"DP replica {replica_id} fetched inconsistent state versions: {versions}"
+                )
+            version = versions[0]
+            with self._lock:
+                for worker_id in members:
+                    self._workers[worker_id].transition(
+                        ReplicaRole.HYBRID_JOINING,
+                        target_core_id=target_core_id,
+                        join_state=JoinState.ZERO_SYNC,
+                        state_version=version,
+                    )
+            for _ in range(self.zero_sync_steps):
+                time.sleep(0)
+
+            self._assert_replica_join_current(replica_id, generation, deadline)
+            if replica_activation_barrier is not None:
+                with self._lock:
+                    for worker_id in members:
+                        self._workers[worker_id].transition(
+                            ReplicaRole.HYBRID_JOINING,
+                            target_core_id=target_core_id,
+                            join_state=JoinState.ACTIVATING,
+                            state_version=version,
+                            transition_generation=generation,
+                        )
+                replica_activation_barrier(replica_id, members, target_core_id, version)
+                self._assert_replica_join_current(replica_id, generation, deadline)
+            elif activation_barrier is not None:
+                with self._lock:
+                    for worker_id in members:
+                        self._workers[worker_id].transition(
+                            ReplicaRole.HYBRID_JOINING,
+                            target_core_id=target_core_id,
+                            join_state=JoinState.ACTIVATING,
+                            state_version=version,
+                            transition_generation=generation,
+                        )
+                for worker_id in members:
+                    activation_barrier(worker_id, target_core_id, version)
+                    self._assert_replica_join_current(replica_id, generation, deadline)
+
+            self.gradient_domain.mark_active(replica_id)
+            with self._lock:
+                active = []
+                for worker_id in members:
+                    worker = self._workers[worker_id]
+                    worker.transition(
+                        ReplicaRole.HYBRID_TRAINING,
+                        target_core_id=target_core_id,
+                        join_state=JoinState.ACTIVE,
+                        state_version=version,
+                        transition_generation=generation,
+                    )
+                    active.append(worker)
+                return tuple(active)
+        except JoinCancelledError:
+            with self._lock:
+                if self._replica_generations.get(replica_id) == generation + 1:
+                    self.gradient_domain.detach(replica_id)
+                    for worker_id in members:
+                        self._workers[worker_id].transition(
+                            ReplicaRole.HYBRID_ROLLOUT,
+                            target_core_id=None,
+                            join_state=JoinState.CANCELLED,
+                            transition_generation=generation + 1,
+                        )
+            raise
+        except Exception:
+            with self._lock:
+                if self._replica_generations.get(replica_id) == generation:
+                    self.gradient_domain.detach(replica_id)
+                    for worker_id in members:
+                        self._workers[worker_id].transition(
+                            ReplicaRole.HYBRID_ROLLOUT,
+                            target_core_id=None,
+                            join_state=JoinState.FAILED,
+                            transition_generation=generation,
+                        )
+                    self._replica_members.pop(replica_id, None)
+            raise
+
+    def _assert_replica_join_current(
+        self,
+        replica_id: str,
+        generation: int,
+        deadline: float | None,
+    ) -> None:
+        with self._lock:
+            if self._closed:
+                raise JoinCancelledError(
+                    f"join cancelled because pool is closed: {replica_id}"
+                )
+            if self._replica_generations.get(replica_id) != generation:
+                raise JoinCancelledError(
+                    f"stale join generation for replica {replica_id}"
+                )
+        if deadline is not None and time.monotonic() > deadline:
+            raise TimeoutError(f"hybrid replica join timed out for {replica_id}")
+
+    def _assert_join_current(
+        self,
+        worker_id: str,
+        generation: int,
+        deadline: float | None,
+    ) -> None:
+        with self._lock:
+            if self._closed:
+                raise JoinCancelledError(f"join cancelled because pool is closed: {worker_id}")
+            if self._join_generations.get(worker_id) != generation:
+                raise JoinCancelledError(f"stale join generation for {worker_id}")
+        if deadline is not None and time.monotonic() > deadline:
+            raise TimeoutError(f"hybrid join timed out for {worker_id}")
 
     def _select_worker(
         self,

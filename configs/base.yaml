@@ -46,7 +46,6 @@ max_seq_length: 2048
 
 total_steps: 100
 eval_interval: 10
-eval_at_start: false
 save_interval: 10
 seed: 42
 

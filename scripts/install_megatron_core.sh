@@ -3,32 +3,15 @@
 set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-VENV_PATH="${VENV_PATH:-}"
+VENV_PATH="${VENV_PATH:-${HOME}/rl_framework_env/bin/activate}"
 WHEELHOUSE="${MCORE_WHEELHOUSE:-$PROJECT_DIR/vendor/megatron}"
 MCORE_ARCHIVE="${MEGATRON_CORE_ARCHIVE:-$WHEELHOUSE/megatron_core-0.14.0.tar.gz}"
 BRIDGE_WHEEL="${MEGATRON_BRIDGE_WHEEL:-$WHEELHOUSE/megatron_bridge-0.2.0rc6-py3-none-any.whl}"
 GROUPED_GEMM_ARCHIVE="${GROUPED_GEMM_ARCHIVE:-$WHEELHOUSE/grouped_gemm-1.1.4-with-cutlass.tar.gz}"
-GROUPED_GEMM_WHEEL="${GROUPED_GEMM_WHEEL:-}"
+GROUPED_GEMM_WHEEL="${GROUPED_GEMM_WHEEL:-$WHEELHOUSE/grouped_gemm-1.1.4-cp312-cp312-linux_x86_64.whl}"
 
-if [ -n "$VENV_PATH" ]; then
-    source "$VENV_PATH"
-elif [ -z "${VIRTUAL_ENV:-}" ]; then
-    echo "Activate the target virtual environment or set VENV_PATH=/path/to/bin/activate." >&2
-    exit 2
-fi
-
-export PYTHONPATH="$PROJECT_DIR:${PYTHONPATH:-}"
-
-if [ -z "$GROUPED_GEMM_WHEEL" ]; then
-    PYTHON_TAG="$(python -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')"
-    for candidate in "$WHEELHOUSE"/grouped_gemm-1.1.4-"$PYTHON_TAG"-"$PYTHON_TAG"-*.whl; do
-        if [ -f "$candidate" ]; then
-            GROUPED_GEMM_WHEEL="$candidate"
-            break
-        fi
-    done
-fi
-
+source "$VENV_PATH"
+export PYTHONPATH="$(dirname "$PROJECT_DIR"):${PYTHONPATH:-}"
 if [ -f "$MCORE_ARCHIVE" ] && [ -f "$BRIDGE_WHEEL" ]; then
     python -m pip install --no-index --no-build-isolation --no-deps \
         --find-links "$WHEELHOUSE" \
@@ -56,9 +39,6 @@ if [ -f "$MCORE_ARCHIVE" ] && [ -f "$BRIDGE_WHEEL" ]; then
             MAX_JOBS="${MAX_JOBS:-1}" \
             python -m pip install --no-build-isolation --no-deps \
                 "$GROUPED_GEMM_ARCHIVE"
-    else
-        echo "No compatible grouped_gemm wheel or source archive was found in $WHEELHOUSE." >&2
-        exit 2
     fi
 else
     python -m pip install -r "$PROJECT_DIR/requirements-megatron.txt"

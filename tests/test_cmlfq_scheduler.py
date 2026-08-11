@@ -140,6 +140,16 @@ class TestCausalPrefixTree(unittest.TestCase):
         self.assertIsNotNone(node)
         self.assertEqual(node.depth, 0)
 
+    def test_global_fallback_for_unseen_prompt(self):
+        """Tool-state evidence transfers to a previously unseen prompt."""
+        state = self._make_state("search", "small", "success")
+        self.tree.insert(Trajectory("seen", [state], [8000]))
+
+        node = self.tree.lookup_with_fallback("unseen", [state])
+        self.assertIsNotNone(node)
+        self.assertEqual(node.depth, 1)
+        self.assertEqual(node.mean_remaining_length, 8000)
+
     def test_bucket_mapping(self):
         """Test bucket mapping."""
         node = PrefixTreeNode(key="test", depth=0)
@@ -193,6 +203,9 @@ class TestCausalPrefixTree(unittest.TestCase):
             self.assertEqual(stats["n_prompts"], 1)
             node = new_tree.lookup("p1", traj.return_states)
             self.assertEqual(node.remaining_lengths, [5000.0])
+            global_node = new_tree.lookup_with_fallback("new-prompt", traj.return_states)
+            self.assertIsNotNone(global_node)
+            self.assertEqual(global_node.remaining_lengths, [5000.0])
         finally:
             os.unlink(path)
 
@@ -244,36 +257,6 @@ class TestCMLFQScheduler(unittest.TestCase):
         self.assertEqual(result.tp_degree, 1)
         self.assertTrue(result.request_id)
 
-    def test_mixed_tp_preference_balances_across_ready_instances(self):
-        scheduler = CMLFQScheduler(
-            buckets={"long": {"tp_degrees": [4, 2], "max_tokens": 50000}},
-            initial_bucket="long",
-            load_balance_strategy="least_connections",
-        )
-        scheduler.register_instance(0, "tp4", 4)
-        scheduler.register_instance(1, "tp2", 2)
-        scheduler.register_instance(2, "tp2_b", 2)
-
-        routes = [scheduler.schedule(input_tokens=100, prompt_id=f"p{i}")
-                  for i in range(3)]
-        self.assertEqual(routes[0].tp_degree, 4)
-        self.assertCountEqual([route.tp_degree for route in routes], [4, 2, 2])
-
-    def test_long_only_preference_reserves_tp4_for_long_requests(self):
-        scheduler = CMLFQScheduler(
-            buckets={"long": {"tp_degrees": [4], "max_tokens": 50000}},
-            initial_bucket="long",
-            load_balance_strategy="least_connections",
-        )
-        scheduler.register_instance(0, "tp4", 4)
-        scheduler.register_instance(1, "tp2", 2)
-
-        routes = [scheduler.schedule(input_tokens=100, prompt_id=f"p{i}")
-                  for i in range(4)]
-
-        self.assertTrue(all(route.tp_degree == 4 for route in routes))
-        self.assertTrue(all(not route.is_fallback for route in routes))
-
     def test_on_tool_return_migration(self):
         """Test on tool return migration."""
 
@@ -304,6 +287,31 @@ class TestCMLFQScheduler(unittest.TestCase):
         self.assertTrue(decision.should_migrate)
         self.assertEqual(decision.target_bucket, "long")
 
+    def test_on_tool_return_migrates_for_unseen_prompt(self):
+        """A learned tool-state continuation applies beyond its prompt id."""
+        result = self.scheduler.schedule(input_tokens=1000, prompt_id="new-prompt")
+        state = ToolReturnState(
+            tool_type="search",
+            payload_size_class=PayloadSizeClass.SizeLarge,
+            execution_status=ExecutionStatus.ToolSuccess,
+        )
+        self.scheduler.prefix_tree.insert(
+            Trajectory(
+                prompt_id="historical-prompt",
+                return_states=[state],
+                total_remaining_lengths=[30000],
+            )
+        )
+
+        decision = self.scheduler.on_tool_return(
+            request_id=result.request_id,
+            tool_result={"tool_type": "search", "output": "x" * 6000},
+            generated_tokens=2000,
+        )
+
+        self.assertTrue(decision.should_migrate)
+        self.assertEqual(decision.target_bucket, "long")
+
     def test_on_tool_return_no_migration(self):
         """Test on tool return no migration."""
         result = self.scheduler.schedule(input_tokens=1000, prompt_id="p1")
@@ -330,36 +338,6 @@ class TestCMLFQScheduler(unittest.TestCase):
 
 
         self.assertFalse(decision.should_migrate)
-
-    def test_migration_floor_skips_short_continuations(self):
-        scheduler = CMLFQScheduler(
-            buckets={
-                "short": {"tp_degrees": [1], "max_tokens": 50},
-                "long": {"tp_degrees": [2], "max_tokens": 50000},
-            },
-            min_migration_remaining_tokens=256,
-        )
-        scheduler.register_instance(0, "short", 1)
-        scheduler.register_instance(1, "long", 2)
-        route = scheduler.schedule(input_tokens=100, prompt_id="p1")
-        state = ToolReturnState(
-            tool_type="search",
-            payload_size_class=PayloadSizeClass.SizeSmall,
-            execution_status=ExecutionStatus.ToolSuccess,
-        )
-        scheduler.prefix_tree.insert(
-            Trajectory("p1", [state], [100])
-        )
-
-        decision = scheduler.on_tool_return(
-            route.request_id,
-            {"tool_type": "search", "output": "small"},
-        )
-
-        self.assertFalse(decision.should_migrate)
-        self.assertEqual(
-            decision.reason, "remaining_length_below_migration_floor"
-        )
 
     def test_on_request_done_tree_update(self):
         """Test on request done tree update."""

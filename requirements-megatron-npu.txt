@@ -1,0 +1,18 @@
+# Runtime dependencies for Megatron-Core paths on Ascend NPU.
+#
+# CUDA-only extensions from requirements-megatron.txt, especially grouped_gemm,
+# are intentionally omitted for the first NPU dependency baseline. Re-enable or
+# replace them only after confirming an Ascend-compatible kernel implementation.
+megatron-core==0.14.0
+omegaconf>=2.3.0,<3.0.0
+hydra-core>1.3,<=1.3.2
+accelerate>=1.0.0,<2.0.0
+rich>=13.0.0
+six>=1.17.0
+regex>=2024.11.6
+tensorboard>=2.19.0
+einops>=0.8.0,<1.0.0
+packaging>=24.2
+
+# Install megatron-bridge separately with --no-deps once the NPU torch stack is
+# active, so broad optional dependencies cannot pull CUDA-only wheels.

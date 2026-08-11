@@ -7,7 +7,6 @@ import os
 import sys
 from collections import Counter
 from datetime import timedelta
-from hashlib import blake2b
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
@@ -19,6 +18,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from RL_Framework import AsyncRLTrainer, parse_args_and_load_config
+from RL_Framework.engine.device_utils import distributed_backend, set_device
 from RL_Framework.env.r2e_gym_reward import r2e_gym_reward_fn
 from RL_Framework.workflow.r2e_gym import R2EGymWorkflow
 
@@ -35,48 +35,6 @@ def _normalize_modified_files(value):
     return parsed if isinstance(parsed, list) else [str(parsed)]
 
 
-def _split_holdout(dataset):
-    """Create a deterministic R2E-Gym holdout without perturbing data order."""
-    fraction = float(os.environ.get("R2E_EVAL_HOLDOUT_FRACTION", "0"))
-    if not 0.0 < fraction < 1.0:
-        return dataset, dataset
-
-    seed = os.environ.get("R2E_EVAL_SEED", "0")
-    eval_indices = []
-    train_indices = []
-    for index, row in enumerate(dataset):
-        key = (
-            f"{seed}:{row.get('repo_name', '')}:"
-            f"{row.get('commit_hash', '')}:{index}"
-        ).encode("utf-8")
-        bucket = int.from_bytes(blake2b(key, digest_size=8).digest(), "big")
-        if bucket / 2**64 < fraction:
-            eval_indices.append(index)
-        else:
-            train_indices.append(index)
-    if not eval_indices or not train_indices:
-        raise ValueError("R2E-Gym holdout split produced an empty partition")
-    return dataset.select(train_indices), dataset.select(eval_indices)
-
-
-def _select_training_subset(dataset):
-    """Select a stable small training set for repeatable scheduler studies."""
-    limit = int(os.environ.get("R2E_TRAIN_MAX_SAMPLES", "0"))
-    if limit <= 0 or limit >= len(dataset):
-        return dataset
-
-    seed = os.environ.get("R2E_TRAIN_SUBSET_SEED", "0")
-    ranked_indices = []
-    for index, row in enumerate(dataset):
-        key = (
-            f"{seed}:{row.get('repo_name', '')}:"
-            f"{row.get('commit_hash', '')}:{index}"
-        ).encode("utf-8")
-        ranked_indices.append((blake2b(key, digest_size=8).digest(), index))
-    selected = sorted(index for _, index in sorted(ranked_indices)[:limit])
-    return dataset.select(selected)
-
-
 def main():
     config = parse_args_and_load_config()
 
@@ -87,23 +45,23 @@ def main():
         and world_size > 1
     ):
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        torch.cuda.set_device(local_rank)
-        device = torch.device("cuda", local_rank)
+        device = set_device(local_rank, getattr(config, "device_backend", "auto"))
+        backend = distributed_backend(getattr(config, "distributed_backend", "auto"))
         distributed_timeout = timedelta(
             seconds=int(os.environ.get("TORCH_DISTRIBUTED_TIMEOUT", "3600"))
         )
         try:
             dist.init_process_group(
-                backend="nccl",
+                backend=backend,
                 device_id=device,
                 timeout=distributed_timeout,
             )
         except TypeError:
             dist.init_process_group(
-                backend="nccl",
+                backend=backend,
                 timeout=distributed_timeout,
             )
-        torch.cuda.set_device(local_rank)
+        set_device(local_rank, getattr(config, "device_backend", "auto"))
 
     rank = dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", "0"))
     is_main_process = rank == 0
@@ -147,13 +105,9 @@ def main():
         }
 
     dataset = dataset.map(preprocess)
-    dataset, eval_dataset = _split_holdout(dataset)
-    dataset = _select_training_subset(dataset)
     if is_main_process:
         repo_counts = Counter(dataset["repo_name"])
-        print(
-            f"Loaded R2E-Gym rows: train={len(dataset)} eval={len(eval_dataset)}"
-        )
+        print(f"Loaded R2E-Gym rows: {len(dataset)}")
         print(f"Repositories: {dict(sorted(repo_counts.items()))}")
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -166,13 +120,16 @@ def main():
     workflow = R2EGymWorkflow(
         reward_fn=r2e_gym_reward_fn,
         tokenizer=tokenizer,
-        max_turns=int(os.environ.get("R2E_MAX_TURNS", "3")),
+        max_turns=int(os.environ.get("R2E_MAX_TURNS", str(config.r2e_max_turns))),
         max_new_tokens=config.max_new_tokens,
         max_seq_length=config.max_seq_length,
         max_prompt_tokens=(
             int(os.environ["R2E_MAX_PROMPT_TOKENS"])
             if os.environ.get("R2E_MAX_PROMPT_TOKENS")
-            else None
+            else (config.r2e_max_prompt_tokens or None)
+        ),
+        stop_reward=float(
+            os.environ.get("R2E_STOP_REWARD", str(config.r2e_stop_reward))
         ),
         temperature=config.temperature,
         top_p=config.top_p,
@@ -180,7 +137,7 @@ def main():
     )
 
     trainer = AsyncRLTrainer(config)
-    trainer.train(workflow=workflow, dataset=dataset, eval_dataset=eval_dataset)
+    trainer.train(workflow=workflow, dataset=dataset)
 
 
 if __name__ == "__main__":

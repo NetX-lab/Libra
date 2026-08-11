@@ -1,0 +1,13 @@
+# Direct runtime pins for the Ascend Megatron-Core baseline validated on
+# 2026-08-05.  torch and torch-npu must come from an Ascend-compatible aarch64
+# wheel source; do not let a generic PyPI install replace them with CUDA wheels.
+torch==2.7.1
+torch-npu==2.7.1.post2
+megatron-core==0.14.0
+megatron-bridge==0.2.0rc6
+transformers==4.57.6
+tokenizers==0.22.2
+datasets==2.21.0
+accelerate==1.14.0
+setuptools==79.0.1
+packaging==26.2

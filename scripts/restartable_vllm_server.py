@@ -80,10 +80,18 @@ def main() -> int:
     current_version = 0
     process: subprocess.Popen | None = None
 
+    def request_shutdown(signum, _frame):
+        raise KeyboardInterrupt(signum)
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
+
     def launch(model_path: str) -> subprocess.Popen:
         command = [model_path if item == "__MODEL_PATH__" else item for item in args.command]
         print(f"[vllm-reloader] launch version={current_version} model={model_path}", flush=True)
-        child = subprocess.Popen(command, start_new_session=True)
+        child_env = os.environ.copy()
+        child_env["MODEL_PATH"] = model_path
+        child = subprocess.Popen(command, start_new_session=True, env=child_env)
         wait_until_ready(child, args.health_url, args.ready_timeout)
         return child
 

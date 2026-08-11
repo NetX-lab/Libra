@@ -1,0 +1,25 @@
+# Long-context single-node GSM8K validation on an Ascend NPU.
+#
+# This is deliberately small-model/one-device so the workload can exercise a
+# larger generation budget than the 14B R2E run without exceeding its FSDP HBM
+# headroom.  It complements (rather than replaces) the real multi-tool R2E
+# capability experiment.
+base_config: gsm8k_npu_smoke.yaml
+
+total_steps: 24
+batch_size: 2
+micro_batch_size: 1
+n_samples: 2
+learning_rate: 2.0e-6
+
+max_seq_length: 8192
+max_new_tokens: 1024
+max_concurrent_rollouts: 4
+queue_size: 16
+
+sync_interval: 0
+eval_interval: 0
+log_dir: "/opt/libra/runs/gsm8k_npu_long_validation/logs"
+sync_path: "/opt/libra/gsm8k_npu_long_validation/weights"
+wandb_project: ""
+wandb_run_name: "gsm8k-npu-long-validation"
