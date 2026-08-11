@@ -7,3 +7,11 @@ history_experiment_name: "r2e_gym_qwen3_14b_6node48_production_no_ehp"
 
 global_resource_planner:
   elastic_hybrid_planning_enabled: false
+  # GRP still owns startup placement through PreflightPlanner, but no runtime
+  # decision may alter that placement in the 200-step control run.
+  runtime_online_replanning: false
+  runtime_dynamic_reconfiguration_enabled: false
+  runtime_reconfigure_training: false
+  hybrid_worker_launch_enabled: false
+  hybrid_worker_remote_control_enabled: false
+  elastic_hybrid_require_isolated_ccl: false

@@ -940,11 +940,17 @@ class GlobalResourcePlanner:
         step: int,
         metrics: RuntimeResourceMetrics | None,
     ) -> str:
+        # Startup planning is handled explicitly by PreflightPlanner. Once the
+        # job is running, disabling online replanning must also disable the
+        # periodic interval trigger; otherwise a nominally fixed control arm
+        # can still receive runtime resource decisions every plan_interval.
+        if not self.online_replanning:
+            return "interval_skip"
         if step - self._last_replan_step < self.replan_cooldown_steps:
             return "cooldown"
         if step % self.plan_interval == 0:
             return "interval"
-        if not self.online_replanning or metrics is None:
+        if metrics is None:
             return "interval_skip"
 
         if metrics.queue_pressure >= self.queue_pressure_threshold:

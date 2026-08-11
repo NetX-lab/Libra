@@ -7,3 +7,9 @@ history_experiment_name: "r2e_gym_qwen3_14b_6node48_production_ehp"
 
 global_resource_planner:
   elastic_hybrid_planning_enabled: true
+  runtime_online_replanning: true
+  runtime_dynamic_reconfiguration_enabled: true
+  runtime_reconfigure_training: true
+  hybrid_worker_launch_enabled: true
+  hybrid_worker_remote_control_enabled: true
+  elastic_hybrid_require_isolated_ccl: true

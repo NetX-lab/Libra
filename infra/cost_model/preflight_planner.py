@@ -66,6 +66,7 @@ class PreflightPlanner:
             "reconfiguration_cost_s": self.planner.reconfiguration_cost_s,
             "min_gain_ratio": self.planner.min_gain_ratio,
             "fixed_train_gpus": self.planner.fixed_train_gpus,
+            "online_replanning": self.planner.online_replanning,
         }
         try:
             self.planner.plan_interval = 1
@@ -76,6 +77,9 @@ class PreflightPlanner:
                 self.planner.min_gain_ratio = 0.0
             if self.planner.initial_allocation_strategy == "grp":
                 self.planner.fixed_train_gpus = 0
+            # Preflight is the one authorized planning pass for a control arm
+            # whose runtime_online_replanning setting is false.
+            self.planner.online_replanning = True
             decision = self.planner.plan_if_needed(
                 step=0,
                 config=self.config,
@@ -88,6 +92,7 @@ class PreflightPlanner:
             self.planner.reconfiguration_cost_s = original["reconfiguration_cost_s"]
             self.planner.min_gain_ratio = original["min_gain_ratio"]
             self.planner.fixed_train_gpus = original["fixed_train_gpus"]
+            self.planner.online_replanning = original["online_replanning"]
 
         applied_plan = self._select_plan(decision)
         applied = applied_plan is not None

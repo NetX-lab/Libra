@@ -103,6 +103,21 @@ def test_grp_startup_ignores_legacy_fixed_train_split(tmp_path: Path):
     assert result.metadata["initial_allocation_strategy"] == "grp"
 
 
+def test_preflight_still_plans_when_runtime_replanning_is_disabled(tmp_path: Path):
+    cfg = _config(tmp_path)
+    cfg.global_resource_planner.initial_allocation_strategy = "grp"
+    cfg.global_resource_planner.runtime_online_replanning = False
+    preflight = PreflightPlanner(cfg)
+
+    result = preflight.run(
+        synthetic_history(num_requests=8, input_len=128, output_len=1024)
+    )
+
+    assert result.applied
+    assert result.decision.candidate_plan is not None
+    assert preflight.planner.online_replanning is False
+
+
 def test_history_jsonl_loader(tmp_path: Path):
     path = tmp_path / "history.jsonl"
     path.write_text(
