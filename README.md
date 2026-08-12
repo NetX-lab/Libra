@@ -40,8 +40,7 @@ for Agentic RL Post-Training"**. Read the [paper](https://arxiv.org/abs/2606.030
 
 ## Latest News
 
-- **2026-08-11** - Integrated GRP startup profiling, EHP controls, and
-  elastic runtime improvements into the CUDA training and rollout stack.
+- **2026-08-11** - A new NPU_support branch has been added, enabling NPU support for all core functionalities.
 - **2026-08-03** — Libra was officially open sourced.
 
 ## System Overview
