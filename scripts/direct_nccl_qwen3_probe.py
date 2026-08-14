@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import time
+import urllib.error
 import urllib.request
 
 import torch
@@ -40,8 +41,12 @@ def post_json(url: str, payload: dict, timeout: float) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"POST {url} returned HTTP {exc.code}: {detail}") from exc
 
 
 def completion(endpoint: str, served_model_name: str) -> dict:
@@ -119,6 +124,7 @@ def main() -> int:
     started = time.perf_counter()
     tensor_count = 0
     transferred_bytes = 0
+    transport_keepalive: list[object] = []
     if rank == 0:
         def record_tensor(_name: str, size_bytes: int) -> None:
             nonlocal transferred_bytes
@@ -136,6 +142,7 @@ def main() -> int:
                 chunk_bytes=args.chunk_mb * 1024 * 1024,
             ),
             on_tensor=record_tensor,
+            keepalive=transport_keepalive,
         )
     else:
         for _name, tensor in weights:
@@ -144,11 +151,13 @@ def main() -> int:
         dist.barrier()
 
     if rank == 0:
+        send_finished = time.perf_counter()
         responses = {
             endpoint: future.result()
             for endpoint, future in futures.items()
         }
         executor.shutdown(wait=True)
+        transport_keepalive.clear()
         total_seconds = time.perf_counter() - started
         after = {
             endpoint: completion(endpoint, args.served_model_name)
@@ -162,6 +171,7 @@ def main() -> int:
             "transferred_bytes": transferred_bytes,
             "fanout_bytes": transferred_bytes * 2,
             "total_seconds": total_seconds,
+            "send_seconds": send_finished - started,
             "payload_gib_per_second": (
                 transferred_bytes / (1024**3) / total_seconds
             ),

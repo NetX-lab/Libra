@@ -77,6 +77,7 @@ def send_weights(
     spec: NcclReloadSpec,
     *,
     on_tensor: Callable[[str, int], None] | None = None,
+    keepalive: list[object] | None = None,
 ) -> int:
     """Broadcast full HF-format tensors from rank zero to vLLM workers.
 
@@ -87,6 +88,10 @@ def send_weights(
     if spec.rank != 0:
         raise ValueError("send_weights must run with rank=0")
     comm = _communicator(spec)
+    if keepalive is not None:
+        # The receivers may still be consuming the final metadata marker after
+        # this function returns. Keep the TCPStore alive until their RPC acks.
+        keepalive.append(comm)
     count = 0
     for name, tensor in weights:
         if tensor.device.type != "cuda":

@@ -66,6 +66,28 @@ def test_nccl_stream_preserves_metadata_and_end_marker(monkeypatch):
     assert tensors == []
 
 
+def test_send_weights_can_keep_transport_alive(monkeypatch):
+    metadata = []
+    tensors = []
+    communicator = FakeCommunicator(0, metadata, tensors)
+    monkeypatch.setattr(nccl_weight_sync, "_communicator", lambda _spec: communicator)
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, **_kwargs: self)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda *_args, **_kwargs: SimpleNamespace(synchronize=lambda: None),
+    )
+    keepalive = []
+
+    nccl_weight_sync.send_weights(
+        [("weight", torch.ones(2, dtype=torch.float32))],
+        NcclReloadSpec("127.0.0.1", 29620, 2, 0, "cuda:0"),
+        keepalive=keepalive,
+    )
+
+    assert keepalive == [communicator]
+
+
 def test_nccl_dtype_rejects_unknown_values():
     try:
         nccl_weight_sync._dtype_from_name("not_a_dtype")

@@ -1119,6 +1119,7 @@ class AsyncRLTrainer:
         weights = self.train_engine.stream_rollout_weights()
         started = time.perf_counter()
         transferred_bytes = 0
+        transport_keepalive: list[object] = []
         if self.is_main_process:
             def record_tensor(_name: str, size_bytes: int) -> None:
                 nonlocal transferred_bytes
@@ -1141,6 +1142,7 @@ class AsyncRLTrainer:
                     ),
                 ),
                 on_tensor=record_tensor,
+                keepalive=transport_keepalive,
             )
         else:
             # The export itself contains Megatron TP/EP collectives.
@@ -1182,6 +1184,7 @@ class AsyncRLTrainer:
                 f"seconds={time.perf_counter() - started:.3f}",
                 flush=True,
             )
+            transport_keepalive.clear()
         if dist.is_initialized():
             dist.barrier()
         self._record_weight_sync_phase("sync_complete")
