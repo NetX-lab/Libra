@@ -635,12 +635,16 @@ class AsyncRLConfig:
 
     weight_sync_mode: str = "disk"
     sync_path: str = "./logs/async_rl_weights"
-    rollout_weight_sync_mode: str = "none"  # none | restart
+    rollout_weight_sync_mode: str = "none"  # none | restart | nccl
     rollout_weight_sync_control_dir: str = ""
     rollout_weight_sync_timeout_s: float = 1200.0
     rollout_weight_sync_export_only: bool = True
     rollout_weight_reload_method: str = "restart"  # restart | inplace
     rollout_weight_reload_strategy: str = "parallel"  # parallel | serial
+    rollout_nccl_host: str = ""
+    rollout_nccl_port: int = 29620
+    rollout_nccl_chunk_mb: int = 256
+    rollout_nccl_rate_limit_gbps: float = 0.0
     require_rollout_weight_sync: bool = False
 
 
@@ -756,8 +760,10 @@ class AsyncRLConfig:
 
         if self.weight_sync_mode not in ["disk", "nccl"]:
             raise ValueError("weight_sync_mode must be 'disk' or 'nccl'")
-        if self.rollout_weight_sync_mode not in ["none", "restart"]:
-            raise ValueError("rollout_weight_sync_mode must be 'none' or 'restart'")
+        if self.rollout_weight_sync_mode not in ["none", "restart", "nccl"]:
+            raise ValueError(
+                "rollout_weight_sync_mode must be 'none', 'restart', or 'nccl'"
+            )
         if self.rollout_weight_reload_method not in ["restart", "inplace"]:
             raise ValueError(
                 "rollout_weight_reload_method must be 'restart' or 'inplace'"
@@ -766,6 +772,21 @@ class AsyncRLConfig:
             raise ValueError(
                 "rollout_weight_reload_strategy must be 'parallel' or 'serial'"
             )
+        if self.rollout_weight_sync_mode == "nccl":
+            if self.train_backend != "megatron_core":
+                raise ValueError(
+                    "NCCL rollout sync requires train_backend='megatron_core'"
+                )
+            if self.weight_sync_mode != "nccl":
+                raise ValueError(
+                    "NCCL rollout sync requires weight_sync_mode='nccl'"
+                )
+            if self.rollout_weight_reload_strategy != "parallel":
+                raise ValueError("NCCL rollout reload requires parallel strategy")
+            if self.rollout_nccl_chunk_mb <= 0:
+                raise ValueError("rollout_nccl_chunk_mb must be greater than zero")
+            if self.rollout_nccl_rate_limit_gbps < 0:
+                raise ValueError("rollout_nccl_rate_limit_gbps cannot be negative")
         if self.pipeline_schedule != "1f1b":
             raise ValueError("pipeline_schedule currently supports only '1f1b'")
         if self.virtual_pipeline_model_parallel_size != 0:
@@ -785,12 +806,19 @@ class AsyncRLConfig:
                 "batch_size must be divisible by train_dp_size * micro_batch_size: "
                 f"{self.batch_size} vs {self.train_dp_size}*{self.micro_batch_size}"
             )
-        if self.train_backend in {"megatron3d", "megatron_core"}:
-            if self.weight_sync_mode != "disk":
-                raise ValueError(
-                    "Megatron training backends support only weight_sync_mode='disk'"
-                )
+        if self.train_backend == "megatron3d" and self.weight_sync_mode != "disk":
+            raise ValueError(
+                "The legacy Megatron backend supports only weight_sync_mode='disk'"
+            )
         if self.train_backend == "megatron_core":
+            if self.weight_sync_mode not in {"disk", "nccl"}:
+                raise ValueError(
+                    "Megatron-Core weight_sync_mode must be 'disk' or 'nccl'"
+                )
+            if self.weight_sync_mode == "nccl" and self.rollout_weight_sync_mode != "nccl":
+                raise ValueError(
+                    "weight_sync_mode='nccl' requires rollout_weight_sync_mode='nccl'"
+                )
             if not 0.0 <= self.megatron_optimizer_offload_fraction <= 1.0:
                 raise ValueError(
                     "megatron_optimizer_offload_fraction must be between 0 and 1"

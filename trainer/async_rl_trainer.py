@@ -1013,6 +1013,9 @@ class AsyncRLTrainer:
 
     def _sync_weights(self, target_version: int):
         """Sync weights."""
+        if self.config.weight_sync_mode == "nccl":
+            self._sync_weights_nccl(target_version)
+            return
         if self.config.weight_sync_mode == "disk":
             if self.is_main_process:
                 print(f"Synchronizing weights (step={self.global_step})")
@@ -1036,9 +1039,156 @@ class AsyncRLTrainer:
                 if dist.is_initialized():
                     dist.barrier()
 
-        elif self.config.weight_sync_mode == "nccl":
-            if self.is_main_process:
-                print("WARNING: NCCL weight synchronization requires additional distributed setup")
+
+    def _nccl_rollout_topology(self) -> tuple[int, dict[str, int]]:
+        """Return NCCL world size and per-instance rank offsets."""
+        if self._use_heterogeneous:
+            entries = [
+                (str(cfg["instance_id"]), int(cfg.get("tp_degree", 1)))
+                for cfg in self.rollout_engine.instance_configs
+            ]
+        else:
+            tp = int(getattr(self.config, "vllm_tp_size", 1) or 1)
+            entries = [
+                (f"instance_{index}", tp)
+                for index in range(self.rollout_engine.num_instances)
+            ]
+        offsets: dict[str, int] = {}
+        next_rank = 0
+        for instance_id, tp_degree in entries:
+            offsets[instance_id] = next_rank
+            next_rank += max(1, tp_degree)
+        return 1 + next_rank, offsets
+
+    def _sync_weights_nccl(self, target_version: int) -> None:
+        """Stream Megatron Bridge tensors directly to all rollout workers."""
+        if str(getattr(self.train_engine, "train_backend", "")) != "megatron_core":
+            raise ValueError("Direct NCCL rollout sync requires train_backend=megatron_core")
+        control_dir_value = str(
+            getattr(self.config, "rollout_weight_sync_control_dir", "") or ""
+        )
+        if not control_dir_value:
+            raise ValueError("NCCL weight synchronization requires rollout_weight_sync_control_dir")
+        control_dir = Path(control_dir_value).resolve()
+        if self.is_main_process:
+            control_dir.mkdir(parents=True, exist_ok=True)
+
+        import socket
+
+        host = (
+            str(getattr(self.config, "rollout_nccl_host", "") or "")
+            or os.environ.get("MASTER_ADDR", "")
+            or socket.gethostbyname(socket.gethostname())
+        )
+        # Reuse one communicator across refreshes. The per-rank broadcast
+        # counters provide generation ordering; changing the port here would
+        # pay NCCL/TCPStore bootstrap on every training version.
+        port = int(getattr(self.config, "rollout_nccl_port", 29620))
+        world_size, offsets = self._nccl_rollout_topology()
+        request = {
+            "mode": "nccl",
+            "version": int(target_version),
+            "nccl_host": host,
+            "nccl_port": port,
+            "nccl_world_size": world_size,
+            "nccl_rank_offsets": offsets,
+            "nccl_chunk_bytes": int(
+                getattr(self.config, "rollout_nccl_chunk_mb", 256)
+            )
+            * 1024
+            * 1024,
+            "reload_strategy": str(
+                getattr(self.config, "rollout_weight_reload_strategy", "parallel")
+            ),
+            "created_at": time.time(),
+        }
+        if self.is_main_process:
+            for instance_id in offsets:
+                (control_dir / f"ack_{instance_id}_{target_version}.json").unlink(
+                    missing_ok=True
+                )
+                (control_dir / f"error_{instance_id}_{target_version}.json").unlink(
+                    missing_ok=True
+                )
+            self._write_json_atomic(control_dir / "reload_request.json", request)
+
+        from RL_Framework.infra.sync.nccl_weight_sync import (
+            NcclReloadSpec,
+            send_weights,
+        )
+
+        weights = self.train_engine.stream_rollout_weights()
+        started = time.perf_counter()
+        transferred_bytes = 0
+        transport_keepalive: list[object] = []
+        if self.is_main_process:
+            def record_tensor(_name: str, size_bytes: int) -> None:
+                nonlocal transferred_bytes
+                transferred_bytes += size_bytes
+
+            send_weights(
+                weights,
+                NcclReloadSpec(
+                    host=host,
+                    port=port,
+                    world_size=world_size,
+                    rank=0,
+                    device=torch.cuda.current_device(),
+                    timeout_s=float(
+                        getattr(self.config, "rollout_weight_sync_timeout_s", 1200.0)
+                    ),
+                    chunk_bytes=request["nccl_chunk_bytes"],
+                    rate_limit_gbps=float(
+                        getattr(self.config, "rollout_nccl_rate_limit_gbps", 0.0)
+                    ),
+                ),
+                on_tensor=record_tensor,
+                keepalive=transport_keepalive,
+            )
+        else:
+            # The export itself contains Megatron TP/EP collectives.
+            for _name, tensor in weights:
+                del tensor
+
+        if self.is_main_process:
+            timeout = float(getattr(self.config, "rollout_weight_sync_timeout_s", 1200.0))
+            deadline = time.monotonic() + timeout
+            pending = set(offsets)
+            while pending and time.monotonic() < deadline:
+                failures = {
+                    instance_id: (control_dir / f"error_{instance_id}_{target_version}.json").read_text(
+                        encoding="utf-8"
+                    )
+                    for instance_id in pending
+                    if (control_dir / f"error_{instance_id}_{target_version}.json").exists()
+                }
+                if failures:
+                    raise RuntimeError(f"vLLM NCCL reload failed: {failures}")
+                pending = {
+                    instance_id
+                    for instance_id in pending
+                    if not (control_dir / f"ack_{instance_id}_{target_version}.json").exists()
+                }
+                if pending:
+                    time.sleep(1.0)
+            if pending:
+                raise TimeoutError(f"Timed out waiting for NCCL reload: {sorted(pending)}")
+            self._record_rollout_weight_version(
+                target_version=target_version,
+                checkpoint_path="",
+                instance_ids=list(offsets),
+            )
+            print(
+                f"Direct NCCL rollout refresh complete: version={target_version}, "
+                f"world_size={world_size}, model_bytes={transferred_bytes}, "
+                f"fanout_bytes={transferred_bytes * (world_size - 1)}, "
+                f"seconds={time.perf_counter() - started:.3f}",
+                flush=True,
+            )
+            transport_keepalive.clear()
+        if dist.is_initialized():
+            dist.barrier()
+        self._record_weight_sync_phase("sync_complete")
 
     @contextmanager
     def _rollout_export_only_context(self, mode: str):

@@ -108,3 +108,48 @@ def test_reload_inplace_posts_checkpoint_to_reload_endpoint(monkeypatch):
         "timeout": 40.0,
     }
     assert result == {"workers": [{"rank": 0}]}
+
+
+def test_reload_nccl_posts_transport_metadata(monkeypatch):
+    script = Path(__file__).parents[1] / "scripts" / "restartable_vllm_server.py"
+    spec = importlib.util.spec_from_file_location("restartable_vllm_server_nccl", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    captured = {}
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"workers": [{"nccl_rank": 1}]}'
+
+    def urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", urlopen)
+    payload = {
+        "host": "10.0.0.1",
+        "port": 29621,
+        "world_size": 3,
+        "rank_offset": 0,
+        "timeout_seconds": 30.0,
+    }
+
+    result = module.reload_nccl("http://127.0.0.1:8000/health", payload, 30.0)
+
+    assert captured == {
+        "url": "http://127.0.0.1:8000/reload_weights_nccl",
+        "payload": payload,
+        "timeout": 40.0,
+    }
+    assert result["workers"][0]["nccl_rank"] == 1

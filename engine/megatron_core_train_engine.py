@@ -553,6 +553,16 @@ class MegatronCoreTrainEngine:
             export_for_rollout=self.streaming_export,
         )
 
+    def stream_rollout_weights(self):
+        """Yield complete HF-format tensors directly from GPU memory."""
+        if self.bridge is None or not self.model:
+            raise RuntimeError("Megatron Bridge/model is not initialized")
+        return self.bridge.export_hf_weights(
+            self.model,
+            cpu=False,
+            show_progress=self.is_main_process,
+        )
+
     def load_weights(self, path: str, version: int):
         if Path(path) != self.checkpoints.sync_path:
             self.checkpoints.sync_path = Path(path)

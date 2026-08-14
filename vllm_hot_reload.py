@@ -56,3 +56,40 @@ class InplaceReloadWorkerExtension:
             "finished_at": finished_at,
             "load_seconds": time.perf_counter() - started,
         }
+
+    def reload_weights_nccl(
+        self,
+        host: str,
+        port: int,
+        world_size: int,
+        rank_offset: int,
+        timeout_seconds: float = 1200.0,
+        chunk_bytes: int = 256 * 1024 * 1024,
+    ) -> dict[str, Any]:
+        """Load full HF-format weights from a Megatron NCCL broadcast."""
+        import torch
+
+        from RL_Framework.infra.sync.nccl_weight_sync import (
+            NcclReloadSpec,
+            receive_weights,
+        )
+
+        local_rank = int(getattr(self, "rank", 0))
+        spec = NcclReloadSpec(
+            host=str(host),
+            port=int(port),
+            world_size=int(world_size),
+            rank=1 + int(rank_offset) + local_rank,
+            device=torch.cuda.current_device(),
+            timeout_s=float(timeout_seconds),
+            chunk_bytes=int(chunk_bytes),
+        )
+        started = time.perf_counter()
+        loaded = self.model_runner.model.load_weights(receive_weights(spec))
+        torch.cuda.synchronize()
+        return {
+            "rank": local_rank,
+            "nccl_rank": spec.rank,
+            "loaded_parameters": len(loaded) if loaded is not None else 0,
+            "load_seconds": time.perf_counter() - started,
+        }

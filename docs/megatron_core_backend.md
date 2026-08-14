@@ -8,10 +8,10 @@ with two collective, bounded-memory operations:
    `optimizer.sharded_state_dict(...)` are saved with Megatron-Core
    `torch_dist` distributed checkpointing.
 2. Megatron Bridge collectively streams converted Hugging Face tensors.
-   All ranks participate in TP/EP conversion, while rank 0 writes the
-   original safetensors shard layout. The writer buffers at most one original
-   safetensors file shard; no rank constructs a full HF model or a full model
-   state dictionary.
+   All ranks participate in TP/EP conversion. For disk sync, rank 0 writes the
+   original safetensors shard layout. With `weight_sync_mode=nccl`, rank 0
+   broadcasts each tensor directly from GPU memory to all vLLM workers; no
+   rollout checkpoint or safetensors file is created.
 
 MCore 0.14's non-Transformer-Engine `GroupedMLP` stores every local expert in
 two expert-major tensors, `weight1` and `weight2`. Megatron Bridge 0.2 does not
@@ -80,6 +80,42 @@ sbatch scripts/submit_r2e_gym_cmlfq_megatron_core_qwen3_30b_a3b.slurm
 The native distributed checkpoint is the source of truth for training
 resume. The Hugging Face safetensors files are an interoperability artifact
 used only to restart vLLM rollout workers at the configured sync interval.
+
+## Direct NCCL rollout refresh
+
+```yaml
+train_backend: megatron_core
+weight_sync_mode: nccl
+rollout_weight_sync_mode: nccl
+rollout_weight_sync_control_dir: /path/to/run/rollout_weight_sync
+rollout_nccl_host: 10.0.0.10
+rollout_nccl_port: 29620
+rollout_nccl_chunk_mb: 256
+rollout_nccl_rate_limit_gbps: 0.0
+```
+
+Both rollout instances enter `/reload_weights_nccl` concurrently. Metadata
+uses `StatelessProcessGroup`, while tensors use an isolated
+`PyNcclCommunicator`, so this path does not alter Megatron's training process
+group. The trainer pauses rollout dispatch and sends bounded chunks outside
+gradient collectives. Set a positive `rollout_nccl_rate_limit_gbps` when the
+rollout and training jobs share an InfiniBand fabric.
+
+The communicator is cached by transport identity inside the Megatron and vLLM
+processes. Keep `rollout_nccl_port` stable across refreshes so later versions
+reuse the initialized NCCL/TCPStore connection. A topology change or process
+restart creates a new communicator automatically.
+
+Libra defaults the independent communicator to `NCCL_CUMEM_ENABLE=0` to match
+vLLM 0.9.x worker communicators. Do not configure different cuMem modes on the
+Megatron sender and vLLM receivers; mixed CUMEM/IPC transports fail during
+communicator initialization.
+
+Wire volume is approximately `parameter_count * dtype_bytes` per rollout
+worker and refresh. Same-node peers normally use NVLink/PCIe; cross-node peers
+use InfiniBand. Two rollout instances increase fan-out traffic, but avoid all
+model checkpoint I/O. The refresh log reports bytes and elapsed seconds for
+effective-bandwidth and congestion monitoring.
 
 ## Verification
 
