@@ -149,6 +149,8 @@ GRP_VLLM_STOP_COMMAND_TEMPLATE="${GRP_VLLM_STOP_COMMAND_TEMPLATE:-}"
 ROLLOUT_WEIGHT_SYNC_MODE="${ROLLOUT_WEIGHT_SYNC_MODE:-restart}"
 REQUIRE_ROLLOUT_WEIGHT_SYNC="${REQUIRE_ROLLOUT_WEIGHT_SYNC:-1}"
 ROLLOUT_WEIGHT_SYNC_EXPORT_ONLY="${ROLLOUT_WEIGHT_SYNC_EXPORT_ONLY:-1}"
+ROLLOUT_WEIGHT_RELOAD_METHOD="${ROLLOUT_WEIGHT_RELOAD_METHOD:-restart}"
+ROLLOUT_WEIGHT_RELOAD_STRATEGY="${ROLLOUT_WEIGHT_RELOAD_STRATEGY:-parallel}"
 MEGATRON_STREAMING_EXPORT="${MEGATRON_STREAMING_EXPORT:-1}"
 PREFERRED_TRAIN_NODE="${PREFERRED_TRAIN_NODE:-gn026}"
 AVOID_TRAIN_NODE="${AVOID_TRAIN_NODE:-gn019}"
@@ -176,7 +178,7 @@ if [ "$VLLM_DISABLE_CUSTOM_ALL_REDUCE" = "1" ]; then
     VLLM_CUSTOM_ALL_REDUCE_FLAG="--disable-custom-all-reduce"
 fi
 if [ "$GRP_MANAGE_ROLLOUT_PROCESSES" = "1" ] && [ -z "$GRP_VLLM_LAUNCH_COMMAND_TEMPLATE" ]; then
-    GRP_VLLM_LAUNCH_COMMAND_TEMPLATE="srun --exclusive --nodes=1 --ntasks=1 --nodelist={host} --gpus={tp} --cpus-per-task=16 bash -lc \"source '$VENV_PATH' && export TOKENIZERS_PARALLELISM=false && export PLANNED_CUDA_VISIBLE_DEVICES={gpus} && if [ -z \\\"\\\${{CUDA_VISIBLE_DEVICES:-}}\\\" ]; then export CUDA_VISIBLE_DEVICES=\\\"\\\$PLANNED_CUDA_VISIBLE_DEVICES\\\"; fi && echo \\\"CUDA_VISIBLE_DEVICES=\\\${{CUDA_VISIBLE_DEVICES}} planned=\\\${{PLANNED_CUDA_VISIBLE_DEVICES}}\\\" && export MASTER_ADDR=127.0.0.1 && export MASTER_PORT=\\\$((20000 + {port})) && export NCCL_P2P_DISABLE='$VLLM_NCCL_P2P_DISABLE' && export NCCL_IB_DISABLE='$VLLM_NCCL_IB_DISABLE' && export CUDA_LAUNCH_BLOCKING='$VLLM_CUDA_LAUNCH_BLOCKING' && {python} '$PROJECT_DIR/scripts/restartable_vllm_server.py' --instance-id {instance_id} --control-dir {control_dir} --health-url {local_health_url} --initial-model {initial_model} --ready-timeout '$MAX_WAIT' -- python3 -m vllm.entrypoints.openai.api_server --model __MODEL_PATH__ --served-model-name {model_path} --host 0.0.0.0 --port {port} --tensor-parallel-size {tp} --max-model-len {max_model_len} --dtype bfloat16 --gpu-memory-utilization {gpu_memory_utilization} --trust-remote-code --enforce-eager $VLLM_CUSTOM_ALL_REDUCE_FLAG\""
+    GRP_VLLM_LAUNCH_COMMAND_TEMPLATE="srun --exclusive --nodes=1 --ntasks=1 --nodelist={host} --gpus={tp} --cpus-per-task=16 bash -lc \"source '$VENV_PATH' && export TOKENIZERS_PARALLELISM=false && export PLANNED_CUDA_VISIBLE_DEVICES={gpus} && if [ -z \\\"\\\${{CUDA_VISIBLE_DEVICES:-}}\\\" ]; then export CUDA_VISIBLE_DEVICES=\\\"\\\$PLANNED_CUDA_VISIBLE_DEVICES\\\"; fi && echo \\\"CUDA_VISIBLE_DEVICES=\\\${{CUDA_VISIBLE_DEVICES}} planned=\\\${{PLANNED_CUDA_VISIBLE_DEVICES}}\\\" && export MASTER_ADDR=127.0.0.1 && export MASTER_PORT=\\\$((20000 + {port})) && export NCCL_P2P_DISABLE='$VLLM_NCCL_P2P_DISABLE' && export NCCL_IB_DISABLE='$VLLM_NCCL_IB_DISABLE' && export CUDA_LAUNCH_BLOCKING='$VLLM_CUDA_LAUNCH_BLOCKING' && {python} '$PROJECT_DIR/scripts/restartable_vllm_server.py' --instance-id {instance_id} --control-dir {control_dir} --health-url {local_health_url} --initial-model {initial_model} --ready-timeout '$MAX_WAIT' --reload-method '$ROLLOUT_WEIGHT_RELOAD_METHOD' --reload-strategy '$ROLLOUT_WEIGHT_RELOAD_STRATEGY' -- python3 '$PROJECT_DIR/scripts/vllm_hot_reload_api_server.py' --worker-extension-cls RL_Framework.vllm_hot_reload.InplaceReloadWorkerExtension --model __MODEL_PATH__ --served-model-name {model_path} --host 0.0.0.0 --port {port} --tensor-parallel-size {tp} --max-model-len {max_model_len} --dtype bfloat16 --gpu-memory-utilization {gpu_memory_utilization} --trust-remote-code --enforce-eager $VLLM_CUSTOM_ALL_REDUCE_FLAG\""
 fi
 if [ "$GRP_MANAGE_ROLLOUT_PROCESSES" = "1" ] && [ -z "$GRP_VLLM_STOP_COMMAND_TEMPLATE" ]; then
     GRP_VLLM_STOP_COMMAND_TEMPLATE="srun --overlap --nodes=1 --ntasks=1 --nodelist={host} bash -lc \"pkill -TERM -f 'restartable_vllm_server.py.*--instance-id {instance_id}' || pkill -TERM -f 'vllm.entrypoints.openai.api_server.*--port {port}' || true\""
@@ -236,6 +238,8 @@ export GRP_VLLM_STOP_COMMAND_TEMPLATE
 export ROLLOUT_WEIGHT_SYNC_MODE
 export REQUIRE_ROLLOUT_WEIGHT_SYNC
 export ROLLOUT_WEIGHT_SYNC_EXPORT_ONLY
+export ROLLOUT_WEIGHT_RELOAD_METHOD
+export ROLLOUT_WEIGHT_RELOAD_STRATEGY
 export MEGATRON_STREAMING_EXPORT
 mkdir -p "$JOB_LOG_DIR"
 mkdir -p "$ROLLOUT_SYNC_DIR"
@@ -559,6 +563,8 @@ seed = {
     "rollout_weight_sync_control_dir": str(project / "logs" / "r2e_gym_cmlfq_24gpu" / f"job_{os.environ['JOB_ID']}" / "rollout_weight_sync"),
     "rollout_weight_sync_timeout_s": int(os.environ["MAX_WAIT"]),
     "rollout_weight_sync_export_only": os.environ.get("ROLLOUT_WEIGHT_SYNC_EXPORT_ONLY", "1") == "1",
+    "rollout_weight_reload_method": os.environ.get("ROLLOUT_WEIGHT_RELOAD_METHOD", "restart"),
+    "rollout_weight_reload_strategy": os.environ.get("ROLLOUT_WEIGHT_RELOAD_STRATEGY", "parallel"),
     "require_rollout_weight_sync": os.environ.get("REQUIRE_ROLLOUT_WEIGHT_SYNC", "1") == "1",
     "log_dir": str(project / "logs" / "r2e_gym_cmlfq_24gpu"),
     "wandb_run_name": f"{os.environ['EXPERIMENT_TAG']}-{os.environ['JOB_ID']}",
@@ -1036,7 +1042,10 @@ start_vllm() {
                 --health-url 'http://127.0.0.1:$port/health' \
                 --initial-model '$MODEL_PATH' \
                 --ready-timeout '$MAX_WAIT' \
-                -- python3 -m vllm.entrypoints.openai.api_server \
+                --reload-method '$ROLLOUT_WEIGHT_RELOAD_METHOD' \
+                --reload-strategy '$ROLLOUT_WEIGHT_RELOAD_STRATEGY' \
+                -- python3 '$PROJECT_DIR/scripts/vllm_hot_reload_api_server.py' \
+                --worker-extension-cls RL_Framework.vllm_hot_reload.InplaceReloadWorkerExtension \
                 --model '__MODEL_PATH__' \
                 --served-model-name '$MODEL_PATH' \
                 --host 0.0.0.0 \

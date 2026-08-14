@@ -1180,6 +1180,22 @@ class AsyncRLTrainer:
         control_dir.mkdir(parents=True, exist_ok=True)
 
         instance_ids = self._current_rollout_instance_ids()
+        reload_method = str(
+            getattr(self.config, "rollout_weight_reload_method", "restart")
+        ).lower()
+        if reload_method not in {"restart", "inplace"}:
+            raise ValueError(
+                "rollout_weight_reload_method must be 'restart' or 'inplace', "
+                f"got {reload_method!r}"
+            )
+        reload_strategy = str(
+            getattr(self.config, "rollout_weight_reload_strategy", "parallel")
+        ).lower()
+        if reload_strategy not in {"parallel", "serial"}:
+            raise ValueError(
+                "rollout_weight_reload_strategy must be 'parallel' or 'serial', "
+                f"got {reload_strategy!r}"
+            )
 
         for instance_id in instance_ids:
             (control_dir / f"ack_{instance_id}_{target_version}.json").unlink(
@@ -1191,12 +1207,9 @@ class AsyncRLTrainer:
         request = {
             "version": int(target_version),
             "checkpoint_path": checkpoint_path,
-            "reload_method": str(
-                getattr(self.config, "rollout_weight_reload_method", "restart")
-            ),
-            "reload_strategy": str(
-                getattr(self.config, "rollout_weight_reload_strategy", "parallel")
-            ),
+            "reload_method": reload_method,
+            "reload_strategy": reload_strategy,
+            "instance_ids": sorted(instance_ids),
             "created_at": time.time(),
         }
         request_tmp = control_dir / "reload_request.json.tmp"
@@ -1233,9 +1246,41 @@ class AsyncRLTrainer:
                 f"Timed out waiting for vLLM to loadversion={target_version}timed out，unconfirmed instances: "
                 f"{sorted(pending)}"
             )
+        acknowledgements = []
+        for instance_id in instance_ids:
+            ack_path = control_dir / f"ack_{instance_id}_{target_version}.json"
+            try:
+                ack = json.loads(ack_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Invalid rollout reload ACK: {ack_path}"
+                ) from exc
+            if (
+                str(ack.get("instance_id")) != instance_id
+                or int(ack.get("version", -1)) != int(target_version)
+                or str(ack.get("checkpoint_path")) != checkpoint_path
+                or str(ack.get("reload_method")) != reload_method
+                or str(ack.get("reload_strategy")) != reload_strategy
+            ):
+                raise RuntimeError(
+                    f"Mismatched rollout reload ACK for {instance_id}: {ack}"
+                )
+            acknowledgements.append(ack)
+
+        reload_seconds = [
+            float(ack["total_seconds"])
+            for ack in acknowledgements
+            if "total_seconds" in ack
+        ]
+        timing = (
+            f", slowest_reload={max(reload_seconds):.2f}s"
+            if reload_seconds
+            else ""
+        )
         print(
             f"Rollout weight refresh complete: version={target_version}, "
-            f"instances={len(instance_ids)}"
+            f"instances={len(instance_ids)}, method={reload_method}, "
+            f"strategy={reload_strategy}{timing}"
         )
 
     def _current_rollout_instance_ids(self) -> list[str]:
