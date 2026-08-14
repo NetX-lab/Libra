@@ -3,7 +3,7 @@
 #SBATCH -A nsgm_xu
 #SBATCH --qos=normal
 #SBATCH -p gpu
-#SBATCH --exclude=gn021
+#SBATCH --exclude=gn005,gn021
 #SBATCH -N 1
 #SBATCH -G 3
 #SBATCH --ntasks-per-node=1
@@ -73,13 +73,22 @@ done
 
 for instance in 0 1; do
   port=$((BASE_PORT + instance))
+  ready=0
   for _ in $(seq 1 600); do
     if curl -fsS "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    if ! kill -0 "${server_steps[$instance]}" 2>/dev/null; then
       break
     fi
     sleep 2
   done
-  curl -fsS "http://127.0.0.1:${port}/health" >/dev/null
+  if [[ "$ready" != 1 ]]; then
+    echo "vLLM instance $instance failed to become ready" >&2
+    tail -100 "$RESULTS/vllm_${instance}.log" >&2 || true
+    exit 1
+  fi
 done
 
 NODE_IP="127.0.0.1"
