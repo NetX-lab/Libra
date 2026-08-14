@@ -24,6 +24,8 @@ commonly changed for experiments and cluster deployments.
 | `max_head_offpolicyness` | Maximum accepted policy-version lag |
 | `recompute_logprobs` | Recompute log probabilities with the current model |
 | `sync_interval` | Training steps between weight sync attempts |
+| `rollout_weight_reload_method` | Use `restart` for process replacement or `inplace` to refresh resident vLLM workers |
+| `rollout_weight_reload_strategy` | Reload rollout instances concurrently with `parallel` (default), or use the node-serialized `serial` fallback |
 
 ## Megatron-Core Options
 
@@ -59,3 +61,18 @@ commonly changed for experiments and cluster deployments.
 
 See the [cluster manual](manual.md) for recommended combinations and launch
 examples.
+
+## Rollout Weight Reloads
+
+When `rollout_weight_sync_mode` is `restart`, the trainer publishes one reload
+request for the complete rollout instance set and waits for the whole ACK batch.
+`rollout_weight_reload_method` controls how each vLLM instance applies the
+checkpoint: `restart` replaces the server process, while `inplace` calls the
+guarded reload endpoint and keeps the server resident. The default
+`rollout_weight_reload_strategy: parallel` applies the selected method to all
+instances concurrently. Use `serial` only as an operational fallback on nodes
+that cannot tolerate concurrent model loads.
+
+Each ACK records method, strategy, lock wait, process stop, model load, and total
+reload time. The trainer validates every ACK and reports the slowest instance
+for each refresh.

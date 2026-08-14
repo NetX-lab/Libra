@@ -150,7 +150,9 @@ def main() -> int:
                     if reload_method not in {"restart", "inplace"}:
                         raise ValueError(f"unsupported reload method: {reload_method}")
                     if reload_strategy not in {"parallel", "serial"}:
-                        raise ValueError(f"unsupported reload strategy: {reload_strategy}")
+                        raise ValueError(
+                            f"unsupported reload strategy: {reload_strategy}"
+                        )
                 except (OSError, ValueError, KeyError, json.JSONDecodeError):
                     time.sleep(max(0.05, args.poll_interval))
                     continue
