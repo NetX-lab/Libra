@@ -1191,6 +1191,12 @@ class AsyncRLTrainer:
         request = {
             "version": int(target_version),
             "checkpoint_path": checkpoint_path,
+            "reload_method": str(
+                getattr(self.config, "rollout_weight_reload_method", "restart")
+            ),
+            "reload_strategy": str(
+                getattr(self.config, "rollout_weight_reload_strategy", "parallel")
+            ),
             "created_at": time.time(),
         }
         request_tmp = control_dir / "reload_request.json.tmp"

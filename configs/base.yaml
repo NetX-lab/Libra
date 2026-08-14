@@ -22,6 +22,8 @@ rollout_weight_sync_mode: "none"
 rollout_weight_sync_control_dir: ""
 rollout_weight_sync_timeout_s: 1200
 rollout_weight_sync_export_only: true
+rollout_weight_reload_method: "restart"
+rollout_weight_reload_strategy: "parallel"
 require_rollout_weight_sync: false
 
 
