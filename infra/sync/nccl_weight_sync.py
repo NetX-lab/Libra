@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator
 
 import torch
+
+
+_COMMUNICATOR_CACHE: dict[tuple[str, int, int, int, str], object] = {}
+_COMMUNICATOR_CACHE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -56,9 +61,21 @@ def _communicator(spec: NcclReloadSpec):
             self._constructor_warmup_output = result
             return result
 
-    communicator = _BroadcastCommunicator(_group(spec), device=spec.device)
-    communicator._constructor_warmup_output = None
-    return communicator
+    device = str(torch.device(spec.device))
+    key = (str(spec.host), int(spec.port), int(spec.world_size), int(spec.rank), device)
+    with _COMMUNICATOR_CACHE_LOCK:
+        communicator = _COMMUNICATOR_CACHE.get(key)
+        if communicator is None:
+            communicator = _BroadcastCommunicator(_group(spec), device=spec.device)
+            communicator._constructor_warmup_output = None
+            _COMMUNICATOR_CACHE[key] = communicator
+        return communicator
+
+
+def clear_communicator_cache() -> None:
+    """Drop cached communicators, typically during orderly process shutdown."""
+    with _COMMUNICATOR_CACHE_LOCK:
+        _COMMUNICATOR_CACHE.clear()
 
 
 def _dtype_name(dtype: torch.dtype) -> str:

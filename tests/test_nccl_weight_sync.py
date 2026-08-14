@@ -129,3 +129,37 @@ def test_communicator_retains_vllm_constructor_warmup_output(monkeypatch):
     )
 
     assert communicator._constructor_warmup_output is None
+
+
+def test_communicator_is_cached_by_transport_identity(monkeypatch):
+    class FakePyNcclCommunicator:
+        init_count = 0
+
+        def __init__(self, group, device):
+            type(self).init_count += 1
+            self.group = group
+            self.device = device
+            self.all_reduce("warmup")
+
+        def all_reduce(self, _tensor, op=None, stream=None):
+            return object()
+
+    pynccl_module = ModuleType(
+        "vllm.distributed.device_communicators.pynccl"
+    )
+    pynccl_module.PyNcclCommunicator = FakePyNcclCommunicator
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed.device_communicators.pynccl",
+        pynccl_module,
+    )
+    monkeypatch.setattr(nccl_weight_sync, "_group", lambda _spec: object())
+    nccl_weight_sync.clear_communicator_cache()
+    spec = NcclReloadSpec("127.0.0.1", 29620, 3, 0, "cuda:0")
+
+    first = nccl_weight_sync._communicator(spec)
+    second = nccl_weight_sync._communicator(spec)
+
+    assert first is second
+    assert first.__class__.init_count == 1
+    nccl_weight_sync.clear_communicator_cache()

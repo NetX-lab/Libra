@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-tp", type=int, default=1)
     parser.add_argument("--train-ep", type=int, default=1)
     parser.add_argument("--chunk-mb", type=int, default=256)
+    parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--output", required=True)
     return parser.parse_args()
 
@@ -92,93 +93,116 @@ def main() -> int:
     if dist.is_initialized():
         dist.barrier()
 
+    if args.repeats <= 0:
+        raise ValueError("--repeats must be positive")
     before = None
-    futures = None
-    executor = None
+    rounds = []
+    transport_keepalive: list[object] = []
     if rank == 0:
         before = {
             endpoint: completion(endpoint, args.served_model_name)
             for endpoint in endpoints
         }
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-        futures = {
-            endpoint: executor.submit(
-                post_json,
-                f"{endpoint}/reload_weights_nccl",
-                {
-                    "host": args.transport_host,
-                    "port": args.transport_port,
-                    "world_size": 3,
-                    "rank_offset": index,
-                    "timeout_seconds": 1800.0,
-                    "chunk_bytes": args.chunk_mb * 1024 * 1024,
-                },
-                1810.0,
+    for round_index in range(args.repeats):
+        futures = None
+        executor = None
+        if rank == 0:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+            futures = {
+                endpoint: executor.submit(
+                    post_json,
+                    f"{endpoint}/reload_weights_nccl",
+                    {
+                        "host": args.transport_host,
+                        "port": args.transport_port,
+                        "world_size": 3,
+                        "rank_offset": index,
+                        "timeout_seconds": 1800.0,
+                        "chunk_bytes": args.chunk_mb * 1024 * 1024,
+                    },
+                    1810.0,
+                )
+                for index, endpoint in enumerate(endpoints)
+            }
+        if dist.is_initialized():
+            dist.barrier()
+        weights = engine.stream_rollout_weights()
+        started = time.perf_counter()
+        tensor_count = 0
+        transferred_bytes = 0
+        if rank == 0:
+            def record_tensor(_name: str, size_bytes: int) -> None:
+                nonlocal transferred_bytes
+                transferred_bytes += size_bytes
+
+            tensor_count = send_weights(
+                weights,
+                NcclReloadSpec(
+                    host=args.transport_host,
+                    port=args.transport_port,
+                    world_size=3,
+                    rank=0,
+                    device=torch.cuda.current_device(),
+                    timeout_s=1800.0,
+                    chunk_bytes=args.chunk_mb * 1024 * 1024,
+                ),
+                on_tensor=record_tensor,
+                keepalive=transport_keepalive,
             )
-            for index, endpoint in enumerate(endpoints)
-        }
-
-    if dist.is_initialized():
-        dist.barrier()
-    weights = engine.stream_rollout_weights()
-    started = time.perf_counter()
-    tensor_count = 0
-    transferred_bytes = 0
-    transport_keepalive: list[object] = []
+        else:
+            for _name, tensor in weights:
+                del tensor
+        if dist.is_initialized():
+            dist.barrier()
+        if rank == 0:
+            send_finished = time.perf_counter()
+            responses = {
+                endpoint: future.result()
+                for endpoint, future in futures.items()
+            }
+            executor.shutdown(wait=True)
+            transport_keepalive.clear()
+            after = {
+                endpoint: completion(endpoint, args.served_model_name)
+                for endpoint in endpoints
+            }
+            total_seconds = time.perf_counter() - started
+            rounds.append(
+                {
+                    "round": round_index + 1,
+                    "tensor_count": tensor_count,
+                    "transferred_bytes": transferred_bytes,
+                    "fanout_bytes": transferred_bytes * 2,
+                    "total_seconds": total_seconds,
+                    "send_seconds": send_finished - started,
+                    "payload_gib_per_second": (
+                        transferred_bytes
+                        / (1024**3)
+                        / total_seconds
+                    ),
+                    "after": after,
+                    "responses": responses,
+                }
+            )
     if rank == 0:
-        def record_tensor(_name: str, size_bytes: int) -> None:
-            nonlocal transferred_bytes
-            transferred_bytes += size_bytes
-
-        tensor_count = send_weights(
-            weights,
-            NcclReloadSpec(
-                host=args.transport_host,
-                port=args.transport_port,
-                world_size=3,
-                rank=0,
-                device=torch.cuda.current_device(),
-                timeout_s=1800.0,
-                chunk_bytes=args.chunk_mb * 1024 * 1024,
-            ),
-            on_tensor=record_tensor,
-            keepalive=transport_keepalive,
-        )
-    else:
-        for _name, tensor in weights:
-            del tensor
-    if dist.is_initialized():
-        dist.barrier()
-
-    if rank == 0:
-        send_finished = time.perf_counter()
-        responses = {
-            endpoint: future.result()
-            for endpoint, future in futures.items()
-        }
-        executor.shutdown(wait=True)
-        transport_keepalive.clear()
-        total_seconds = time.perf_counter() - started
-        after = {
-            endpoint: completion(endpoint, args.served_model_name)
-            for endpoint in endpoints
-        }
+        final_round = rounds[-1]
         payload = {
             "model": args.model,
             "train_tp": args.train_tp,
             "train_ep": args.train_ep,
-            "tensor_count": tensor_count,
-            "transferred_bytes": transferred_bytes,
-            "fanout_bytes": transferred_bytes * 2,
-            "total_seconds": total_seconds,
-            "send_seconds": send_finished - started,
-            "payload_gib_per_second": (
-                transferred_bytes / (1024**3) / total_seconds
-            ),
+            "repeats": args.repeats,
+            "tensor_count": final_round["tensor_count"],
+            "transferred_bytes": final_round["transferred_bytes"],
+            "fanout_bytes": final_round["fanout_bytes"],
+            "total_seconds": final_round["total_seconds"],
+            "send_seconds": final_round["send_seconds"],
+            "payload_gib_per_second": final_round["payload_gib_per_second"],
             "before": before,
-            "after": after,
-            "outputs_stable": before == after,
-            "responses": responses,
+            "after": final_round["after"],
+            "outputs_stable": all(
+                before == round_result["after"] for round_result in rounds
+            ),
+            "rounds": rounds,
         }
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)

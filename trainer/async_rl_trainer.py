@@ -1080,9 +1080,10 @@ class AsyncRLTrainer:
             or os.environ.get("MASTER_ADDR", "")
             or socket.gethostbyname(socket.gethostname())
         )
-        port = int(getattr(self.config, "rollout_nccl_port", 29620)) + (
-            int(target_version) % 1000
-        )
+        # Reuse one communicator across refreshes. The per-rank broadcast
+        # counters provide generation ordering; changing the port here would
+        # pay NCCL/TCPStore bootstrap on every training version.
+        port = int(getattr(self.config, "rollout_nccl_port", 29620))
         world_size, offsets = self._nccl_rollout_topology()
         request = {
             "mode": "nccl",

@@ -101,6 +101,11 @@ group. The trainer pauses rollout dispatch and sends bounded chunks outside
 gradient collectives. Set a positive `rollout_nccl_rate_limit_gbps` when the
 rollout and training jobs share an InfiniBand fabric.
 
+The communicator is cached by transport identity inside the Megatron and vLLM
+processes. Keep `rollout_nccl_port` stable across refreshes so later versions
+reuse the initialized NCCL/TCPStore connection. A topology change or process
+restart creates a new communicator automatically.
+
 Libra defaults the independent communicator to `NCCL_CUMEM_ENABLE=0` to match
 vLLM 0.9.x worker communicators. Do not configure different cuMem modes on the
 Megatron sender and vLLM receivers; mixed CUMEM/IPC transports fail during

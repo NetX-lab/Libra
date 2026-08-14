@@ -19,6 +19,7 @@ TRAIN_EP="${TRAIN_EP:-1}"
 BASE_PORT="${BASE_PORT:-18500}"
 TRANSPORT_PORT="${TRANSPORT_PORT:-29620}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.82}"
+PROBE_REPEATS="${PROBE_REPEATS:-1}"
 ROOT="$HOME/kwchen/rlinf_baseline"
 PROJECT="$ROOT/libra_nccl_dev/RL_Framework"
 MODEL="$HOME/kwchen/hf_models/$MODEL_NAME"
@@ -99,5 +100,6 @@ CUDA_VISIBLE_DEVICES="$TRAINER_CUDA_VISIBLE_DEVICES" \
       --transport-port "$TRANSPORT_PORT" \
       --train-tp "$TRAIN_TP" \
       --train-ep "$TRAIN_EP" \
+      --repeats "$PROBE_REPEATS" \
       --output "$RESULTS/result.json" \
       >"$RESULTS/trainer.log" 2>&1
