@@ -639,6 +639,8 @@ class AsyncRLConfig:
     rollout_weight_sync_control_dir: str = ""
     rollout_weight_sync_timeout_s: float = 1200.0
     rollout_weight_sync_export_only: bool = True
+    rollout_weight_reload_method: str = "restart"  # restart | inplace
+    rollout_weight_reload_strategy: str = "parallel"  # parallel | serial
     require_rollout_weight_sync: bool = False
 
 
@@ -754,6 +756,16 @@ class AsyncRLConfig:
 
         if self.weight_sync_mode not in ["disk", "nccl"]:
             raise ValueError("weight_sync_mode must be 'disk' or 'nccl'")
+        if self.rollout_weight_sync_mode not in ["none", "restart"]:
+            raise ValueError("rollout_weight_sync_mode must be 'none' or 'restart'")
+        if self.rollout_weight_reload_method not in ["restart", "inplace"]:
+            raise ValueError(
+                "rollout_weight_reload_method must be 'restart' or 'inplace'"
+            )
+        if self.rollout_weight_reload_strategy not in ["parallel", "serial"]:
+            raise ValueError(
+                "rollout_weight_reload_strategy must be 'parallel' or 'serial'"
+            )
         if self.pipeline_schedule != "1f1b":
             raise ValueError("pipeline_schedule currently supports only '1f1b'")
         if self.virtual_pipeline_model_parallel_size != 0:

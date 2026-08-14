@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a vLLM server and reload full checkpoints via a file handshake."""
+"""Run vLLM and refresh checkpoints through restart or in-place reload."""
 
 from __future__ import annotations
 
@@ -23,6 +23,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--health-url", required=True)
     parser.add_argument("--initial-model", required=True)
     parser.add_argument("--ready-timeout", type=float, default=1200.0)
+    parser.add_argument(
+        "--reload-strategy",
+        choices=("parallel", "serial"),
+        default="parallel",
+    )
+    parser.add_argument(
+        "--reload-method",
+        choices=("restart", "inplace"),
+        default="restart",
+    )
+    parser.add_argument("--poll-interval", type=float, default=0.25)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.command and args.command[0] == "--":
@@ -45,6 +56,24 @@ def wait_until_ready(process: subprocess.Popen, url: str, timeout: float) -> Non
             pass
         time.sleep(2)
     raise TimeoutError(f"vLLM did not become ready within {timeout}s: {url}")
+
+
+def reload_inplace(health_url: str, checkpoint_path: str, timeout: float) -> dict:
+    """Ask a running vLLM server to replace its resident model weights."""
+    endpoint = health_url.rsplit("/", 1)[0] + "/reload_weights"
+    payload = json.dumps(
+        {"checkpoint_path": checkpoint_path, "timeout_seconds": timeout}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout + 10) as response:
+        if response.status != 200:
+            raise RuntimeError(f"vLLM reload returned HTTP {response.status}")
+        return json.loads(response.read().decode("utf-8"))
 
 
 def stop_process(process: subprocess.Popen | None) -> None:
@@ -70,6 +99,13 @@ def node_reload_lock(control_dir: Path):
             yield
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def write_json_atomic(path: Path, payload: dict) -> None:
+    """Atomically publish a reload acknowledgement or error."""
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def main() -> int:
@@ -105,50 +141,93 @@ def main() -> int:
                     request = json.loads(request_path.read_text(encoding="utf-8"))
                     requested_version = int(request["version"])
                     checkpoint_path = str(request["checkpoint_path"])
+                    reload_method = str(
+                        request.get("reload_method", args.reload_method)
+                    ).lower()
+                    reload_strategy = str(
+                        request.get("reload_strategy", args.reload_strategy)
+                    ).lower()
+                    if reload_method not in {"restart", "inplace"}:
+                        raise ValueError(f"unsupported reload method: {reload_method}")
+                    if reload_strategy not in {"parallel", "serial"}:
+                        raise ValueError(f"unsupported reload strategy: {reload_strategy}")
                 except (OSError, ValueError, KeyError, json.JSONDecodeError):
-                    time.sleep(1)
+                    time.sleep(max(0.05, args.poll_interval))
                     continue
                 if requested_version > current_version:
                     if not Path(checkpoint_path).is_dir():
                         raise FileNotFoundError(checkpoint_path)
                     current_version = requested_version
+                    reload_started_at = time.time()
+                    response: dict = {}
                     try:
-                        with node_reload_lock(control_dir):
-                            stop_process(process)
-                            process = launch(checkpoint_path)
+                        reload_guard = (
+                            node_reload_lock(control_dir)
+                            if reload_strategy == "serial"
+                            else contextlib.nullcontext()
+                        )
+                        with reload_guard:
+                            guard_acquired_at = time.time()
+                            if reload_method == "restart":
+                                stop_process(process)
+                                stopped_at = time.time()
+                                process = launch(checkpoint_path)
+                            else:
+                                stopped_at = guard_acquired_at
+                                response = reload_inplace(
+                                    args.health_url,
+                                    checkpoint_path,
+                                    args.ready_timeout,
+                                )
                     except Exception as exc:
                         error_path = control_dir / f"error_{args.instance_id}_{current_version}.json"
-                        error_path.write_text(
-                            json.dumps(
-                                {
-                                    "instance_id": args.instance_id,
-                                    "version": current_version,
-                                    "checkpoint_path": checkpoint_path,
-                                    "error": str(exc),
-                                    "failed_at": time.time(),
-                                }
-                            ),
-                            encoding="utf-8",
-                        )
-                        raise
-                    ack_path = control_dir / f"ack_{args.instance_id}_{current_version}.json"
-                    ack_path.write_text(
-                        json.dumps(
+                        write_json_atomic(
+                            error_path,
                             {
                                 "instance_id": args.instance_id,
                                 "version": current_version,
                                 "checkpoint_path": checkpoint_path,
-                                "ready_at": time.time(),
-                            }
-                        ),
-                        encoding="utf-8",
+                                "reload_strategy": reload_strategy,
+                                "reload_method": reload_method,
+                                "error": str(exc),
+                                "failed_at": time.time(),
+                            },
+                        )
+                        raise
+                    ack_path = control_dir / f"ack_{args.instance_id}_{current_version}.json"
+                    ready_at = time.time()
+                    write_json_atomic(
+                        ack_path,
+                        {
+                            "instance_id": args.instance_id,
+                            "version": current_version,
+                            "checkpoint_path": checkpoint_path,
+                            "reload_strategy": reload_strategy,
+                            "reload_method": reload_method,
+                            "reload_started_at": reload_started_at,
+                            "guard_acquired_at": guard_acquired_at,
+                            "stopped_at": stopped_at,
+                            "ready_at": ready_at,
+                            "lock_wait_seconds": guard_acquired_at
+                            - reload_started_at,
+                            "stop_seconds": stopped_at - guard_acquired_at,
+                            "load_seconds": ready_at - stopped_at,
+                            "total_seconds": ready_at - reload_started_at,
+                            "server_response": response,
+                        },
                     )
-                    print(f"[vllm-reloader] ready version={current_version}", flush=True)
-            time.sleep(1)
+                    print(
+                        f"[vllm-reloader] ready version={current_version} "
+                        f"method={reload_method} strategy={reload_strategy} "
+                        f"reload_seconds={ready_at - reload_started_at:.2f}",
+                        flush=True,
+                    )
+            time.sleep(max(0.05, args.poll_interval))
     except KeyboardInterrupt:
         return 130
     finally:
         stop_process(process)
+    return 0
 
 
 if __name__ == "__main__":

@@ -255,6 +255,7 @@ def apply_megatron_core_014_compatibility() -> None:
         MegatronMappingRegistry,
     )
     from megatron.bridge.models.conversion.param_mapping import AutoMapping
+    from megatron.bridge.models.qwen.qwen2_bridge import Qwen2Bridge
     from megatron.bridge.models.qwen.qwen3_bridge import Qwen3Bridge
     from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
     from RL_Framework.engine.megatron_core_moe_mapping import (
@@ -264,6 +265,7 @@ def apply_megatron_core_014_compatibility() -> None:
     original_mapping_registry = Qwen3MoEBridge.mapping_registry
     original_provider_bridge = Qwen3MoEBridge.provider_bridge
     original_dense_mapping_registry = Qwen3Bridge.mapping_registry
+    original_qwen2_mapping_registry = Qwen2Bridge.mapping_registry
 
     if not getattr(
         original_provider_bridge,
@@ -354,6 +356,28 @@ def apply_megatron_core_014_compatibility() -> None:
 
         dense_mapping_registry._rl_framework_dense_qwen3_compat = True
         Qwen3Bridge.mapping_registry = dense_mapping_registry
+
+    if not getattr(
+        original_qwen2_mapping_registry,
+        "_rl_framework_dense_qwen2_compat",
+        False,
+    ):
+        def qwen2_mapping_registry(self):
+            registry = original_qwen2_mapping_registry(self)
+            return MegatronMappingRegistry(
+                AutoMapping(
+                    megatron_param="decoder.layers.*.input_layernorm.weight",
+                    hf_param="model.layers.*.input_layernorm.weight",
+                ),
+                AutoMapping(
+                    megatron_param="decoder.layers.*.pre_mlp_layernorm.weight",
+                    hf_param="model.layers.*.post_attention_layernorm.weight",
+                ),
+                *registry.get_all_mappings(),
+            )
+
+        qwen2_mapping_registry._rl_framework_dense_qwen2_compat = True
+        Qwen2Bridge.mapping_registry = qwen2_mapping_registry
 
 
 class TorchSDPADotProductAttention(MegatronModule):
@@ -448,8 +472,12 @@ def torch_sdpa_layer_spec(config):
     layer_spec.submodules.input_layernorm = TorchSequenceParallelNorm
     layer_spec.submodules.pre_mlp_layernorm = TorchSequenceParallelNorm
     attention_submodules = layer_spec.submodules.self_attention.submodules
-    attention_submodules.q_layernorm = TorchSequenceParallelNorm
-    attention_submodules.k_layernorm = TorchSequenceParallelNorm
+    if getattr(config, "qk_layernorm", False):
+        attention_submodules.q_layernorm = TorchSequenceParallelNorm
+        attention_submodules.k_layernorm = TorchSequenceParallelNorm
+    else:
+        attention_submodules.q_layernorm = None
+        attention_submodules.k_layernorm = None
     attention_submodules.core_attention = TorchSDPADotProductAttention
 
     return ModuleSpec(

@@ -88,8 +88,27 @@ def test_megatron_core_optimizer_offload_defaults_to_disabled():
 
     assert config.megatron_optimizer_cpu_offload is False
     assert config.megatron_optimizer_offload_fraction == 0.0
+    assert config.rollout_weight_reload_method == "restart"
+    assert config.rollout_weight_reload_strategy == "parallel"
 
 
 def test_megatron_core_rejects_offload_fraction_without_cpu_offload():
     with pytest.raises(ValueError, match="requires"):
         make_config(megatron_optimizer_offload_fraction=1.0)
+
+
+@pytest.mark.parametrize("method", ["restart", "inplace"])
+def test_rollout_weight_reload_methods_are_valid(method):
+    config = make_config(rollout_weight_reload_method=method)
+
+    assert config.rollout_weight_reload_method == method
+
+
+def test_rejects_unknown_rollout_weight_reload_method():
+    with pytest.raises(ValueError, match="rollout_weight_reload_method"):
+        make_config(rollout_weight_reload_method="unknown")
+
+
+def test_rejects_unknown_rollout_weight_reload_strategy():
+    with pytest.raises(ValueError, match="rollout_weight_reload_strategy"):
+        make_config(rollout_weight_reload_strategy="unknown")
