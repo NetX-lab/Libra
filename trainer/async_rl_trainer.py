@@ -1170,7 +1170,15 @@ class AsyncRLTrainer:
                     if not (control_dir / f"ack_{instance_id}_{target_version}.json").exists()
                 }
                 if pending:
-                    time.sleep(1.0)
+                    time.sleep(
+                        float(
+                            getattr(
+                                self.config,
+                                "rollout_weight_sync_poll_interval_s",
+                                0.05,
+                            )
+                        )
+                    )
             if pending:
                 raise TimeoutError(f"Timed out waiting for NCCL reload: {sorted(pending)}")
             self._record_rollout_weight_version(

@@ -28,6 +28,7 @@ rollout_nccl_host: ""
 rollout_nccl_port: 29620
 rollout_nccl_chunk_mb: 256
 rollout_nccl_rate_limit_gbps: 0.0
+rollout_weight_sync_poll_interval_s: 0.05
 require_rollout_weight_sync: false
 
 
