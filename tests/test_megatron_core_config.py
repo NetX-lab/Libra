@@ -112,3 +112,31 @@ def test_rejects_unknown_rollout_weight_reload_method():
 def test_rejects_unknown_rollout_weight_reload_strategy():
     with pytest.raises(ValueError, match="rollout_weight_reload_strategy"):
         make_config(rollout_weight_reload_strategy="unknown")
+
+
+def test_direct_nccl_rollout_sync_is_valid_for_megatron_core():
+    config = make_config(
+        weight_sync_mode="nccl",
+        rollout_weight_sync_mode="nccl",
+        rollout_weight_sync_control_dir="/tmp/libra-rollout-sync",
+    )
+
+    assert config.weight_sync_mode == "nccl"
+    assert config.rollout_weight_sync_mode == "nccl"
+
+
+def test_direct_nccl_rollout_sync_rejects_serial_reload():
+    with pytest.raises(ValueError, match="parallel strategy"):
+        make_config(
+            weight_sync_mode="nccl",
+            rollout_weight_sync_mode="nccl",
+            rollout_weight_reload_strategy="serial",
+        )
+
+
+def test_direct_nccl_rollout_sync_rejects_disk_transport():
+    with pytest.raises(ValueError, match="weight_sync_mode='nccl'"):
+        make_config(
+            weight_sync_mode="disk",
+            rollout_weight_sync_mode="nccl",
+        )

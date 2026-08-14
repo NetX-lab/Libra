@@ -24,6 +24,17 @@ class ReloadWeightsRequest(BaseModel):
     timeout_seconds: float = 300.0
 
 
+class ReloadWeightsNcclRequest(BaseModel):
+    """Payload for a direct Megatron-to-vLLM NCCL reload."""
+
+    host: str
+    port: int
+    world_size: int
+    rank_offset: int
+    timeout_seconds: float = 1200.0
+    chunk_bytes: int = 268435456
+
+
 _reload_lock = asyncio.Lock()
 
 
@@ -49,6 +60,37 @@ async def reload_weights(payload: ReloadWeightsRequest, request: Request):
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         return {
             "checkpoint_path": str(checkpoint),
+            "total_seconds": time.perf_counter() - started,
+            "workers": results,
+        }
+
+
+@api_server.router.post("/reload_weights_nccl")
+async def reload_weights_nccl(
+    payload: ReloadWeightsNcclRequest,
+    request: Request,
+):
+    """Receive the next model directly from the Megatron GPU stream."""
+    async with _reload_lock:
+        started = time.perf_counter()
+        client = api_server.engine_client(request)
+        try:
+            results = await client.collective_rpc(
+                "reload_weights_nccl",
+                timeout=payload.timeout_seconds,
+                args=(
+                    payload.host,
+                    payload.port,
+                    payload.world_size,
+                    payload.rank_offset,
+                    payload.timeout_seconds,
+                    payload.chunk_bytes,
+                ),
+            )
+            await client.reset_prefix_cache()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {
             "total_seconds": time.perf_counter() - started,
             "workers": results,
         }

@@ -24,6 +24,10 @@ rollout_weight_sync_timeout_s: 1200
 rollout_weight_sync_export_only: true
 rollout_weight_reload_method: "restart"
 rollout_weight_reload_strategy: "parallel"
+rollout_nccl_host: ""
+rollout_nccl_port: 29620
+rollout_nccl_chunk_mb: 256
+rollout_nccl_rate_limit_gbps: 0.0
 require_rollout_weight_sync: false
 
 
