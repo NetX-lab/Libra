@@ -13,6 +13,7 @@ import torch
 
 _COMMUNICATOR_CACHE: dict[tuple[str, int, int, int, str], object] = {}
 _COMMUNICATOR_CACHE_LOCK = threading.Lock()
+_PIPELINE_DEPTH = 2
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ def _communicator(spec: NcclReloadSpec):
     # vLLM 0.9.x disables cuMem for its worker communicators. All ranks in
     # this independent communicator must use the same transport mode.
     os.environ.setdefault("NCCL_CUMEM_ENABLE", "0")
+    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
     class _BroadcastCommunicator(PyNcclCommunicator):
@@ -61,12 +63,30 @@ def _communicator(spec: NcclReloadSpec):
             self._constructor_warmup_output = result
             return result
 
-    device = str(torch.device(spec.device))
-    key = (str(spec.host), int(spec.port), int(spec.world_size), int(spec.rank), device)
+    device = torch.device(spec.device)
+    device_key = str(device)
+    key = (
+        str(spec.host),
+        int(spec.port),
+        int(spec.world_size),
+        int(spec.rank),
+        device_key,
+    )
     with _COMMUNICATOR_CACHE_LOCK:
         communicator = _COMMUNICATOR_CACHE.get(key)
         if communicator is None:
-            communicator = _BroadcastCommunicator(_group(spec), device=spec.device)
+            # vLLM may have changed the current device while serving requests.
+            # Bind the CUDA context before creating this independent NCCL
+            # communicator; otherwise DeepSeek's first warm-up collective can
+            # execute on a stale device and report an asynchronous launch error.
+            if device.type == "cuda" and torch.cuda.is_available():
+                with torch.cuda.device(device):
+                    torch.cuda.synchronize(device)
+                    communicator = _BroadcastCommunicator(
+                        _group(spec), device=device
+                    )
+            else:
+                communicator = _BroadcastCommunicator(_group(spec), device=device)
             communicator._constructor_warmup_output = None
             _COMMUNICATOR_CACHE[key] = communicator
         return communicator
@@ -89,6 +109,20 @@ def _dtype_from_name(name: str) -> torch.dtype:
     return value
 
 
+def _cuda_stream(device: str | int):
+    resolved = torch.device(device)
+    if resolved.type != "cuda" or not torch.cuda.is_available():
+        return None
+    return torch.cuda.Stream(device=resolved)
+
+
+def _wait_for_event(event, device: str | int) -> None:
+    if event is None:
+        return
+    consumer_stream = torch.cuda.current_stream(device=torch.device(device))
+    consumer_stream.wait_event(event)
+
+
 def send_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     spec: NcclReloadSpec,
@@ -109,6 +143,14 @@ def send_weights(
         # The receivers may still be consuming the final metadata marker after
         # this function returns. Keep the TCPStore alive until their RPC acks.
         keepalive.append(comm)
+    stream = _cuda_stream(spec.device)
+    pending: list[tuple[torch.Tensor, object]] = []
+
+    def drain_one() -> None:
+        if pending:
+            _tensor, event = pending.pop(0)
+            event.synchronize()
+
     count = 0
     for name, tensor in weights:
         if tensor.device.type != "cuda":
@@ -127,18 +169,30 @@ def send_weights(
         for start in range(0, flat.numel(), chunk_numel):
             chunk = flat[start : start + chunk_numel]
             chunk_started = time.perf_counter()
-            comm.broadcast(chunk, src=0)
-            torch.cuda.current_stream(tensor.device).synchronize()
+            if stream is None:
+                comm.broadcast(chunk, src=0)
+            else:
+                comm.broadcast(chunk, src=0, stream=stream)
             if spec.rate_limit_gbps > 0:
+                if stream is not None:
+                    stream.synchronize()
                 target_seconds = (
                     chunk.numel() * chunk.element_size() * 8
                 ) / (spec.rate_limit_gbps * 1e9)
                 elapsed = time.perf_counter() - chunk_started
                 if elapsed < target_seconds:
                     time.sleep(target_seconds - elapsed)
+        if stream is not None:
+            event = torch.cuda.Event()
+            event.record(stream)
+            pending.append((tensor, event))
+            if len(pending) >= _PIPELINE_DEPTH:
+                drain_one()
         count += 1
         if on_tensor is not None:
             on_tensor(str(name), int(tensor.numel() * tensor.element_size()))
+    while pending:
+        drain_one()
     comm.group.broadcast_obj({"done": True}, src=0)
     return count
 
@@ -146,6 +200,7 @@ def send_weights(
 def receive_weights(spec: NcclReloadSpec) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield NCCL-received HF tensors for vLLM's ``load_weights`` method."""
     comm = _communicator(spec)
+    stream = _cuda_stream(spec.device)
     while True:
         metadata = comm.group.broadcast_obj(None, src=0)
         if metadata.get("done", False):
@@ -160,6 +215,13 @@ def receive_weights(spec: NcclReloadSpec) -> Iterator[tuple[str, torch.Tensor]]:
         chunk_numel = max(1, int(metadata["chunk_numel"]))
         for start in range(0, flat.numel(), chunk_numel):
             chunk = flat[start : start + chunk_numel]
-            comm.broadcast(chunk, src=0)
-            torch.cuda.current_stream(tensor.device).synchronize()
+            if stream is None:
+                comm.broadcast(chunk, src=0)
+            else:
+                comm.broadcast(chunk, src=0, stream=stream)
+        if stream is not None:
+            event = torch.cuda.Event()
+            event.record(stream)
+            _wait_for_event(event, spec.device)
+            tensor.record_stream(torch.cuda.current_stream(device=torch.device(spec.device)))
         yield str(metadata["name"]), tensor

@@ -645,6 +645,7 @@ class AsyncRLConfig:
     rollout_nccl_port: int = 29620
     rollout_nccl_chunk_mb: int = 256
     rollout_nccl_rate_limit_gbps: float = 0.0
+    rollout_weight_sync_poll_interval_s: float = 0.05
     require_rollout_weight_sync: bool = False
 
 
@@ -787,6 +788,10 @@ class AsyncRLConfig:
                 raise ValueError("rollout_nccl_chunk_mb must be greater than zero")
             if self.rollout_nccl_rate_limit_gbps < 0:
                 raise ValueError("rollout_nccl_rate_limit_gbps cannot be negative")
+            if self.rollout_weight_sync_poll_interval_s <= 0:
+                raise ValueError(
+                    "rollout_weight_sync_poll_interval_s must be greater than zero"
+                )
         if self.pipeline_schedule != "1f1b":
             raise ValueError("pipeline_schedule currently supports only '1f1b'")
         if self.virtual_pipeline_model_parallel_size != 0:
