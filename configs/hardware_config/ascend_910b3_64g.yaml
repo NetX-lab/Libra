@@ -1,0 +1,10 @@
+# Ascend 910B3 profile used by the six-node NPU experiment. mem_capacity is
+# the allocator-visible capacity reported by PyTorch/NPU on these hosts.
+flops_peak: 3.12e+14
+mem_bw: 2.0e+12
+mem_capacity: 6.5455301591e+10
+bw_intra_node: 6.0e+11
+bw_inter_node: 2.0e+11
+gpus_per_node: 8
+tp_comm_overhead: 5.0e-6
+latency_inter_node: 5.0e-6

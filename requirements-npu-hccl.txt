@@ -1,0 +1,67 @@
+# Unified Ascend stack for official vLLM HCCL weight transfer.
+#
+# Required platform baseline:
+#   - CANN 9.0.0
+#   - vLLM 0.22.1 (installed with --no-deps; see scripts/setup_npu_env.sh)
+#   - vLLM Ascend 0.22.1rc1
+#   - PyTorch / torch-npu 2.10.0
+#
+# Keep the legacy CANN 8.5 / torch 2.7 profile in requirements-npu.txt for
+# rollback. This profile must be installed into a fresh environment.
+
+torch==2.10.0
+torch-npu==2.10.0
+torchaudio==2.10.0
+torchvision==0.25.0
+vllm==0.22.1
+vllm-ascend==0.22.1rc1
+# The available ARM64 index exposes Triton Ascend 3.2.0; the published
+# v0.22.1rc1 metadata asks for 3.2.1, so setup_npu_env.sh installs the
+# Ascend wheel without re-resolving this already-pinned runtime dependency.
+triton-ascend==3.2.0
+# vLLM Ascend 0.22.1rc1 pins Transformers 5.5.4.
+transformers==5.5.4
+compressed-tensors==0.15.0.1
+accelerate>=1.0.0,<2.0.0
+
+# Megatron-Core + Megatron Bridge are required by the trainer-side HF export.
+# The rc6 Bridge wheel is kept as an explicit pin because this repository's
+# Qwen3 Bridge adapter targets that API.  It may need to come from the private
+# wheelhouse when the public index does not carry the release candidate.
+megatron-core==0.14.0
+megatron-bridge==0.2.0rc6
+omegaconf>=2.3.0,<3.0.0
+hydra-core>1.3,<=1.3.2
+# OmegaConf 2.3.x requires the 4.9 runtime line.
+antlr4-python3-runtime==4.9.3
+einops>=0.8.0,<1.0.0
+packaging>=24.2
+rich>=13.0.0
+
+datasets>=2.18.0,<4.0.0
+pandas>=2.1.0,<3.0.0
+numpy>=1.26.0,<2.0.0
+scipy>=1.11.0,<2.0.0
+matplotlib>=3.8.0,<4.0.0
+seaborn>=0.13.0,<1.0.0
+pyyaml>=6.0.1
+aiohttp>=3.9.0,<4.0.0
+httpx>=0.27.0,<1.0.0
+tqdm>=4.66.0
+python-dateutil>=2.8.2
+psutil>=5.9.8
+importlib-metadata>=6.0.0
+pybase64==1.4.3
+openai>=1.52.0
+decorator>=5.1.0
+cloudpickle>=2.2.0
+ml-dtypes>=0.4.0
+tornado>=6.4.0
+absl-py>=2.0.0
+colorlog>=6.8.0
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+latex2sympy2
+word2number
+wandb
+sympy

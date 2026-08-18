@@ -1,0 +1,19 @@
+# ============================================================
+
+#
+
+
+#
+
+#   hardware_config: hardware_config/a800_80g.yaml
+#
+
+# ============================================================
+
+flops_peak: 3.12e+14
+mem_bw: 2.0e+12
+mem_capacity: 8.0e+10
+bw_intra_node: 4.0e+11
+bw_inter_node: 1.0e+11
+gpus_per_node: 8
+tp_comm_overhead: 8.0e-6

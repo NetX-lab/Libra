@@ -1,0 +1,13 @@
+# Treatment: GRP chooses the initial NPU-level allocation from the full shared
+# 48-NPU budget. There is no fixed train count or whole-node granularity.
+base_config: r2e_gym_qwen3_14b_mcore_npu_6node48_grp_ab_equal_common.yaml
+
+wandb_run_name: "r2e-gym-qwen3-14b-mcore-npu-6node48-grp"
+history_experiment_name: "r2e_gym_qwen3_14b_6node48_grp"
+
+global_resource_planner:
+  enabled: true
+  initial_allocation_strategy: "grp"
+  fixed_train_gpus: 0
+  runtime_async_planning: true
+  runtime_online_replanning: true

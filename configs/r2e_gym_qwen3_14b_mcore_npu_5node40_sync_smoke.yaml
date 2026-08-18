@@ -1,0 +1,21 @@
+# Two-step gate that additionally validates Megatron-to-HF export and managed
+# rollout restart/acknowledgement on all four heterogeneous instances.
+base_config: r2e_gym_qwen3_14b_mcore_npu_5node40_smoke.yaml
+
+total_steps: 2
+sync_interval: 1
+megatron_streaming_export: true
+rollout_weight_sync_mode: "restart"
+rollout_weight_sync_control_dir: "./runs/r2e_gym_qwen3_14b_5node40/rollout_smoke/control"
+rollout_weight_sync_timeout_s: 2400
+rollout_weight_sync_export_only: true
+require_rollout_weight_sync: true
+
+sync_path: "./runs/r2e_gym_qwen3_14b_5node40/sync_smoke/weights"
+log_dir: "./runs/r2e_gym_qwen3_14b_5node40/sync_smoke/logs"
+history_output_dir: "./runs/r2e_gym_qwen3_14b_5node40/sync_smoke/history"
+history_experiment_name: "r2e_gym_qwen3_14b_5node40_sync_smoke"
+
+heterogeneous_rollout:
+  scheduling:
+    cmlfq_tree_path: "./runs/r2e_gym_qwen3_14b_5node40/sync_smoke/cmlfq_tree.json"

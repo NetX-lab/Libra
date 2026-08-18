@@ -1,0 +1,115 @@
+# ============================================================
+
+#
+
+#   bash scripts/run_hetero_distributed_4GPU.sh --config configs/gsm8k_hetero_4gpu.yaml
+
+#
+
+
+
+
+#
+
+# ============================================================
+
+
+base_config: base.yaml
+
+
+hardware_config: hardware_config/a100_80g.yaml
+model_arch_config: model_arch_config/qwen2.5-3b.yaml
+
+
+model_path: "/path/to/Qwen3-4B"
+
+
+train_gpus: 2
+tp_size: 1
+
+
+
+rollout_gpus: 2
+
+
+dataset_name: "openai/gsm8k"
+max_new_tokens: 2048
+max_seq_length: 4096
+
+
+wandb_project: "RL_Framework_gsm8k_hetero"
+wandb_run_name: "gsm8k_hetero_rollout"
+
+# ============================================================
+
+#
+
+
+
+#
+
+#   GPU 0,1      -> Training (FSDP, 2 GPU)
+
+
+# ============================================================
+heterogeneous_rollout:
+  enabled: true
+
+
+  total_gpus: 2
+  available_gpus: [2, 3]
+
+
+  vllm_host: "127.0.0.1"
+  vllm_base_port: 8000
+  startup_timeout: 300
+  gpu_memory_utilization: 0.90
+  max_model_len: 4096
+
+
+  instances:
+    - instance_id: "tp1_inst0"
+      tp: 1
+      gpus: [2]
+      description: "TP=1 instance for short sequences"
+
+    - instance_id: "tp1_inst1"
+      tp: 1
+      gpus: [3]
+      description: "TP=1 instance for short sequences"
+
+
+  scheduling:
+    scheduler_type: "load_balance"
+
+    length_thresholds:
+      short: 1024        # <= 1024 tokens -> short
+      medium: 2048       # 1025-2048 tokens -> medium
+      long: 4096         # 2049-4096 tokens -> long
+                         # > 4096 tokens -> extra_long
+
+
+    routing_rules:
+      short: [1]
+      medium: [1]
+      long: [1]
+      extra_long: [1]
+
+
+    load_balance_strategy: "round_robin"
+
+
+    max_queue_length: 64
+
+
+    enable_fallback: true
+
+
+    adaptive_routing: true
+
+
+    request_timeout: 600
+
+
+max_concurrent_rollouts: 32
+max_head_offpolicyness: 4

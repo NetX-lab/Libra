@@ -1,0 +1,11 @@
+# C-MLFQ ablation control: keep the same model, topology, workload and GRP
+# settings as the 5-node experiment, changing only the rollout scheduler.
+base_config: r2e_gym_qwen3_14b_mcore_npu_5node40_100step.yaml
+
+wandb_run_name: "r2e-gym-qwen3-14b-mcore-npu-5node40-no-cmlfq"
+history_experiment_name: "r2e_gym_qwen3_14b_5node40_no_cmlfq"
+
+heterogeneous_rollout:
+  scheduling:
+    scheduler_type: "load_balance"
+    load_balance_strategy: "round_robin"

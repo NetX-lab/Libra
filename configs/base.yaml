@@ -1,0 +1,71 @@
+# ============================================================
+
+#
+
+#   base_config: base.yaml
+# ============================================================
+
+
+max_concurrent_rollouts: 64
+max_head_offpolicyness: 4
+queue_size: 256
+enable_rollout_tracing: false
+sync_interval: 1
+
+# Decoupled PPO
+recompute_logprobs: true
+
+
+weight_sync_mode: "disk"
+sync_path: "./logs/async_rl_weights"
+rollout_weight_sync_mode: "none"
+rollout_weight_sync_control_dir: ""
+rollout_weight_sync_timeout_s: 1200
+rollout_weight_sync_export_only: true
+rollout_weight_reload_method: "restart"
+rollout_weight_reload_strategy: "parallel"
+rollout_weight_sync_poll_interval_s: 0.05
+rollout_hccl_host: ""
+rollout_hccl_port: 29620
+rollout_hccl_packed: true
+rollout_hccl_packed_buffer_mb: 1024
+rollout_hccl_buffer_headroom_mb: 128
+rollout_hccl_num_buffers: 2
+rollout_hccl_checkpoint_format: true
+require_rollout_weight_sync: false
+
+
+learning_rate: 1.0e-6
+ppo_epochs: 1
+batch_size: 32
+micro_batch_size: 4
+kl_coef: 0.001
+clip_epsilon: 0.2
+gamma: 1.0
+
+
+max_new_tokens: 1024
+n_samples: 4
+temperature: 1.0
+top_p: 1.0
+
+
+dataset_split: "train"
+max_seq_length: 2048
+
+
+total_steps: 100
+eval_interval: 10
+save_interval: 10
+seed: 42
+
+
+vllm_host: "127.0.0.1"
+vllm_port: 8000
+vllm_num_instances: 0
+
+
+log_dir: "./logs"
+
+
+keep_latest_checkpoints: 5

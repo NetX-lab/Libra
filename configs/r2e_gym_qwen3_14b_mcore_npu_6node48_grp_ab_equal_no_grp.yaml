@@ -1,0 +1,13 @@
+# Control: GRP is disabled and resources remain at the requested even 24/24
+# training/rollout split for all 100 steps.
+base_config: r2e_gym_qwen3_14b_mcore_npu_6node48_grp_ab_equal_common.yaml
+
+wandb_run_name: "r2e-gym-qwen3-14b-mcore-npu-6node48-no-grp-equal"
+history_experiment_name: "r2e_gym_qwen3_14b_6node48_no_grp_equal"
+
+global_resource_planner:
+  enabled: false
+  initial_allocation_strategy: "configured"
+  fixed_train_gpus: 24
+  runtime_async_planning: false
+  runtime_online_replanning: false

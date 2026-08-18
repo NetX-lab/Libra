@@ -1,0 +1,12 @@
+# Approximate continuation of the fixed 24/24 arm. Model weights start from
+# the exported v25 Hugging Face snapshot, while optimizer state is intentionally
+# reinitialized. This is not a strict checkpoint resume.
+base_config: r2e_gym_qwen3_14b_mcore_npu_6node48_grp_ab_equal_no_grp.yaml
+
+model_path: /path/to/model-or-checkpoint
+total_steps: 75
+sync_interval: 25
+save_interval: 25
+
+wandb_run_name: "r2e-gym-qwen3-14b-mcore-npu-6node48-no-grp-v25-optimizer-reset-75step"
+history_experiment_name: "r2e_gym_qwen3_14b_6node48_no_grp_v25_optimizer_reset_75step"

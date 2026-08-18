@@ -1,0 +1,15 @@
+# Control arm: use precisely the EHP arm's GRP-selected startup plan, but
+# never accept an online plan or change rollout/training ownership afterwards.
+base_config: r2e_gym_qwen3_14b_mcore_npu_2node16_ehp_docker.yaml
+
+wandb_run_name: r2e-gym-qwen3-14b-mcore-npu-2node16-no-ehp-docker
+history_experiment_name: r2e_gym_qwen3_14b_2node16_no_ehp_docker
+
+global_resource_planner:
+  runtime_async_planning: false
+  runtime_online_replanning: false
+  runtime_dynamic_reconfiguration_enabled: false
+  runtime_reconfigure_training: false
+  runtime_manage_rollout_processes: false
+  hybrid_worker_launch_enabled: false
+  hybrid_worker_remote_control_enabled: false

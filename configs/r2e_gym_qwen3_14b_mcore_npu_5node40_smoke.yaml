@@ -1,0 +1,34 @@
+# End-to-end gate for the exact 5-node/40-NPU experiment.  Only duration and
+# sequence limits are reduced; model, Megatron topology and heterogeneous
+# rollout topology remain identical to the 100-step configuration.
+base_config: r2e_gym_qwen3_14b_mcore_npu_5node40_100step.yaml
+
+total_steps: 1
+max_seq_length: 512
+max_new_tokens: 128
+r2e_max_turns: 1
+r2e_max_prompt_tokens: 256
+sync_interval: 0
+eval_interval: 0
+save_interval: 0
+
+megatron_streaming_export: false
+rollout_weight_sync_mode: "none"
+require_rollout_weight_sync: false
+
+sync_path: "./runs/r2e_gym_qwen3_14b_5node40/smoke/weights"
+log_dir: "./runs/r2e_gym_qwen3_14b_5node40/smoke/logs"
+history_output_dir: "./runs/r2e_gym_qwen3_14b_5node40/smoke/history"
+history_experiment_name: "r2e_gym_qwen3_14b_5node40_smoke"
+
+heterogeneous_rollout:
+  scheduling:
+    cmlfq_tree_path: "./runs/r2e_gym_qwen3_14b_5node40/smoke/cmlfq_tree.json"
+
+global_resource_planner:
+  enabled: true
+  apply_to_runtime: false
+  runtime_async_planning: false
+  runtime_dynamic_reconfiguration_enabled: false
+  runtime_online_replanning: false
+  runtime_reconfigure_training: false

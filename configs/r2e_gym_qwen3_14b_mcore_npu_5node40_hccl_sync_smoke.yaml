@@ -1,0 +1,23 @@
+# Official vLLM Ascend HCCL in-place weight refresh smoke test.
+base_config: r2e_gym_qwen3_14b_mcore_npu_5node40_smoke.yaml
+
+total_steps: 2
+sync_interval: 1
+weight_sync_mode: "hccl"
+rollout_weight_sync_mode: "hccl"
+rollout_weight_sync_control_dir: "./runs/r2e_gym_qwen3_14b_5node40/hccl_sync/control"
+rollout_weight_sync_timeout_s: 2400
+rollout_weight_sync_poll_interval_s: 0.05
+rollout_hccl_host: ""
+rollout_hccl_port: 29620
+rollout_hccl_packed: true
+rollout_hccl_packed_buffer_mb: 1024
+rollout_hccl_buffer_headroom_mb: 128
+rollout_hccl_num_buffers: 2
+rollout_hccl_checkpoint_format: true
+require_rollout_weight_sync: true
+
+sync_path: "./runs/r2e_gym_qwen3_14b_5node40/hccl_sync/weights"
+log_dir: "./runs/r2e_gym_qwen3_14b_5node40/hccl_sync/logs"
+history_output_dir: "./runs/r2e_gym_qwen3_14b_5node40/hccl_sync/history"
+history_experiment_name: "r2e_gym_qwen3_14b_5node40_hccl_sync_smoke"

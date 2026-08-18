@@ -1,0 +1,25 @@
+# ============================================================
+
+#
+
+
+#   model_arch_config: model_arch_config/qwen3-30b-a3b.yaml
+# ============================================================
+
+num_params: 30.0e+9
+d_model: 2048
+n_layers: 48
+n_heads: 32
+n_kv_heads: 4               # GQA
+vocab_size: 151936
+intermediate_size: 6144
+dtype_bytes: 2              # BF16
+
+
+is_moe: true
+active_num_params: 3.0e+9
+num_experts: 128
+num_shared_experts: 1
+num_activated_experts: 8    # top_k = 8
+expert_intermediate_size: 768
+shared_expert_intermediate_size: 768

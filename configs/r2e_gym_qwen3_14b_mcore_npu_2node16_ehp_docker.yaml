@@ -1,0 +1,387 @@
+batch_size: 32
+clip_epsilon: 0.2
+dataset_name: openai/gsm8k
+dataset_split: train
+device_backend: npu
+distributed_backend: hccl
+enable_history_collection: true
+enable_rollout_tracing: false
+eval_interval: 0
+expert_tensor_parallel_size: 1
+gamma: 1.0
+global_resource_planner:
+  allowed_rollout_tp:
+  - 1
+  - 2
+  - 4
+  - 8
+  allowed_train_pp: []
+  allowed_train_tp: []
+  apply_to_runtime: true
+  # The current NPU launcher does not initialize a separate elastic CCL
+  # process group; use the initialized training group for the migration smoke.
+  decouple_communication_domains: false
+  elastic_hybrid_borrow_train_rollout_ratio: 1.15
+  elastic_hybrid_join_timeout_s: 180.0
+  elastic_hybrid_max_rollout_pressure: 0.8
+  elastic_hybrid_max_workers: 0
+  elastic_hybrid_planning_enabled: true
+  elastic_hybrid_release_train_rollout_ratio: 0.9
+  elastic_hybrid_replica_size_gpus: 0
+  elastic_hybrid_require_isolated_ccl: true
+  elastic_hybrid_require_planner_signal: true
+  elastic_hybrid_signal_ttl_steps: 20
+  enabled: true
+  fixed_train_gpus: 0
+  gradient_server_authkey: rl-framework-elastic
+  gradient_server_host: 0.0.0.0
+  gradient_server_port: 29852
+  gradient_server_public_host: node-internal
+  gradient_transport_backend: tcp
+  hybrid_active_gradient_timeout_s: 300.0
+  hybrid_lockstep_gradient_sync: true
+  hybrid_training_prewarm_count: 0
+  hybrid_training_prewarm_enabled: false
+  hybrid_training_prewarm_worker_ids: []
+  hybrid_update_timeout_s: 300.0
+  hybrid_worker_command_template: ''
+  hybrid_worker_config_path: ''
+  hybrid_worker_endpoint_dir: ''
+  hybrid_worker_launch_enabled: true
+  hybrid_worker_mode: megatron_core
+  hybrid_worker_python: python
+  hybrid_worker_ready_timeout_s: 120
+  hybrid_worker_remote_control_dir: ./runs/r2e_gym_qwen3_14b_2node16_ehp_docker/preflight_2node_ctx4096_20260818/elastic_training_tasks
+  hybrid_worker_remote_control_enabled: true
+  hybrid_worker_task_dir: ./runs/r2e_gym_qwen3_14b_2node16_ehp_docker/preflight_2node_ctx4096_20260818/elastic_training_tasks
+  initial_allocation_applied: true
+  initial_allocation_strategy: grp
+  max_history_size: 4096
+  micro_batch_sizes: []
+  min_gain_ratio: 0.05
+  min_history_size: 1
+  native_rdma_device: mlx5_0
+  native_rdma_gid_index: 0
+  native_rdma_ib_port: 1
+  native_rdma_max_bytes: 67108864
+  plan_interval: 1
+  reconfiguration_cost_s: 120.0
+  require_heterogeneous_rollout_tp: false
+  rollout_backend: analytic
+  rollout_node_tp_pattern: []
+  runtime_active_rollout_pressure_threshold: 0.85
+  runtime_adopt_existing_rollout_processes: true
+  runtime_async_planning: false
+  runtime_batch_collection_max_retries: 0
+  runtime_batch_collection_timeout_s: 0.0
+  runtime_cluster_swap_enabled: true
+  runtime_coordinate_batch_source_only: true
+  # The current single-train-node smoke path cannot publish peer-ready
+  # markers reliably while the batch-source rank is draining.  Disable the
+  # optional peer barrier so rank 0 can execute the cluster swap and peers
+  # consume the applied manifest on the next step.
+  runtime_coordinate_reconfiguration_ranks: false
+  runtime_drain_before_reconfigure: true
+  runtime_drain_timeout_s: 3600.0
+  runtime_dynamic_reconfiguration_enabled: true
+  runtime_length_profile_enabled: true
+  runtime_length_profile_jsonl: ./runs/r2e_gym_qwen3_14b_2node16_ehp_docker/preflight_2node_ctx4096_20260818/history/runtime_length_profile.jsonl
+  runtime_manage_rollout_processes: true
+  runtime_max_pending_plans: 1
+  runtime_online_replanning: true
+  runtime_peer_request_wait_s: 120
+  runtime_post_rollout_stop_grace_s: 5.0
+  runtime_prewarm_no_spare_fallback_strategy: restart_all
+  runtime_queue_pressure_threshold: 0.75
+  runtime_reconfigure_training: true
+  runtime_rejected_rollout_delta_threshold: 8
+  runtime_replan_cooldown_steps: 1
+  runtime_rollout_log_dir: ./runs/r2e_gym_qwen3_14b_2node16_ehp_docker/preflight_2node_ctx4096_20260818/runtime_rollout_logs
+  runtime_rollout_manifest_path: ./runs/r2e_gym_qwen3_14b_2node16_ehp_docker/preflight_2node_ctx4096_20260818/runtime_reconfiguration/rollout_manifest.json
+  runtime_rollout_pid_registry_path: ''
+  runtime_rollout_reconfigure_strategy: cluster_swap
+  runtime_rollout_train_imbalance_threshold: 1.25
+  runtime_training_pool_only: true
+  runtime_training_pool_plan_only: false
+  runtime_training_pool_target_gpus: 0
+  runtime_use_nccl_barrier_after_rollout: false
+  runtime_use_nccl_barrier_before_weight_sync: false
+  runtime_wait_rollout_process_start_ready: true
+  sailor_path: ../sailor
+  sailor_python: python
+  sailor_train_command: ''
+  simulator_allow_fallback: true
+  simulator_cache_dir: ./logs/global_resource_planner/simulator_cache
+  simulator_timeout_s: 120.0
+  startup_profile_allow_synthetic_fallback: false
+  startup_profile_dataset_jsonl: ''
+  startup_profile_enabled: true
+  startup_profile_history_jsonl: ''
+  startup_profile_reuse_existing: true
+  startup_profile_sample_size: 64
+  startup_profile_samples_per_prompt: 1
+  startup_profile_seed: 0
+  startup_profile_strategy: spread
+  startup_profile_summary_json: ''
+  train_backend: analytic
+  verbose: true
+  vidur_batch_size_cap: 512
+  vidur_chunk_size: 512
+  vidur_device: a100
+  vidur_model_name: meta-llama/Meta-Llama-3-8B
+  vidur_path: ../vidur
+  vidur_python: python
+  vidur_qps: 1000000.0
+  vidur_rollout_command: ''
+  vidur_scheduler: sarathi
+  vidur_time_limit_s: 0.0
+  vllm_launch_command_template: ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=120 -o TCPKeepAlive=yes root@{host}
+    EHP_DOCKER_EXEC=1 EHP_DOCKER_CONTAINER=ehp-container bash ./scripts/ehp_docker_exec.sh
+    bash -lc 'bash ./scripts/runtime_manage_r2e_rollout_npu.sh
+    run' {instance_id} {gpus} {tp} {port} ./runs/r2e_gym_qwen3_14b_2node16_ehp_docker/preflight_2node_ctx4096_20260818
+    {model_path} {max_model_len}
+  vllm_ready_timeout_s: 1800.0
+  vllm_stop_command_template: ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=120 -o TCPKeepAlive=yes root@{host}
+    EHP_DOCKER_EXEC=1 EHP_DOCKER_CONTAINER=ehp-container bash ./scripts/ehp_docker_exec.sh
+    bash -lc 'bash ./scripts/runtime_manage_r2e_rollout_npu.sh
+    stop' {instance_id} ./runs/r2e_gym_qwen3_14b_2node16_ehp_docker/preflight_2node_ctx4096_20260818
+  vllm_stop_timeout_s: 30.0
+  warmup_steps: 0
+gpus_per_node_override: 0
+hardware:
+  bw_inter_node: 200000000000.0
+  bw_intra_node: 390000000000.0
+  flops_peak: 320000000000000.0
+  gpus_per_node: 8
+  latency_inter_node: 5.0e-06
+  mem_bw: 1600000000000.0
+  mem_capacity: 64000000000.0
+  tp_comm_overhead: 8.0e-06
+heterogeneous_rollout:
+  available_gpus:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  enable_thinking: false
+  enabled: true
+  gpu_memory_utilization: 0.88
+  instances:
+  - description: managed_by_global_resource_planner
+    gpus:
+    - 0
+    - 1
+    host: node-internal
+    instance_id: n41_tp2_0
+    port: 8000
+    tp: 2
+  - description: managed_by_global_resource_planner
+    gpus:
+    - 2
+    - 3
+    host: node-internal
+    instance_id: n41_tp2_1
+    port: 8001
+    tp: 2
+  - description: managed_by_global_resource_planner
+    gpus:
+    - 4
+    - 5
+    host: node-internal
+    instance_id: n41_tp2_2
+    port: 8002
+    tp: 2
+  - description: managed_by_global_resource_planner
+    gpus:
+    - 6
+    - 7
+    host: node-internal
+    instance_id: n41_tp2_3
+    port: 8003
+    tp: 2
+  max_model_len: 4096
+  scheduling:
+    adaptive_routing: true
+    cmlfq_buckets:
+      long:
+        max_tokens: 30000
+        tp_degrees:
+        - 4
+      medium:
+        max_tokens: 12000
+        tp_degrees:
+        - 2
+      short:
+        max_tokens: 4000
+        tp_degrees:
+        - 1
+    cmlfq_migration_profile_path: ''
+    cmlfq_payload_large_threshold: 12000
+    cmlfq_payload_small_threshold: 1000
+    cmlfq_rebuild_interval: 5
+    cmlfq_shared_load_dir: ./runs/r2e_gym_qwen3_14b_2node16_ehp_docker/preflight_2node_ctx4096_20260818/cmlfq_shared_load
+    cmlfq_shared_load_heartbeat_s: 10
+    cmlfq_shared_load_ttl_s: 60
+    cmlfq_tree_path: ./runs/r2e_gym_qwen3_14b_2node16_ehp_docker/preflight_2node_ctx4096_20260818/cmlfq_tree.json
+    cmlfq_tree_persist_interval: 1
+    enable_fallback: true
+    la_mlfq_buckets:
+      long:
+        max_tokens: 50000
+        tp_degrees:
+        - 4
+        - 8
+      short:
+        max_tokens: 5000
+        tp_degrees:
+        - 1
+        - 2
+    la_mlfq_history_ttl: 5
+    la_mlfq_migration_threshold: 3000
+    la_mlfq_scout_timeout: 30.0
+    length_thresholds:
+      long: 15000
+      medium: 10000
+      short: 5000
+    load_balance_strategy: least_connections
+    max_queue_length: 3
+    request_timeout: 3600
+    routing_rules:
+      extra_long:
+      - 8
+      - 4
+      long:
+      - 4
+      - 8
+      medium:
+      - 2
+      - 4
+      short:
+      - 1
+      - 2
+    scheduler_type: cmlfq
+  startup_timeout: 300
+  total_gpus: 8
+  vllm_base_port: 8000
+  vllm_host: node-internal
+history_experiment_name: r2e_gym_qwen3_14b_2node16_ehp_docker
+history_flush_interval: 1
+history_output_dir: ./runs/r2e_gym_qwen3_14b_2node16_ehp_docker/preflight_2node_ctx4096_20260818/history
+history_save_raw_lengths: true
+keep_latest_checkpoints: 5
+kl_coef: 0.001
+learning_rate: 1.0e-06
+log_dir: ./runs/r2e_gym_qwen3_14b_2node16_ehp_docker/preflight_2node_ctx4096_20260818/logs
+master_addr: node-internal
+master_port: 29742
+max_concurrent_rollouts: 128
+max_head_offpolicyness: 4
+max_new_tokens: 32
+max_seq_length: 4096
+megatron_async_save: false
+megatron_checkpoint_format: torch_dist
+megatron_fully_parallel_save: true
+megatron_grad_reduce_in_fp32: false
+megatron_optimizer_cpu_offload: false
+megatron_optimizer_offload_fraction: 0.0
+megatron_optimizer_pin_cpu_grads: true
+megatron_optimizer_pin_cpu_params: true
+megatron_recompute_num_layers: 1
+megatron_streaming_export: true
+megatron_use_cpu_initialization: false
+megatron_use_precision_aware_optimizer: false
+megatron_use_transformer_engine: false
+micro_batch_size: 1
+model_arch:
+  active_num_params: 0.0
+  d_model: 5120
+  dtype_bytes: 2
+  expert_intermediate_size: 17408
+  head_dim: 128
+  intermediate_size: 17408
+  is_moe: false
+  n_heads: 40
+  n_kv_heads: 8
+  n_layers: 40
+  num_activated_experts: 1
+  num_experts: 1
+  num_params: 14000000000.0
+  num_shared_experts: 0
+  shared_expert_intermediate_size: 0
+  vocab_size: 151936
+model_path: ./models/Qwen3-14B
+n_samples: 4
+n_total_gpus: 16
+num_nodes: 1
+pipeline_schedule: 1f1b
+ppo_epochs: 1
+profiling:
+  act_workspace_bytes: 1000000000.0
+  alpha_attn_bwd: 3.0e-12
+  alpha_attn_fwd: 1.5e-12
+  alpha_mlp_bwd: 7.0e-08
+  alpha_mlp_fwd: 3.5e-08
+  beta_attn_bwd: 5.0e-08
+  beta_attn_fwd: 2.5e-08
+  beta_mlp_bwd: 2.0e-05
+  beta_mlp_fwd: 1.0e-05
+  decode_bw_util: 0.85
+  gamma_attn_bwd: 1.5e-05
+  gamma_attn_fwd: 8.0e-06
+  kv_frag_rate: 0.04
+  prefill_chunk_size: 1024
+  prefill_mfu: 0.55
+  rho_compute_bound: 0.08
+  rho_memory_bound: 0.45
+  theta_slowdown: 1.0
+  train_mem_frag_rate: 0.08
+  train_workspace_bytes: 500000000.0
+queue_size: 128
+r2e_max_prompt_tokens: 2048
+r2e_max_turns: 12
+r2e_stop_reward: 0.5
+ray_address: auto
+recompute_logprobs: true
+require_rollout_weight_sync: true
+rollout_backend: vllm
+rollout_gpu_ids: ''
+rollout_gpus: 8
+rollout_gpus_per_node: 0
+rollout_weight_sync_control_dir: ./runs/r2e_gym_qwen3_14b_2node16_ehp_docker/preflight_2node_ctx4096_20260818/rollout_weight_sync
+rollout_weight_sync_export_only: true
+rollout_weight_sync_mode: restart
+rollout_weight_sync_timeout_s: 3600
+save_interval: 0
+seed: 42
+sequence_parallel: true
+sync_interval: 5
+sync_path: ./runs/r2e_gym_qwen3_14b_2node16_ehp_docker/preflight_2node_ctx4096_20260818/weights
+temperature: 0.8
+tokenizer_path: ./models/Qwen3-14B
+top_p: 0.95
+total_steps: 4
+tp_size: 4
+train_backend: megatron_core
+train_cp_size: 1
+train_dp_size: 2
+train_ep_size: 1
+train_gpus: 8
+train_gpus_per_node: 8
+train_pp_size: 1
+train_tp_size: 4
+use_distributed_optimizer: true
+virtual_pipeline_model_parallel_size: 0
+vllm_endpoints: ''
+vllm_host: 127.0.0.1
+vllm_num_instances: 0
+vllm_port: 8000
+vllm_tp_size: 1
+wandb_project: ''
+wandb_run_name: r2e-gym-qwen3-14b-mcore-npu-2node16-ehp-docker
+weight_sync_mode: disk
