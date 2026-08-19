@@ -109,6 +109,86 @@ class AsyncRLTrainer:
         self._elastic_membership_epochs: dict[str, int] = {}
         self._pending_hybrid_training_batches: dict[str, list[dict[str, Any]]] = {}
 
+    def _run_grp_memory_preflight(self) -> None:
+        """Validate one complete recompute against the planned memory budget.
+
+        The analytic GRP estimate is conservative, but only the real engine
+        accounts for implementation-specific temporary tensors. All ranks run
+        the probe because MCore recompute uses tensor-parallel collectives.
+        """
+        planner_cfg = getattr(self.config, "global_resource_planner", None)
+        if planner_cfg is None:
+            return
+        if not bool(getattr(planner_cfg, "enabled", False)):
+            return
+        if not bool(getattr(planner_cfg, "memory_budget_check_enabled", True)):
+            return
+        if not bool(getattr(planner_cfg, "memory_budget_dry_run_enabled", True)):
+            return
+        if not bool(getattr(self.config, "recompute_logprobs", True)):
+            return
+        if self.train_engine is None:
+            return
+        if getattr(self.config, "train_backend", "") != "megatron_core":
+            if self.is_main_process:
+                print(
+                    "[GRP memory preflight] skipped for non-Megatron-Core "
+                    f"backend={self.config.train_backend}",
+                    flush=True,
+                )
+            return
+
+        local_batch_size = self.train_engine.get_local_batch_size(
+            self.config.batch_size
+        )
+        is_npu = getattr(self.train_engine, "device_backend", "") == "npu"
+        probe_count = max(1, int(local_batch_size))
+        max_length = max(1, int(self.config.max_seq_length))
+        trajectories = [
+            {
+                "input_ids": torch.zeros((1, max_length), dtype=torch.long),
+                "logprobs": torch.zeros((1, max_length), dtype=torch.float32),
+                "loss_mask": torch.ones((1, max_length), dtype=torch.float32),
+                "rewards": torch.zeros(1, dtype=torch.float32),
+            }
+            for _ in range(probe_count)
+        ]
+
+        if self.is_main_process:
+            print(
+                "[GRP memory preflight] running complete recompute_logprobs "
+                f"local_batch={probe_count} micro_batch={self.config.micro_batch_size} "
+                f"max_seq_length={max_length}",
+                flush=True,
+            )
+        try:
+            if dist.is_initialized():
+                dist.barrier()
+            self.train_engine.recompute_logprobs(trajectories)
+            if is_npu and hasattr(torch, "npu"):
+                torch.npu.synchronize()
+            if dist.is_initialized():
+                dist.barrier()
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                raise RuntimeError(
+                    "GRP memory preflight rejected this training plan: "
+                    "recompute_logprobs exceeded the device memory budget at "
+                    f"max_seq_length={max_length}, local_batch={probe_count}, "
+                    f"micro_batch={self.config.micro_batch_size}."
+                ) from exc
+            raise
+        finally:
+            del trajectories
+            if is_npu and hasattr(torch, "npu"):
+                try:
+                    torch.npu.empty_cache()
+                except Exception:
+                    pass
+
+        if self.is_main_process:
+            print("[GRP memory preflight] passed", flush=True)
+
     def setup(self, workflow):
         """Setup."""
         self.workflow = workflow
@@ -141,6 +221,7 @@ class AsyncRLTrainer:
             print("Initializing the training engine...")
         self.train_engine = create_train_engine(self.config)
         self.train_engine.initialize(max_seq_length=self.config.max_seq_length)
+        self._run_grp_memory_preflight()
         if self.start_step > 0 or self.initial_model_version > 0:
             self.train_engine.set_version(self.initial_model_version)
             if self.is_main_process:

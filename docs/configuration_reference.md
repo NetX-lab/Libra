@@ -23,6 +23,11 @@ commonly changed for experiments and cluster deployments.
 | `max_concurrent_rollouts` | Maximum in-flight rollout tasks |
 | `max_head_offpolicyness` | Maximum accepted policy-version lag |
 | `recompute_logprobs` | Recompute log probabilities with the current model |
+| `global_resource_planner.memory_budget_check_enabled` | Include recompute-logprobs temporary memory in GRP candidate budgets |
+| `global_resource_planner.memory_budget_dry_run_enabled` | Run one complete runtime recompute probe before training |
+| `global_resource_planner.memory_budget_safety_margin_bytes` | Reserve device memory outside the analytic estimate |
+| `global_resource_planner.memory_budget_logits_dtype_bytes` | Dtype width used for the logits temporary estimate |
+| `global_resource_planner.memory_budget_workspace_factor` | Multiplier for simultaneous logits/workspace temporaries |
 | `sync_interval` | Training steps between weight sync attempts |
 | `rollout_weight_reload_method` | Use `restart` for process replacement or `inplace` to refresh resident vLLM workers |
 | `rollout_weight_reload_strategy` | Reload rollout instances concurrently with `parallel` (default), or use the node-serialized `serial` fallback |

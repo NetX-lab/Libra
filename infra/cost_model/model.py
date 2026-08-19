@@ -9,6 +9,8 @@ from typing import Any
 
 import numpy as np
 
+from .memory_budget import estimate_recompute_logprobs_memory
+
 logger = logging.getLogger(__name__)
 
 
@@ -388,6 +390,12 @@ class TrainingCostModel:
         train_mem_frag_rate: float = 0.08,
         train_workspace_bytes: float = 0.5e9,
         effective_num_params: float | None = None,
+        vocab_size: int = 151936,
+        max_seq_length: int = 2048,
+        recompute_logprobs: bool = True,
+        recompute_logits_dtype_bytes: int = 4,
+        recompute_workspace_factor: float = 1.5,
+        memory_safety_margin_bytes: float = 0.0,
     ):
         self.P = num_params
         self.P_active = effective_num_params or num_params
@@ -421,6 +429,12 @@ class TrainingCostModel:
 
         self.mem_frag_rate = train_mem_frag_rate
         self.workspace = train_workspace_bytes
+        self.vocab_size = max(1, int(vocab_size))
+        self.max_seq_length = max(1, int(max_seq_length))
+        self.recompute_logprobs = bool(recompute_logprobs)
+        self.recompute_logits_dtype_bytes = max(1, int(recompute_logits_dtype_bytes))
+        self.recompute_workspace_factor = max(1.0, float(recompute_workspace_factor))
+        self.memory_safety_margin_bytes = max(0.0, float(memory_safety_margin_bytes))
 
 
 
@@ -457,14 +471,28 @@ class TrainingCostModel:
         layers_per_pp = self.n_layers / max(pp, 1)
         m_act = b_micro * L * self.d_model * self.dtype_bytes * layers_per_pp / tp
 
-        return m_weight + m_opt + m_grad + m_fsdp_transient + m_act + self.workspace
+        total = m_weight + m_opt + m_grad + m_fsdp_transient + m_act + self.workspace
+        if self.recompute_logprobs:
+            recompute = estimate_recompute_logprobs_memory(
+                batch_size=b_micro,
+                sequence_length=max(L, self.max_seq_length),
+                vocab_size=self.vocab_size,
+                tensor_parallel_size=tp,
+                logits_dtype_bytes=self.recompute_logits_dtype_bytes,
+                workspace_factor=self.recompute_workspace_factor,
+            )
+            total += recompute.total_bytes
+        return total
 
     def check_memory_oom(
         self, config: TrainParallelConfig, b_micro: int, L: int,
     ) -> bool:
         """Check memory oom."""
         mem_per_gpu = self.estimate_memory_per_gpu(config, b_micro, L)
-        available = self.mem_capacity * (1.0 - self.mem_frag_rate)
+        available = (
+            self.mem_capacity * (1.0 - self.mem_frag_rate)
+            - self.memory_safety_margin_bytes
+        )
         return mem_per_gpu > available
 
 
@@ -664,7 +692,18 @@ class TrainingCostModel:
 class CostModel:
     """Cost model implementation."""
 
-    def __init__(self, hardware=None, model_arch=None, profiling=None):
+    def __init__(
+        self,
+        hardware=None,
+        model_arch=None,
+        profiling=None,
+        *,
+        max_seq_length: int = 2048,
+        recompute_logprobs: bool = True,
+        recompute_logits_dtype_bytes: int = 4,
+        recompute_workspace_factor: float = 1.5,
+        memory_safety_margin_bytes: float = 0.0,
+    ):
         from RL_Framework.config import HardwareConfig, ModelArchConfig, ProfilingConfig
 
         hw = hardware or HardwareConfig()
@@ -720,6 +759,12 @@ class CostModel:
             train_mem_frag_rate=prof.train_mem_frag_rate,
             train_workspace_bytes=prof.train_workspace_bytes,
             effective_num_params=ma.effective_num_params,
+            vocab_size=ma.vocab_size,
+            max_seq_length=max_seq_length,
+            recompute_logprobs=recompute_logprobs,
+            recompute_logits_dtype_bytes=recompute_logits_dtype_bytes,
+            recompute_workspace_factor=recompute_workspace_factor,
+            memory_safety_margin_bytes=memory_safety_margin_bytes,
         )
 
         self.hw = hw
