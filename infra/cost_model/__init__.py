@@ -9,6 +9,10 @@ from .model import (
     TrainParallelConfig,
     CostModelResult,
 )
+from .memory_budget import (
+    RecomputeLogprobsMemoryEstimate,
+    estimate_recompute_logprobs_memory,
+)
 from .calibrator import ShadowCalibrator, CalibratedParams, EpochRunData
 from .optimizer import (
     TwoLevelNestedOptimizer,
@@ -46,6 +50,8 @@ __all__ = [
     "RolloutClusterConfig",
     "TrainParallelConfig",
     "CostModelResult",
+    "RecomputeLogprobsMemoryEstimate",
+    "estimate_recompute_logprobs_memory",
     "ShadowCalibrator",
     "CalibratedParams",
     "EpochRunData",
