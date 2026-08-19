@@ -184,7 +184,10 @@ class AsyncRLTrainer:
                 dist.barrier()
             self.train_engine.recompute_logprobs(trajectories)
             if is_npu and hasattr(torch, "npu"):
-                torch.npu.synchronize()
+                # torch_npu versions used on Ascend 910B may return a
+                # torch.device from current_device(), while synchronize()
+                # expects an integer device index.
+                torch.npu.synchronize(int(self.local_rank))
             if dist.is_initialized():
                 dist.barrier()
         except RuntimeError as exc:
