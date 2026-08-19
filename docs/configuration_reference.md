@@ -29,6 +29,12 @@ commonly changed for experiments and cluster deployments.
 | `global_resource_planner.memory_budget_safety_margin_bytes` | Reserve device memory outside the analytic estimate |
 | `global_resource_planner.memory_budget_logits_dtype_bytes` | Dtype width used for the logits temporary estimate |
 | `global_resource_planner.memory_budget_workspace_factor` | Multiplier for simultaneous logits/workspace temporaries |
+
+When `phase_trace_enabled` is true, each rank writes append-only
+`phase_trace_rank*.jsonl` spans. Set `RL_TRAIN_PHASE_TRACE=1` and optionally
+`RL_TRAIN_PHASE_TRACE_DIR` for long runs. Convert the files for Perfetto or
+Chrome Trace with `scripts/phase_trace_to_chrome.py`; the stable schema and
+phase names allow the same converter to compare baseline runs.
 | `sync_interval` | Training steps between weight sync attempts |
 | `rollout_weight_reload_method` | Use `restart` for process replacement or `inplace` to refresh resident vLLM workers |
 | `rollout_weight_reload_strategy` | Reload rollout instances concurrently with `parallel` (default), or use the node-serialized `serial` fallback |
