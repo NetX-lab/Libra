@@ -428,6 +428,23 @@ class HybridSimulatorCostModel:
             hardware=config.hardware,
             model_arch=config.model_arch,
             profiling=config.profiling,
+            max_seq_length=config.max_seq_length,
+            recompute_logprobs=(
+                bool(config.recompute_logprobs)
+                and bool(getattr(self.planner_config, "memory_budget_check_enabled", True))
+            ),
+            recompute_micro_batch_size=int(
+                getattr(config, "recompute_micro_batch_size", 1)
+            ),
+            recompute_logits_dtype_bytes=int(
+                getattr(self.planner_config, "memory_budget_logits_dtype_bytes", 4)
+            ),
+            recompute_workspace_factor=float(
+                getattr(self.planner_config, "memory_budget_workspace_factor", 1.5)
+            ),
+            memory_safety_margin_bytes=float(
+                getattr(self.planner_config, "memory_budget_safety_margin_bytes", 0.0)
+            ),
         )
         self.train_backend = (self.planner_config.train_backend or "analytic").lower()
         self.rollout_backend = (
