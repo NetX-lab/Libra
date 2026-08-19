@@ -393,6 +393,7 @@ class TrainingCostModel:
         vocab_size: int = 151936,
         max_seq_length: int = 2048,
         recompute_logprobs: bool = True,
+        recompute_micro_batch_size: int = 1,
         recompute_logits_dtype_bytes: int = 4,
         recompute_workspace_factor: float = 1.5,
         memory_safety_margin_bytes: float = 0.0,
@@ -432,6 +433,7 @@ class TrainingCostModel:
         self.vocab_size = max(1, int(vocab_size))
         self.max_seq_length = max(1, int(max_seq_length))
         self.recompute_logprobs = bool(recompute_logprobs)
+        self.recompute_micro_batch_size = max(1, int(recompute_micro_batch_size))
         self.recompute_logits_dtype_bytes = max(1, int(recompute_logits_dtype_bytes))
         self.recompute_workspace_factor = max(1.0, float(recompute_workspace_factor))
         self.memory_safety_margin_bytes = max(0.0, float(memory_safety_margin_bytes))
@@ -474,7 +476,7 @@ class TrainingCostModel:
         total = m_weight + m_opt + m_grad + m_fsdp_transient + m_act + self.workspace
         if self.recompute_logprobs:
             recompute = estimate_recompute_logprobs_memory(
-                batch_size=b_micro,
+                batch_size=min(b_micro, self.recompute_micro_batch_size),
                 sequence_length=max(L, self.max_seq_length),
                 vocab_size=self.vocab_size,
                 tensor_parallel_size=tp,
@@ -700,6 +702,7 @@ class CostModel:
         *,
         max_seq_length: int = 2048,
         recompute_logprobs: bool = True,
+        recompute_micro_batch_size: int = 1,
         recompute_logits_dtype_bytes: int = 4,
         recompute_workspace_factor: float = 1.5,
         memory_safety_margin_bytes: float = 0.0,
@@ -762,6 +765,7 @@ class CostModel:
             vocab_size=ma.vocab_size,
             max_seq_length=max_seq_length,
             recompute_logprobs=recompute_logprobs,
+            recompute_micro_batch_size=recompute_micro_batch_size,
             recompute_logits_dtype_bytes=recompute_logits_dtype_bytes,
             recompute_workspace_factor=recompute_workspace_factor,
             memory_safety_margin_bytes=memory_safety_margin_bytes,

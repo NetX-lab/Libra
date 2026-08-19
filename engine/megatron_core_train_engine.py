@@ -36,6 +36,7 @@ class MegatronCoreTrainEngine:
         kl_coef: float = 0.001,
         clip_epsilon: float = 0.2,
         micro_batch_size: int = 1,
+        recompute_micro_batch_size: int = 1,
         train_tp_size: int = 1,
         train_pp_size: int = 1,
         train_cp_size: int = 1,
@@ -68,6 +69,7 @@ class MegatronCoreTrainEngine:
         self.kl_coef = kl_coef
         self.clip_epsilon = clip_epsilon
         self.micro_batch_size = micro_batch_size
+        self.recompute_micro_batch_size = max(1, int(recompute_micro_batch_size))
         self.train_tp_size = train_tp_size
         self.train_pp_size = train_pp_size
         self.train_cp_size = train_cp_size
@@ -488,7 +490,7 @@ class MegatronCoreTrainEngine:
     def recompute_logprobs(self, trajectories: list[dict[str, Any]]):
         self._set_train_mode(False)
         with torch.no_grad():
-            for micro_batch in self._iter_micro_batches(trajectories):
+            for micro_batch in self._iter_recompute_micro_batches(trajectories):
                 logits = self._forward(micro_batch)
                 action_log_probs = self._action_log_probs(
                     logits,
@@ -835,6 +837,11 @@ class MegatronCoreTrainEngine:
     def _iter_micro_batches(self, trajectories: list[dict[str, Any]]):
         for start in range(0, len(trajectories), self.micro_batch_size):
             rows = trajectories[start : start + self.micro_batch_size]
+            yield self._pad_micro_batch(rows)
+
+    def _iter_recompute_micro_batches(self, trajectories: list[dict[str, Any]]):
+        for start in range(0, len(trajectories), self.recompute_micro_batch_size):
+            rows = trajectories[start : start + self.recompute_micro_batch_size]
             yield self._pad_micro_batch(rows)
 
     def _pad_micro_batch(

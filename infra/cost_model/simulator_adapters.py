@@ -433,6 +433,9 @@ class HybridSimulatorCostModel:
                 bool(config.recompute_logprobs)
                 and bool(getattr(self.planner_config, "memory_budget_check_enabled", True))
             ),
+            recompute_micro_batch_size=int(
+                getattr(config, "recompute_micro_batch_size", 1)
+            ),
             recompute_logits_dtype_bytes=int(
                 getattr(self.planner_config, "memory_budget_logits_dtype_bytes", 4)
             ),

@@ -23,6 +23,7 @@ commonly changed for experiments and cluster deployments.
 | `max_concurrent_rollouts` | Maximum in-flight rollout tasks |
 | `max_head_offpolicyness` | Maximum accepted policy-version lag |
 | `recompute_logprobs` | Recompute log probabilities with the current model |
+| `recompute_micro_batch_size` | Temporary batch size used only by recompute-logprobs; defaults to 1 to bound logits memory |
 | `global_resource_planner.memory_budget_check_enabled` | Include recompute-logprobs temporary memory in GRP candidate budgets |
 | `global_resource_planner.memory_budget_dry_run_enabled` | Run one complete runtime recompute probe before training |
 | `global_resource_planner.memory_budget_safety_margin_bytes` | Reserve device memory outside the analytic estimate |
