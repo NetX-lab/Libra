@@ -591,6 +591,11 @@ class AsyncRLConfig:
 
 
     recompute_logprobs: bool = True
+    # Recompute can use a smaller temporary batch than the training update.
+    # This preserves the requested training micro-batch while bounding logits.
+    recompute_micro_batch_size: int = 1
+    phase_trace_enabled: bool = False
+    phase_trace_dir: str = ""
 
 
     weight_sync_mode: str = "disk"  # disk | nccl | hccl
