@@ -456,6 +456,11 @@ class GlobalResourcePlannerConfig:
     allowed_train_pp: list[int] = field(default_factory=list)
     fixed_train_gpus: int = 0
     micro_batch_sizes: list[int] = field(default_factory=list)
+    memory_budget_check_enabled: bool = True
+    memory_budget_dry_run_enabled: bool = True
+    memory_budget_safety_margin_bytes: float = 2.0e9
+    memory_budget_logits_dtype_bytes: int = 4
+    memory_budget_workspace_factor: float = 1.5
     apply_to_runtime: bool = True
     verbose: bool = False
     runtime_async_planning: bool = True
@@ -591,6 +596,11 @@ class AsyncRLConfig:
 
 
     recompute_logprobs: bool = True
+    # Recompute can use a smaller temporary batch than the training update.
+    # This preserves the requested training micro-batch while bounding logits.
+    recompute_micro_batch_size: int = 1
+    phase_trace_enabled: bool = False
+    phase_trace_dir: str = ""
 
 
     weight_sync_mode: str = "disk"  # disk | nccl | hccl

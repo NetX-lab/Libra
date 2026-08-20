@@ -45,6 +45,7 @@ def create_train_engine(config: AsyncRLConfig) -> TrainEngine:
             kl_coef=config.kl_coef,
             clip_epsilon=config.clip_epsilon,
             micro_batch_size=config.micro_batch_size,
+            recompute_micro_batch_size=config.recompute_micro_batch_size,
             train_tp_size=config.train_tp_size,
             train_pp_size=config.train_pp_size,
             train_cp_size=config.train_cp_size,

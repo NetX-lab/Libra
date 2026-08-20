@@ -432,6 +432,20 @@ class HybridSimulatorCostModel:
             use_distributed_optimizer=config.use_distributed_optimizer,
             grad_reduce_in_fp32=config.megatron_grad_reduce_in_fp32,
             precision_aware_optimizer=config.megatron_use_precision_aware_optimizer,
+            max_seq_length=config.max_seq_length,
+            recompute_logprobs=bool(config.recompute_logprobs),
+            recompute_micro_batch_size=int(
+                getattr(config, "recompute_micro_batch_size", 1)
+            ),
+            memory_safety_margin_bytes=float(
+                getattr(self.planner_config, "memory_budget_safety_margin_bytes", 0.0)
+            ),
+            recompute_logits_dtype_bytes=int(
+                getattr(self.planner_config, "memory_budget_logits_dtype_bytes", 4)
+            ),
+            recompute_workspace_factor=float(
+                getattr(self.planner_config, "memory_budget_workspace_factor", 1.5)
+            ),
         )
         self.train_backend = (self.planner_config.train_backend or "analytic").lower()
         self.rollout_backend = (

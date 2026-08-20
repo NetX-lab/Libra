@@ -34,6 +34,7 @@ from RL_Framework.infra.elastic.runtime_executor import RuntimeElasticExecutor
 from RL_Framework.infra.execution.async_runner import AsyncTaskRunner
 from RL_Framework.infra.execution.batch_dispatcher import BatchTaskDispatcher, TaskInput
 from RL_Framework.infra.observability.history_collector import HistoryDataCollector, ResourceConfig
+from RL_Framework.infra.observability.phase_tracer import PhaseTracer
 from RL_Framework.infra.sync.staleness import StalenessManager
 from RL_Framework.infra.sync.hccl_weight_transfer import (
     HCCLWeightMetadata,
@@ -112,6 +113,82 @@ class AsyncRLTrainer:
         self._hccl_weight_metadata: HCCLWeightMetadata | None = None
         self._hccl_metadata_initialized = False
         self._trace_train_phases = os.environ.get("RL_TRAIN_PHASE_TRACE", "0") == "1"
+        trace_enabled = self._trace_train_phases or bool(
+            getattr(config, "phase_trace_enabled", False)
+        )
+        trace_dir = (
+            os.environ.get("RL_TRAIN_PHASE_TRACE_DIR", "")
+            or getattr(config, "phase_trace_dir", "")
+            or os.path.join(getattr(config, "log_dir", "./logs"), "phase_trace")
+        )
+        self._phase_tracer = (
+            PhaseTracer(
+                Path(trace_dir) / f"phase_trace_rank{self.rank}.jsonl",
+                rank=self.rank,
+                world_size=self.world_size,
+            )
+            if trace_enabled
+            else None
+        )
+
+    def _run_grp_memory_preflight(self) -> None:
+        """Run one complete recompute probe before starting training."""
+        planner_cfg = getattr(self.config, "global_resource_planner", None)
+        if not planner_cfg or not bool(getattr(planner_cfg, "enabled", False)):
+            return
+        if not bool(getattr(planner_cfg, "memory_budget_check_enabled", True)):
+            return
+        if not bool(getattr(planner_cfg, "memory_budget_dry_run_enabled", True)):
+            return
+        if not bool(getattr(self.config, "recompute_logprobs", True)):
+            return
+        if self.train_engine is None:
+            return
+        if getattr(self.config, "train_backend", "") != "megatron_core":
+            return
+        local_batch_size = self.train_engine.get_local_batch_size(self.config.batch_size)
+        max_length = max(1, int(self.config.max_seq_length))
+        trajectories = [
+            {
+                "input_ids": torch.zeros((1, max_length), dtype=torch.long),
+                "logprobs": torch.zeros((1, max_length), dtype=torch.float32),
+                "loss_mask": torch.ones((1, max_length), dtype=torch.float32),
+                "rewards": torch.zeros(1, dtype=torch.float32),
+            }
+            for _ in range(max(1, int(local_batch_size)))
+        ]
+        if self.is_main_process:
+            print(
+                "[GRP memory preflight] running complete recompute_logprobs "
+                f"local_batch={len(trajectories)} micro_batch={self.config.micro_batch_size} "
+                f"max_seq_length={max_length}",
+                flush=True,
+            )
+        try:
+            if dist.is_initialized():
+                dist.barrier()
+            self.train_engine.recompute_logprobs(trajectories)
+            if getattr(self.train_engine, "device_backend", "") == "npu" and hasattr(torch, "npu"):
+                torch.npu.synchronize(int(self.local_rank))
+            if dist.is_initialized():
+                dist.barrier()
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                raise RuntimeError(
+                    "GRP memory preflight rejected this training plan: "
+                    f"recompute_logprobs exceeded memory at max_seq_length={max_length}, "
+                    f"local_batch={len(trajectories)}, micro_batch={self.config.micro_batch_size}."
+                ) from exc
+            raise
+        finally:
+            del trajectories
+            if hasattr(torch, "npu"):
+                try:
+                    torch.npu.empty_cache()
+                except Exception:
+                    pass
+        if self.is_main_process:
+            print("[GRP memory preflight] passed", flush=True)
 
     def setup(self, workflow):
         """Setup."""
@@ -132,6 +209,7 @@ class AsyncRLTrainer:
             print("Initializing the training engine...")
         self.train_engine = create_train_engine(self.config)
         self.train_engine.initialize(max_seq_length=self.config.max_seq_length)
+        self._run_grp_memory_preflight()
 
 
         if self.is_main_process and self.train_engine.is_batch_source():
@@ -604,6 +682,14 @@ class AsyncRLTrainer:
             dist.barrier()
 
     def _trace_train_phase(self, step: int, phase: str, **details: Any) -> None:
+        phase = str(phase)
+        if self._phase_tracer is not None:
+            if phase.endswith("_start"):
+                self._phase_tracer.start(step, phase[:-6], details)
+            elif phase.endswith("_done"):
+                self._phase_tracer.end(step, phase[:-5], details)
+            else:
+                self._phase_tracer.end(step, phase, details)
         if not self._trace_train_phases:
             return
         payload = " ".join(f"{key}={value}" for key, value in sorted(details.items()))
@@ -721,6 +807,8 @@ class AsyncRLTrainer:
                 batch,
                 ppo_epochs=self.config.ppo_epochs,
             )
+            reward_start = time.time()
+            self._trace_train_phase(step, "reward_compute_start")
             reward_values = torch.cat(
                 [traj["rewards"].reshape(-1).float() for traj in batch]
             )
@@ -731,6 +819,12 @@ class AsyncRLTrainer:
                     "reward_min": float(reward_values.min()),
                     "reward_max": float(reward_values.max()),
                 }
+            )
+            self._trace_train_phase(
+                step,
+                "reward_compute_done",
+                seconds=f"{time.time() - reward_start:.6f}",
+                reward_count=int(reward_values.numel()),
             )
             train_time = time.time() - train_start
             self._trace_train_phase(

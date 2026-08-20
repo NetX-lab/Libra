@@ -23,6 +23,18 @@ commonly changed for experiments and cluster deployments.
 | `max_concurrent_rollouts` | Maximum in-flight rollout tasks |
 | `max_head_offpolicyness` | Maximum accepted policy-version lag |
 | `recompute_logprobs` | Recompute log probabilities with the current model |
+| `recompute_micro_batch_size` | Temporary batch size used only by recompute-logprobs; defaults to 1 to bound logits memory |
+| `global_resource_planner.memory_budget_check_enabled` | Include recompute-logprobs temporary memory in GRP candidate budgets |
+| `global_resource_planner.memory_budget_dry_run_enabled` | Run one complete runtime recompute probe before training |
+| `global_resource_planner.memory_budget_safety_margin_bytes` | Reserve device memory outside the analytic estimate |
+| `global_resource_planner.memory_budget_logits_dtype_bytes` | Dtype width used for the logits temporary estimate |
+| `global_resource_planner.memory_budget_workspace_factor` | Multiplier for simultaneous logits/workspace temporaries |
+
+When `phase_trace_enabled` is true, each rank writes append-only
+`phase_trace_rank*.jsonl` spans. Set `RL_TRAIN_PHASE_TRACE=1` and optionally
+`RL_TRAIN_PHASE_TRACE_DIR` for long runs. Convert the files for Perfetto or
+Chrome Trace with `scripts/phase_trace_to_chrome.py`; the stable schema and
+phase names allow the same converter to compare baseline runs.
 | `sync_interval` | Training steps between weight sync attempts |
 | `rollout_weight_sync_mode` | `none`, checkpoint-based `restart`, or official Ascend `hccl` refresh |
 | `rollout_weight_reload_method` | For checkpoint refreshes, `restart` replaces vLLM or `inplace` keeps the resident server |
