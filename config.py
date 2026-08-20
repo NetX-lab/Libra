@@ -456,6 +456,11 @@ class GlobalResourcePlannerConfig:
     allowed_train_pp: list[int] = field(default_factory=list)
     fixed_train_gpus: int = 0
     micro_batch_sizes: list[int] = field(default_factory=list)
+    memory_budget_check_enabled: bool = True
+    memory_budget_dry_run_enabled: bool = True
+    memory_budget_safety_margin_bytes: float = 2.0e9
+    memory_budget_logits_dtype_bytes: int = 4
+    memory_budget_workspace_factor: float = 1.5
     apply_to_runtime: bool = True
     verbose: bool = False
     runtime_async_planning: bool = True

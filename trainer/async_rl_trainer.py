@@ -131,6 +131,65 @@ class AsyncRLTrainer:
             else None
         )
 
+    def _run_grp_memory_preflight(self) -> None:
+        """Run one complete recompute probe before starting training."""
+        planner_cfg = getattr(self.config, "global_resource_planner", None)
+        if not planner_cfg or not bool(getattr(planner_cfg, "enabled", False)):
+            return
+        if not bool(getattr(planner_cfg, "memory_budget_check_enabled", True)):
+            return
+        if not bool(getattr(planner_cfg, "memory_budget_dry_run_enabled", True)):
+            return
+        if not bool(getattr(self.config, "recompute_logprobs", True)):
+            return
+        if self.train_engine is None:
+            return
+        if getattr(self.config, "train_backend", "") != "megatron_core":
+            return
+        local_batch_size = self.train_engine.get_local_batch_size(self.config.batch_size)
+        max_length = max(1, int(self.config.max_seq_length))
+        trajectories = [
+            {
+                "input_ids": torch.zeros((1, max_length), dtype=torch.long),
+                "logprobs": torch.zeros((1, max_length), dtype=torch.float32),
+                "loss_mask": torch.ones((1, max_length), dtype=torch.float32),
+                "rewards": torch.zeros(1, dtype=torch.float32),
+            }
+            for _ in range(max(1, int(local_batch_size)))
+        ]
+        if self.is_main_process:
+            print(
+                "[GRP memory preflight] running complete recompute_logprobs "
+                f"local_batch={len(trajectories)} micro_batch={self.config.micro_batch_size} "
+                f"max_seq_length={max_length}",
+                flush=True,
+            )
+        try:
+            if dist.is_initialized():
+                dist.barrier()
+            self.train_engine.recompute_logprobs(trajectories)
+            if getattr(self.train_engine, "device_backend", "") == "npu" and hasattr(torch, "npu"):
+                torch.npu.synchronize(int(self.local_rank))
+            if dist.is_initialized():
+                dist.barrier()
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                raise RuntimeError(
+                    "GRP memory preflight rejected this training plan: "
+                    f"recompute_logprobs exceeded memory at max_seq_length={max_length}, "
+                    f"local_batch={len(trajectories)}, micro_batch={self.config.micro_batch_size}."
+                ) from exc
+            raise
+        finally:
+            del trajectories
+            if hasattr(torch, "npu"):
+                try:
+                    torch.npu.empty_cache()
+                except Exception:
+                    pass
+        if self.is_main_process:
+            print("[GRP memory preflight] passed", flush=True)
+
     def setup(self, workflow):
         """Setup."""
         self.workflow = workflow
@@ -150,6 +209,7 @@ class AsyncRLTrainer:
             print("Initializing the training engine...")
         self.train_engine = create_train_engine(self.config)
         self.train_engine.initialize(max_seq_length=self.config.max_seq_length)
+        self._run_grp_memory_preflight()
 
 
         if self.is_main_process and self.train_engine.is_batch_source():
