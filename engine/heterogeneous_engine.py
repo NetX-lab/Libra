@@ -46,6 +46,17 @@ class HeterogeneousRolloutEngine:
 
         self._pending_futures: dict[str, list[asyncio.Future]] = {}
 
+    def reset_after_reconfigure(self) -> None:
+        """Clear stale request state after dispatcher cancellation."""
+        with self._lock:
+            for futures in self._pending_futures.values():
+                for future in futures:
+                    if not future.done():
+                        future.cancel()
+            self._pending_futures.clear()
+            for handle in getattr(self.scheduler, "_instances", []):
+                handle.active_requests = 0
+
     # ----------------------------------------------------------------
 
     # ----------------------------------------------------------------

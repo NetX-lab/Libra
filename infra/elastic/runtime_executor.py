@@ -258,6 +258,9 @@ class RuntimeElasticExecutor:
             and self.rollout_engine is not None
             and hasattr(self.rollout_engine, "wait_until_idle")
         ):
+            if hasattr(self.rollout_engine, "reset_after_reconfigure"):
+                self.rollout_engine.reset_after_reconfigure()
+                result.actions.append("rollout_engine_reset_stale_accounting")
             self.rollout_engine.wait_until_idle(
                 timeout=float(
                     getattr(planner_cfg, "runtime_drain_timeout_s", 3600.0)

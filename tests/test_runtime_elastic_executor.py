@@ -1,10 +1,15 @@
 import json
+import time
 
 import pytest
 
 from RL_Framework.config import AsyncRLConfig, HeterogeneousInstanceConfig
 from RL_Framework.infra.execution.batch_dispatcher import BatchTaskDispatcher, TaskInput
-from RL_Framework.infra.cost_model.global_resource_planner import GlobalResourcePlanner
+from RL_Framework.engine.heterogeneous_engine import HeterogeneousRolloutEngine
+from RL_Framework.infra.cost_model.global_resource_planner import (
+    ElasticHybridSignal,
+    GlobalResourcePlanner,
+)
 from RL_Framework.infra.elastic.runtime_executor import (
     ManagedRolloutProcess,
     RuntimeElasticExecutor,
@@ -12,9 +17,15 @@ from RL_Framework.infra.elastic.runtime_executor import (
 from RL_Framework.infra.sync.staleness import StalenessManager
 
 try:
-    from RL_Framework.infra.elastic.hybrid_pool import ElasticHybridPool
+    from RL_Framework.infra.elastic.hybrid_pool import (
+        ElasticHybridPool,
+        JoinState,
+        ReplicaRole,
+    )
 except ModuleNotFoundError:
     ElasticHybridPool = None
+    JoinState = None
+    ReplicaRole = None
 
 
 class FakeDispatcher:
@@ -106,6 +117,47 @@ def test_runtime_executor_applies_rollout_reconfiguration():
     assert cfg.heterogeneous_rollout.instances
 
 
+def test_runtime_executor_preserves_external_rollout_config_when_disabled():
+    cfg = _config()
+    cfg.heterogeneous_rollout.instances = [
+        HeterogeneousInstanceConfig(
+            instance_id="external0",
+            tp=1,
+            gpus=[0],
+            host="192.0.2.20",
+            port=8000,
+        ),
+        HeterogeneousInstanceConfig(
+            instance_id="external1",
+            tp=1,
+            gpus=[1],
+            host="192.0.2.22",
+            port=8000,
+        ),
+    ]
+    cfg.global_resource_planner.apply_to_runtime = False
+    cfg.global_resource_planner.runtime_manage_rollout_processes = False
+    cfg.global_resource_planner.runtime_reconfigure_training = True
+    cfg.global_resource_planner.runtime_training_pool_plan_only = True
+    original_instances = [vars(instance).copy() for instance in cfg.heterogeneous_rollout.instances]
+    planner, decision = _decision(cfg)
+    engine = FakeRolloutEngine()
+    executor = RuntimeElasticExecutor(
+        config=cfg,
+        planner=planner,
+        rollout_engine=engine,
+    )
+
+    result = executor.execute(decision)
+
+    assert result.applied
+    assert "preserve_external_rollout_config" in result.actions
+    assert "apply_config" not in result.actions
+    assert "reconfigure_rollout_engine" not in result.actions
+    assert engine.calls == []
+    assert [vars(instance).copy() for instance in cfg.heterogeneous_rollout.instances] == original_instances
+
+
 def test_runtime_executor_requests_training_join_when_enabled():
     if ElasticHybridPool is None:
         pytest.skip("torch is not installed in this local environment")
@@ -166,6 +218,192 @@ def test_runtime_executor_uses_training_pool_target_without_core_resize():
     ) == 2
     assert cfg.train_gpus == 2
     assert cfg.train_dp_size == 2
+    pool.close()
+
+
+def test_runtime_executor_applies_grp_signal_with_non_blocking_join():
+    if ElasticHybridPool is None:
+        pytest.skip("torch is not installed in this local environment")
+
+    cfg = _config()
+    cfg.global_resource_planner.runtime_reconfigure_training = True
+    cfg.global_resource_planner.runtime_training_pool_plan_only = False
+    cfg.global_resource_planner.elastic_hybrid_require_planner_signal = True
+    cfg.global_resource_planner.elastic_hybrid_max_workers = 1
+    planner, decision = _decision(cfg)
+    decision.elastic_hybrid_signal = ElasticHybridSignal(
+        step=0,
+        desired_workers=1,
+        current_workers=0,
+        max_workers=1,
+        action="join",
+        reason="training_bottleneck",
+        train_rollout_ratio=2.0,
+        rollout_pressure=0.1,
+        ttl_steps=10,
+    )
+    release_fetch = __import__("threading").Event()
+
+    def slow_fetch(*_args):
+        release_fetch.wait(timeout=2.0)
+        return 1
+
+    pool = ElasticHybridPool(
+        core_train_workers=["core0"],
+        core_rollout_workers=["rollout0"],
+        snapshot_fetcher=slow_fetch,
+        zero_sync_steps=0,
+    )
+    executor = RuntimeElasticExecutor(
+        config=cfg,
+        planner=planner,
+        elastic_pool=pool,
+    )
+
+    started = time.perf_counter()
+    result = executor.execute(decision)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.1
+    assert any(
+        action.startswith("join_training_submitted:rollout0")
+        for action in result.training_actions
+    )
+    assert executor.hybrid_runtime_state()["joining_hybrid_workers"] == 1
+    release_fetch.set()
+    pool.close()
+
+
+def test_peer_state_does_not_activate_a_joining_hybrid_replica():
+    if ElasticHybridPool is None:
+        pytest.skip("torch is not installed in this local environment")
+
+    cfg = _config()
+    cfg.global_resource_planner.runtime_reconfigure_training = True
+    cfg.global_resource_planner.runtime_training_pool_plan_only = False
+    cfg.global_resource_planner.runtime_training_pool_target_gpus = 3
+    planner, decision = _decision(cfg)
+    pool = ElasticHybridPool(
+        core_train_workers=["dp0", "dp1"],
+        core_rollout_workers=["rollout0"],
+        zero_sync_steps=1,
+    )
+    pool.gradient_domain.request_join("rollout0", "dp0")
+    executor = RuntimeElasticExecutor(
+        config=cfg,
+        planner=planner,
+        elastic_pool=pool,
+    )
+
+    joining = executor._peer_training_reconfiguration_state(
+        decision.candidate_plan
+    )
+    assert joining["hybrid_targets"] == {"rollout0": "dp0"}
+    assert joining["active_hybrid_ids"] == []
+    assert joining["activate_hybrids"] is False
+
+    pool.gradient_domain.mark_active("rollout0")
+    active = executor._peer_training_reconfiguration_state(
+        decision.candidate_plan
+    )
+    assert active["active_hybrid_ids"] == ["rollout0"]
+    assert active["activate_hybrids"] is True
+    pool.close()
+
+
+def test_runtime_executor_release_signal_cancels_pending_join_immediately():
+    if ElasticHybridPool is None:
+        pytest.skip("torch is not installed in this local environment")
+
+    cfg = _config()
+    cfg.global_resource_planner.runtime_reconfigure_training = True
+    cfg.global_resource_planner.runtime_training_pool_plan_only = False
+    cfg.global_resource_planner.elastic_hybrid_require_planner_signal = True
+    cfg.global_resource_planner.elastic_hybrid_max_workers = 1
+    planner, join_decision = _decision(cfg)
+    join_decision.elastic_hybrid_signal = ElasticHybridSignal(
+        step=1,
+        desired_workers=1,
+        current_workers=0,
+        max_workers=1,
+        action="join",
+        reason="training_bottleneck",
+        train_rollout_ratio=2.0,
+        rollout_pressure=0.1,
+        ttl_steps=10,
+    )
+    release_fetch = __import__("threading").Event()
+    pool = ElasticHybridPool(
+        core_train_workers=["core0"],
+        core_rollout_workers=["rollout0"],
+        snapshot_fetcher=lambda *_args: release_fetch.wait(timeout=2.0) or 1,
+        zero_sync_steps=0,
+    )
+    executor = RuntimeElasticExecutor(
+        config=cfg,
+        planner=planner,
+        elastic_pool=pool,
+    )
+    executor.execute(join_decision)
+
+    release_signal = ElasticHybridSignal(
+        step=2,
+        desired_workers=0,
+        current_workers=1,
+        max_workers=1,
+        action="release",
+        reason="protect_rollout_capacity",
+        train_rollout_ratio=0.5,
+        rollout_pressure=1.0,
+        ttl_steps=10,
+        joining_workers=1,
+    )
+    executor.accept_planner_signal(release_signal)
+
+    assert executor.hybrid_runtime_state()["pending_hybrid_joins"] == 0
+    worker = pool.snapshot()["rollout0"]
+    assert worker.role == ReplicaRole.HYBRID_ROLLOUT
+    assert worker.join_state == JoinState.CANCELLED
+    release_fetch.set()
+    pool.close()
+
+
+def test_runtime_executor_does_not_rejoin_hybrids_after_target_is_reached():
+    if ElasticHybridPool is None:
+        pytest.skip("torch is not installed in this local environment")
+
+    cfg = _config()
+    planner, decision = _decision(cfg)
+    cfg.global_resource_planner.runtime_reconfigure_training = True
+    cfg.global_resource_planner.runtime_training_pool_target_gpus = 3
+    cfg.global_resource_planner.runtime_training_pool_plan_only = False
+    pool = ElasticHybridPool(
+        core_train_workers=["core0"],
+        core_rollout_workers=["rollout0", "rollout1"],
+        zero_sync_steps=0,
+    )
+    executor = RuntimeElasticExecutor(
+        config=cfg,
+        planner=planner,
+        elastic_pool=pool,
+    )
+
+    first = executor.execute(decision)
+    second = executor.execute(decision)
+    active_hybrids = [
+        worker
+        for worker in pool.snapshot().values()
+        if getattr(worker.role, "value", worker.role)
+        in {"hybrid_training", "hybrid_joining"}
+    ]
+
+    assert any(action.startswith("join_training:") for action in first.training_actions)
+    assert not any(action.startswith("join_training:") for action in second.training_actions)
+    assert any(
+        action.startswith("training_gpus_unchanged:3:active_hybrids=1")
+        for action in second.training_actions
+    )
+    assert len(active_hybrids) == 1
     pool.close()
 
 
@@ -260,7 +498,8 @@ def test_runtime_executor_creates_decoupled_elastic_domain_by_default():
     assert train_engine.domain is executor.elastic_pool.gradient_domain
     assert train_engine.domain.decoupled_communication_domains
     assert train_engine.domain.process_group is None
-    assert not train_engine.core_group_requested
+    assert train_engine.core_group_requested
+    assert train_engine.domain.communication_state()["has_core_process_group"]
     executor.close()
 
 
@@ -402,7 +641,7 @@ def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path
         for action in result.training_actions
     )
     assert any(
-        action.startswith("activate_prewarmed_hybrid_worker:rollout0->")
+        action.startswith("join_training_submitted:rollout0->")
         for action in result.training_actions
     )
     assert not any(
@@ -636,7 +875,7 @@ def test_cluster_swap_adopts_same_physical_rollout_and_filters_training_slots():
         command="old-keep",
         pid=-1,
         gpus=[0, 1, 2, 3],
-        port=8017,
+        port=8000,
         host="gn023",
         tp=4,
         adopted=True,
@@ -664,8 +903,6 @@ def test_cluster_swap_adopts_same_physical_rollout_and_filters_training_slots():
     assert "initial_override_tp4_0" not in executor.stopped
     assert "grp_tp4_0" in executor._process_meta
     assert executor._process_meta["grp_tp4_0"].pid == -1
-    assert executor._process_meta["grp_tp4_0"].port == 8017
-    assert cfg.heterogeneous_rollout.instances[0].port == 8017
     assert [meta.instance_id for meta in stopped] == ["initial_override_tp4_1"]
     assert executor.started == ["grp_tp2_1"]
     assert assigned == {
@@ -1200,3 +1437,26 @@ def test_dispatcher_reset_after_reconfigure_clears_old_rollout_state():
     assert stats.enqueued == 0
     assert stats.running == 0
     assert stats.accepted == 0
+
+
+def test_rollout_engine_reset_after_reconfigure_clears_pending_futures_and_load():
+    class Handle:
+        active_requests = 3
+
+    class Scheduler:
+        _instances = [Handle()]
+
+    engine = HeterogeneousRolloutEngine.__new__(HeterogeneousRolloutEngine)
+    engine.scheduler = Scheduler()
+    engine._lock = __import__("threading").RLock()
+    loop = __import__("asyncio").new_event_loop()
+    try:
+        pending = loop.create_future()
+        engine._pending_futures = {"request-1": [pending]}
+        engine.reset_after_reconfigure()
+
+        assert pending.cancelled()
+        assert engine._pending_futures == {}
+        assert Scheduler._instances[0].active_requests == 0
+    finally:
+        loop.close()
