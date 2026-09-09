@@ -5,6 +5,7 @@ import pytest
 
 from RL_Framework.config import AsyncRLConfig, HeterogeneousInstanceConfig
 from RL_Framework.infra.execution.batch_dispatcher import BatchTaskDispatcher, TaskInput
+from RL_Framework.engine.heterogeneous_engine import HeterogeneousRolloutEngine
 from RL_Framework.infra.cost_model.global_resource_planner import (
     ElasticHybridSignal,
     GlobalResourcePlanner,
@@ -1436,3 +1437,26 @@ def test_dispatcher_reset_after_reconfigure_clears_old_rollout_state():
     assert stats.enqueued == 0
     assert stats.running == 0
     assert stats.accepted == 0
+
+
+def test_rollout_engine_reset_after_reconfigure_clears_pending_futures_and_load():
+    class Handle:
+        active_requests = 3
+
+    class Scheduler:
+        _instances = [Handle()]
+
+    engine = HeterogeneousRolloutEngine.__new__(HeterogeneousRolloutEngine)
+    engine.scheduler = Scheduler()
+    engine._lock = __import__("threading").RLock()
+    loop = __import__("asyncio").new_event_loop()
+    try:
+        pending = loop.create_future()
+        engine._pending_futures = {"request-1": [pending]}
+        engine.reset_after_reconfigure()
+
+        assert pending.cancelled()
+        assert engine._pending_futures == {}
+        assert Scheduler._instances[0].active_requests == 0
+    finally:
+        loop.close()
