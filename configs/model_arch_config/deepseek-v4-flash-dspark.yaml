@@ -1,0 +1,30 @@
+# DeepSeek-V4-Flash-DSpark-BF16 architecture for Libra's GRP cost model.
+#
+# Counts were obtained from the headers of all 48 safetensors shards in the
+# deployed model, rather than from a nominal model-name estimate:
+#   total parameters: 304,180,418,494
+#   routed-expert parameters: 296,352,743,424
+#   shared-expert parameters: 1,157,627,904
+#   remaining dense/draft parameters: 6,227,046,487 / 443,000,679
+# At top-6 of 256 routed experts the active parameter count is
+# 14,330,441,815.  This value includes dense attention, shared experts and the
+# DSpark draft module, so it is suitable for compute-cost planning while the
+# total count remains suitable for memory-cost planning.
+
+num_params: 304.180418494e+9
+active_num_params: 14.330441815e+9
+d_model: 4096
+n_layers: 43
+n_heads: 64
+n_kv_heads: 1
+vocab_size: 129280
+intermediate_size: 2048
+dtype_bytes: 2
+head_dim: 512
+
+is_moe: true
+num_experts: 256
+num_shared_experts: 1
+num_activated_experts: 6
+expert_intermediate_size: 2048
+shared_expert_intermediate_size: 2048
