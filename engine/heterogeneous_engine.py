@@ -183,6 +183,23 @@ class HeterogeneousRolloutEngine:
                 )
             time.sleep(max(0.05, poll_interval))
 
+    def reset_after_reconfigure(self) -> None:
+        """Discard request accounting invalidated by a runtime reconfiguration.
+
+        The dispatcher may cancel in-flight work while changing the rollout
+        topology.  Those cancelled futures must not keep the next topology in
+        a permanent draining state, and scheduler load counters must start
+        from the same empty state.
+        """
+        with self._lock:
+            for futures in self._pending_futures.values():
+                for future in futures:
+                    if not future.done():
+                        future.cancel()
+            self._pending_futures.clear()
+            for handle in getattr(self.scheduler, "_instances", []):
+                handle.active_requests = 0
+
     async def close(self):
         """Close."""
         for engine in self.engines:
@@ -597,7 +614,7 @@ class HeterogeneousRolloutEngine:
         )
 
     def __del__(self):
-        for engine in self.engines:
+        for engine in getattr(self, "engines", []):
             try:
                 engine.__del__()
             except Exception:
