@@ -12,6 +12,7 @@ import threading
 import time
 import urllib.request
 import uuid
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -144,6 +145,25 @@ class RuntimeElasticExecutor:
         self.gradient_server = None
         self.membership_run_id = membership_run_id or uuid.uuid4().hex
         self._membership_publication_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._closing = threading.Event()
+        self._closed = False
+
+    @contextmanager
+    def _hybrid_resource_guard(self, handle=None):
+        """Commit managed side effects atomically with shutdown/cancellation.
+
+        Preparation and readiness waits stay outside this gate. Once close has
+        acquired it, no callback can launch, register or update worker metadata.
+        """
+        from RL_Framework.infra.elastic.hybrid_pool import JoinCancelledError
+
+        with self._lifecycle_lock:
+            if self._closing.is_set():
+                raise JoinCancelledError("runtime executor is closing")
+            guard = self.elastic_pool.activation_guard(handle) if self.elastic_pool is not None else nullcontext()
+            with guard:
+                yield
 
     def execute(self, decision: PlannerDecision) -> RuntimeReconfigurationResult:
         result = RuntimeReconfigurationResult(applied=False, reason=decision.reason)
@@ -501,42 +521,44 @@ class RuntimeElasticExecutor:
                         replica_rank=0,
                         replica_world_size=len(_members),
                     )
-                    proc = subprocess.Popen(command, shell=True, env=os.environ.copy())
-                    self._hybrid_worker_processes[_replica_id] = proc
-                    for rank, worker_id in enumerate(_members):
-                        self._hybrid_worker_processes[worker_id] = proc
-                        self._hybrid_worker_meta[worker_id] = ManagedHybridWorkerProcess(
-                            worker_id=worker_id,
-                            target_core_id=target_core_id,
-                            command=command,
-                            pid=proc.pid,
-                            snapshot_path=snapshot_path,
-                            host=next(iter(hosts), ""),
-                            gpus=gpus,
-                            replica_id=_replica_id,
-                            replica_rank=rank,
-                            replica_world_size=len(_members),
-                        )
+                    with self._hybrid_resource_guard():
+                        proc = subprocess.Popen(command, shell=True, env=os.environ.copy())
+                        self._hybrid_worker_processes[_replica_id] = proc
+                        for rank, worker_id in enumerate(_members):
+                            self._hybrid_worker_processes[worker_id] = proc
+                            self._hybrid_worker_meta[worker_id] = ManagedHybridWorkerProcess(
+                                worker_id=worker_id,
+                                target_core_id=target_core_id,
+                                command=command,
+                                pid=proc.pid,
+                                snapshot_path=snapshot_path,
+                                host=next(iter(hosts), ""),
+                                gpus=gpus,
+                                replica_id=_replica_id,
+                                replica_rank=rank,
+                                replica_world_size=len(_members),
+                            )
                     self._wait_hybrid_worker_ready(_replica_id)
 
-                handle = self.elastic_pool.join_replica(
-                    replica_id,
-                    members,
-                    target_core,
-                    replica_activation_barrier=(
-                        activate_replica if self._hybrid_worker_launch_enabled else None
-                    ),
-                    timeout_s=float(
-                        getattr(
-                            self.config.global_resource_planner,
-                            "elastic_hybrid_join_timeout_s",
-                            180.0,
-                        )
-                    ),
-                )
-                with self._pending_hybrid_join_lock:
-                    self._pending_hybrid_joins[replica_id] = handle
-                    self._pending_hybrid_join_started_at[replica_id] = time.time()
+                with self._hybrid_resource_guard():
+                    handle = self.elastic_pool.join_replica(
+                        replica_id,
+                        members,
+                        target_core,
+                        replica_activation_barrier=(
+                            activate_replica if self._hybrid_worker_launch_enabled else None
+                        ),
+                        timeout_s=float(
+                            getattr(
+                                self.config.global_resource_planner,
+                                "elastic_hybrid_join_timeout_s",
+                                180.0,
+                            )
+                        ),
+                    )
+                    with self._pending_hybrid_join_lock:
+                        self._pending_hybrid_joins[replica_id] = handle
+                        self._pending_hybrid_join_started_at[replica_id] = time.time()
                 actions.append(
                     f"join_replica_submitted:{replica_id}[{','.join(members)}]"
                     f"->{target_core}:"
@@ -869,17 +891,6 @@ class RuntimeElasticExecutor:
                 self._publish_hybrid_membership()
                 self._stop_hybrid_worker_process(worker_id, result)
 
-    def close(self) -> None:
-        """Stop control-plane threads and owned elastic resources."""
-        for worker_id in list(self._hybrid_worker_processes):
-            self._stop_hybrid_worker_process(worker_id)
-        if self.gradient_server is not None and hasattr(self.gradient_server, "close"):
-            self.gradient_server.close()
-        self.gradient_server = None
-        if self.elastic_pool is not None:
-            self.elastic_pool.close()
-        self.elastic_pool = None
-
     def _reconcile_pending_hybrid_joins(
         self,
         result: RuntimeReconfigurationResult | None = None,
@@ -961,55 +972,7 @@ class RuntimeElasticExecutor:
                 replica_rank=replica_rank,
                 replica_world_size=replica_world_size,
             )
-            if self._hybrid_worker_remote_control_enabled:
-                meta = self._request_remote_hybrid_worker(
-                    worker_id=worker_id,
-                    target_core_id=target_core_id,
-                    snapshot_path=snapshot_path,
-                    command=command,
-                    slot=slot,
-                )
-                meta.replica_id = replica_id or worker_id
-                meta.replica_rank = replica_rank
-                meta.replica_world_size = replica_world_size
-                self._hybrid_worker_meta[worker_id] = meta
-            else:
-                proc = subprocess.Popen(command, shell=True, env=os.environ.copy())
-                self._hybrid_worker_processes[worker_id] = proc
-                self._hybrid_worker_meta[worker_id] = ManagedHybridWorkerProcess(
-                    worker_id=worker_id,
-                    target_core_id=target_core_id,
-                    command=command,
-                    pid=proc.pid,
-                    snapshot_path=snapshot_path,
-                    host=str(slot.get("host", "")),
-                    gpus=[int(gpu) for gpu in slot.get("gpus", [])],
-                    replica_id=replica_id or worker_id,
-                    replica_rank=replica_rank,
-                    replica_world_size=replica_world_size,
-                )
-        else:
-            meta = self._hybrid_worker_meta.get(worker_id)
-            if meta is not None and (
-                meta.snapshot_path != snapshot_path
-                or meta.replica_id != (replica_id or worker_id)
-                or meta.replica_rank != replica_rank
-                or meta.replica_world_size != replica_world_size
-            ):
-                # A prewarmed process may have loaded an older checkpoint. Relaunch
-                # it in the background before the domain marks it active.
-                self._stop_hybrid_worker_process(worker_id)
-                command = self._build_hybrid_worker_command(
-                    worker_id=worker_id,
-                    target_core_id=target_core_id,
-                    snapshot_path=snapshot_path,
-                    idle=False,
-                    host=str(slot.get("host", "")),
-                    gpus=[int(gpu) for gpu in slot.get("gpus", [])],
-                    replica_id=replica_id or worker_id,
-                    replica_rank=replica_rank,
-                    replica_world_size=replica_world_size,
-                )
+            with self._hybrid_resource_guard():
                 if self._hybrid_worker_remote_control_enabled:
                     meta = self._request_remote_hybrid_worker(
                         worker_id=worker_id,
@@ -1031,10 +994,61 @@ class RuntimeElasticExecutor:
                         command=command,
                         pid=proc.pid,
                         snapshot_path=snapshot_path,
+                        host=str(slot.get("host", "")),
+                        gpus=[int(gpu) for gpu in slot.get("gpus", [])],
                         replica_id=replica_id or worker_id,
                         replica_rank=replica_rank,
                         replica_world_size=replica_world_size,
                     )
+        else:
+            meta = self._hybrid_worker_meta.get(worker_id)
+            if meta is not None and (
+                meta.snapshot_path != snapshot_path
+                or meta.replica_id != (replica_id or worker_id)
+                or meta.replica_rank != replica_rank
+                or meta.replica_world_size != replica_world_size
+            ):
+                # A prewarmed process may have loaded an older checkpoint. Relaunch
+                # it in the background before the domain marks it active.
+                with self._hybrid_resource_guard():
+                    self._stop_hybrid_worker_process(worker_id)
+                command = self._build_hybrid_worker_command(
+                    worker_id=worker_id,
+                    target_core_id=target_core_id,
+                    snapshot_path=snapshot_path,
+                    idle=False,
+                    host=str(slot.get("host", "")),
+                    gpus=[int(gpu) for gpu in slot.get("gpus", [])],
+                    replica_id=replica_id or worker_id,
+                    replica_rank=replica_rank,
+                    replica_world_size=replica_world_size,
+                )
+                with self._hybrid_resource_guard():
+                    if self._hybrid_worker_remote_control_enabled:
+                        meta = self._request_remote_hybrid_worker(
+                            worker_id=worker_id,
+                            target_core_id=target_core_id,
+                            snapshot_path=snapshot_path,
+                            command=command,
+                            slot=slot,
+                        )
+                        meta.replica_id = replica_id or worker_id
+                        meta.replica_rank = replica_rank
+                        meta.replica_world_size = replica_world_size
+                        self._hybrid_worker_meta[worker_id] = meta
+                    else:
+                        proc = subprocess.Popen(command, shell=True, env=os.environ.copy())
+                        self._hybrid_worker_processes[worker_id] = proc
+                        self._hybrid_worker_meta[worker_id] = ManagedHybridWorkerProcess(
+                            worker_id=worker_id,
+                            target_core_id=target_core_id,
+                            command=command,
+                            pid=proc.pid,
+                            snapshot_path=snapshot_path,
+                            replica_id=replica_id or worker_id,
+                            replica_rank=replica_rank,
+                            replica_world_size=replica_world_size,
+                        )
         self._wait_hybrid_worker_ready(worker_id)
 
     @property
@@ -1091,6 +1105,21 @@ class RuntimeElasticExecutor:
         command: str,
         slot: dict[str, Any],
     ) -> ManagedHybridWorkerProcess:
+        with self._hybrid_resource_guard():
+            return self._request_remote_hybrid_worker_locked(
+                worker_id=worker_id, target_core_id=target_core_id,
+                snapshot_path=snapshot_path, command=command, slot=slot,
+            )
+
+    def _request_remote_hybrid_worker_locked(
+        self,
+        *,
+        worker_id: str,
+        target_core_id: str,
+        snapshot_path: str,
+        command: str,
+        slot: dict[str, Any],
+    ) -> ManagedHybridWorkerProcess:
         host = str(slot.get("host", ""))
         if not host:
             raise RuntimeError(f"remote EHP worker {worker_id} has no host")
@@ -1115,12 +1144,7 @@ class RuntimeElasticExecutor:
             encoding="utf-8",
         )
         tmp.replace(request)
-        print(
-            "[RuntimeElasticExecutor] remote_hybrid_launch_requested "
-            f"worker={worker_id} host={host} gpus={slot.get('gpus', [])}",
-            flush=True,
-        )
-        return ManagedHybridWorkerProcess(
+        meta = ManagedHybridWorkerProcess(
             worker_id=worker_id,
             target_core_id=target_core_id,
             command=command,
@@ -1129,6 +1153,13 @@ class RuntimeElasticExecutor:
             host=host,
             gpus=[int(gpu) for gpu in slot.get("gpus", [])],
         )
+        self._hybrid_worker_meta[worker_id] = meta
+        print(
+            "[RuntimeElasticExecutor] remote_hybrid_launch_requested "
+            f"worker={worker_id} host={host} gpus={slot.get('gpus', [])}",
+            flush=True,
+        )
+        return meta
 
     def _cluster_swap_enabled(self, strategy: str | None = None) -> bool:
         cfg = self.config.global_resource_planner
@@ -1684,6 +1715,10 @@ class RuntimeElasticExecutor:
         return [rank for rank in source_ranks if rank != 0]
 
     def _ensure_elastic_pool(self):
+        with self._hybrid_resource_guard():
+            self._initialize_elastic_pool()
+
+    def _initialize_elastic_pool(self):
         if self.elastic_pool is not None:
             self._ensure_gradient_server()
             self._attach_train_engine_gradient_domain()
@@ -1884,18 +1919,19 @@ class RuntimeElasticExecutor:
         command: str,
         snapshot_path: str,
     ) -> ManagedHybridWorkerProcess:
-        env = os.environ.copy()
-        proc = subprocess.Popen(command, shell=True, env=env)
-        meta = ManagedHybridWorkerProcess(
-            worker_id=worker_id,
-            target_core_id=target_core_id,
-            command=command,
-            pid=proc.pid,
-            snapshot_path=snapshot_path,
-        )
-        self._hybrid_worker_processes[worker_id] = proc
-        self._hybrid_worker_meta[worker_id] = meta
-        return meta
+        with self._hybrid_resource_guard():
+            env = os.environ.copy()
+            proc = subprocess.Popen(command, shell=True, env=env)
+            meta = ManagedHybridWorkerProcess(
+                worker_id=worker_id,
+                target_core_id=target_core_id,
+                command=command,
+                pid=proc.pid,
+                snapshot_path=snapshot_path,
+            )
+            self._hybrid_worker_processes[worker_id] = proc
+            self._hybrid_worker_meta[worker_id] = meta
+            return meta
 
     def _adopt_prewarmed_hybrid_worker(
         self,
@@ -1910,42 +1946,53 @@ class RuntimeElasticExecutor:
         if not self._is_hybrid_worker_running(worker_id):
             return False
         worker = handle.result(timeout=None)
-        meta = self._hybrid_worker_meta.get(worker_id)
-        if meta is None:
-            meta = ManagedHybridWorkerProcess(
-                worker_id=worker_id,
-                target_core_id=target_core_id,
-                command="prewarmed_external_worker",
-                pid=-1,
-                snapshot_path=self._snapshot_path_for_version(worker.state_version),
-                host=str(self._cluster_swap_training_slot(worker_id).get("host", "")),
-                gpus=list(self._cluster_swap_training_slot(worker_id).get("gpus", [])),
-            )
-        else:
-            meta.target_core_id = target_core_id
-            meta.snapshot_path = self._snapshot_path_for_version(worker.state_version)
-        self._hybrid_worker_meta[worker_id] = meta
-        result.started_hybrid_workers.append(meta)
-        return True
+        with self._hybrid_resource_guard(handle):
+            meta = self._hybrid_worker_meta.get(worker_id)
+            if meta is None:
+                meta = ManagedHybridWorkerProcess(
+                    worker_id=worker_id,
+                    target_core_id=target_core_id,
+                    command="prewarmed_external_worker",
+                    pid=-1,
+                    snapshot_path=self._snapshot_path_for_version(worker.state_version),
+                    host=str(self._cluster_swap_training_slot(worker_id).get("host", "")),
+                    gpus=list(self._cluster_swap_training_slot(worker_id).get("gpus", [])),
+                )
+            else:
+                meta.target_core_id = target_core_id
+                meta.snapshot_path = self._snapshot_path_for_version(worker.state_version)
+            self._hybrid_worker_meta[worker_id] = meta
+            result.started_hybrid_workers.append(meta)
+            return True
 
     def _stop_hybrid_worker_process(
         self,
         worker_id: str,
         result: RuntimeReconfigurationResult | None = None,
     ) -> None:
-        proc = self._hybrid_worker_processes.pop(worker_id, None)
-        meta = self._hybrid_worker_meta.pop(worker_id, None)
+        with self._lifecycle_lock:
+            self._stop_hybrid_worker_process_locked(worker_id, result)
+
+    def _stop_hybrid_worker_process_locked(
+        self,
+        worker_id: str,
+        result: RuntimeReconfigurationResult | None = None,
+    ) -> None:
+        proc = self._hybrid_worker_processes.get(worker_id)
+        meta = self._hybrid_worker_meta.get(worker_id)
         if proc is None:
             if meta is not None and self._hybrid_worker_remote_control_enabled:
                 control_dir = self._hybrid_worker_control_dir()
                 control_dir.mkdir(parents=True, exist_ok=True)
-                request = control_dir / f".stop_{worker_id}.json"
-                tmp = request.with_suffix(request.suffix + ".tmp")
-                tmp.write_text(
-                    json.dumps({"worker_id": worker_id, "host": meta.host}),
-                    encoding="utf-8",
+                # Withdraw an unclaimed start before queuing its stop. The
+                # controller may already own a .running request; no remote
+                # exit acknowledgement is implied by this local publish.
+                (control_dir / f".launch_{worker_id}.json").unlink(missing_ok=True)
+                self._write_json_atomic(
+                    control_dir / f".stop_{worker_id}.json",
+                    {"worker_id": worker_id, "host": meta.host},
                 )
-                tmp.replace(request)
+            self._hybrid_worker_meta.pop(worker_id, None)
             if result is not None and meta is not None:
                 result.training_actions.append(f"stop_hybrid_worker_meta:{worker_id}")
             return
@@ -1956,10 +2003,21 @@ class RuntimeElasticExecutor:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+        # A replica process is registered under both replica and member IDs.
+        # Remove all aliases only after stop succeeds, retaining retryable
+        # ownership if terminate/wait or remote publication fails.
+        for alias, owned in list(self._hybrid_worker_processes.items()):
+            if owned is proc:
+                self._hybrid_worker_processes.pop(alias, None)
+                self._hybrid_worker_meta.pop(alias, None)
         if result is not None:
             result.training_actions.append(f"stop_hybrid_worker:{worker_id}")
 
     def _ensure_gradient_server(self):
+        with self._hybrid_resource_guard():
+            self._initialize_gradient_server()
+
+    def _initialize_gradient_server(self):
         if self.gradient_server is not None:
             return
         if self.train_engine is None:
@@ -2025,22 +2083,23 @@ class RuntimeElasticExecutor:
                 host=str(slot.get("host", "")),
                 gpus=[int(gpu) for gpu in slot.get("gpus", [])],
             )
-            env = os.environ.copy()
-            proc = subprocess.Popen(command, shell=True, env=env)
-            meta = ManagedHybridWorkerProcess(
-                worker_id=worker.worker_id,
-                target_core_id=handle.target_core_id,
-                command=command,
-                pid=proc.pid,
-                snapshot_path=snapshot_path,
-                host=str(slot.get("host", "")),
-                gpus=[int(gpu) for gpu in slot.get("gpus", [])],
-            )
-            self._hybrid_worker_processes[worker.worker_id] = proc
-            self._hybrid_worker_meta[worker.worker_id] = meta
-            if result is not None:
-                result.started_hybrid_workers.append(meta)
-            return meta
+            with self._hybrid_resource_guard(handle):
+                env = os.environ.copy()
+                proc = subprocess.Popen(command, shell=True, env=env)
+                meta = ManagedHybridWorkerProcess(
+                    worker_id=worker.worker_id,
+                    target_core_id=handle.target_core_id,
+                    command=command,
+                    pid=proc.pid,
+                    snapshot_path=snapshot_path,
+                    host=str(slot.get("host", "")),
+                    gpus=[int(gpu) for gpu in slot.get("gpus", [])],
+                )
+                self._hybrid_worker_processes[worker.worker_id] = proc
+                self._hybrid_worker_meta[worker.worker_id] = meta
+                if result is not None:
+                    result.started_hybrid_workers.append(meta)
+                return meta
         except Exception as exc:
             if result is not None:
                 result.errors.append(f"hybrid_worker_launch_failed:{exc}")
@@ -2066,29 +2125,30 @@ class RuntimeElasticExecutor:
             )
         )
         deadline = time.time() + max(timeout, 0.0)
-        proc = self._hybrid_worker_processes.get(worker_id)
         while time.time() < deadline:
-            if ready_path.exists():
-                meta = self._hybrid_worker_meta.get(worker_id)
-                if meta is not None and launch_started_path.exists():
-                    try:
-                        payload = json.loads(
-                            launch_started_path.read_text(encoding="utf-8")
-                        )
-                        meta.pid = int(payload.get("pid", meta.pid))
-                    except Exception:
-                        pass
-                return
-            if launch_error_path.exists():
-                raise RuntimeError(
-                    f"remote hybrid worker {worker_id} launch failed: "
-                    f"{launch_error_path.read_text(encoding='utf-8')[-1000:]}"
-                )
-            if proc is not None and proc.poll() is not None:
-                raise RuntimeError(
-                    f"hybrid worker {worker_id} exited before ready"
-                )
-            time.sleep(0.2)
+            with self._hybrid_resource_guard():
+                if ready_path.exists():
+                    meta = self._hybrid_worker_meta.get(worker_id)
+                    if meta is not None and launch_started_path.exists():
+                        try:
+                            payload = json.loads(
+                                launch_started_path.read_text(encoding="utf-8")
+                            )
+                            meta.pid = int(payload.get("pid", meta.pid))
+                        except Exception:
+                            pass
+                    return
+                if launch_error_path.exists():
+                    raise RuntimeError(
+                        f"remote hybrid worker {worker_id} launch failed: "
+                        f"{launch_error_path.read_text(encoding='utf-8')[-1000:]}"
+                    )
+                proc = self._hybrid_worker_processes.get(worker_id)
+                if proc is not None and proc.poll() is not None:
+                    raise RuntimeError(
+                        f"hybrid worker {worker_id} exited before ready"
+                    )
+            self._closing.wait(0.2)
         raise TimeoutError(
             f"hybrid worker {worker_id} did not become ready after {timeout:.0f}s"
         )
@@ -3005,19 +3065,43 @@ class RuntimeElasticExecutor:
         )
 
     def close(self):
-        self._stop_managed_rollout_processes()
-        for proc in list(self._hybrid_worker_processes.values()):
-            if proc.poll() is None:
-                proc.terminate()
+        """Fence late callbacks, then stop every resource already committed.
+
+        This waits for launch/register critical sections, not arbitrary join
+        Futures (which can be waiting on external snapshot/readiness work).
+        A failed cleanup raises and retains ownership for a subsequent retry.
+        """
+        # Stop admitting new reservations even while an earlier launch commit
+        # owns the gate. That commit must finish registration before we scan.
+        self._closing.set()
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            errors = []
+            if self.elastic_pool is not None:
                 try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-        self._hybrid_worker_processes.clear()
-        self._hybrid_worker_meta.clear()
-        if self.gradient_server is not None:
-            self.gradient_server.close()
-            self.gradient_server = None
-        if self.elastic_pool is not None and hasattr(self.elastic_pool, "close"):
-            self.elastic_pool.close()
-        time.sleep(0)
+                    self.elastic_pool.close()
+                except Exception as exc:
+                    errors.append(exc)
+            with self._pending_hybrid_join_lock:
+                self._pending_hybrid_joins.clear()
+                self._pending_hybrid_join_started_at.clear()
+            worker_ids = set(self._hybrid_worker_processes) | set(self._hybrid_worker_meta)
+            for worker_id in sorted(worker_ids):
+                try:
+                    self._stop_hybrid_worker_process(worker_id)
+                except Exception as exc:
+                    errors.append(exc)
+            try:
+                self._stop_managed_rollout_processes()
+            except Exception as exc:
+                errors.append(exc)
+            if self.gradient_server is not None:
+                try:
+                    self.gradient_server.close()
+                    self.gradient_server = None
+                except Exception as exc:
+                    errors.append(exc)
+            if errors:
+                raise RuntimeError("runtime shutdown cleanup failed: " + "; ".join(map(str, errors))) from errors[0]
+            self._closed = True

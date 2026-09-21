@@ -17,6 +17,7 @@ import enum
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping, Protocol
 
@@ -659,6 +660,7 @@ class ElasticHybridPool:
         self._executor = ThreadPoolExecutor(max_workers=background_capacity)
         self._lock = threading.RLock()
         self._closed = False
+        self._activation_context = threading.local()
         self._join_generations: dict[str, int] = {}
         self._replica_generations: dict[str, int] = {}
         self._replica_members: dict[str, tuple[str, ...]] = {}
@@ -890,8 +892,54 @@ class ElasticHybridPool:
 
     def close(self):
         with self._lock:
+            if self._closed:
+                return
             self._closed = True
+            # Finish local rollback here. Late callbacks must not mutate pool
+            # state after close returns, including their exception handlers.
+            for replica_id, generation in list(self._replica_generations.items()):
+                self._replica_generations[replica_id] = generation + 1
+            for worker_id, generation in list(self._join_generations.items()):
+                self._join_generations[worker_id] = generation + 1
+            for replica_id in self.gradient_domain.attached_hybrid_ids():
+                self.gradient_domain.detach(replica_id)
+            self._replica_members.clear()
+            for worker in self._workers.values():
+                if worker.role in {ReplicaRole.HYBRID_JOINING, ReplicaRole.HYBRID_TRAINING}:
+                    worker.transition(ReplicaRole.HYBRID_ROLLOUT, join_state=JoinState.CANCELLED)
         self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _invoke_activation(self, callback, args, *, identity, generation, replica, deadline):
+        # Preserve the callback API while carrying the original join generation
+        # to the runtime launch gate, even if cancellation/rejoin happens during
+        # command preparation. Reading the latest worker generation is unsafe.
+        previous = getattr(self._activation_context, "join", None)
+        self._activation_context.join = (identity, generation, replica, deadline)
+        try:
+            callback(*args)
+        finally:
+            self._activation_context.join = previous
+
+    @contextmanager
+    def activation_guard(self, handle=None):
+        """Serialize a launch commit with cancellation, never readiness waits.
+
+        Lock order: runtime lifecycle lock -> pool lock -> gradient-domain lock.
+        Pool callbacks themselves always run outside the pool lock.
+        """
+        with self._lock:
+            if self._closed:
+                raise JoinCancelledError("activation cancelled because pool is closed")
+            join = getattr(self._activation_context, "join", None)
+            if handle is not None:
+                replica = hasattr(handle, "replica_id")
+                identity = handle.replica_id if replica else handle.worker_id
+                join = (identity, handle.generation, replica, None)
+            if join is not None:
+                identity, generation, replica, deadline = join
+                check = self._assert_replica_join_current if replica else self._assert_join_current
+                check(identity, generation, deadline)
+            yield
 
     def _finish_join(
         self,
@@ -909,6 +957,7 @@ class ElasticHybridPool:
         try:
             self._assert_join_current(worker_id, generation, deadline)
             with self._lock:
+                self._assert_join_current(worker_id, generation, deadline)
                 worker = self._workers[worker_id]
                 worker.transition(
                     ReplicaRole.HYBRID_JOINING,
@@ -919,6 +968,7 @@ class ElasticHybridPool:
             self._assert_join_current(worker_id, generation, deadline)
 
             with self._lock:
+                self._assert_join_current(worker_id, generation, deadline)
                 worker = self._workers[worker_id]
                 worker.transition(
                     ReplicaRole.HYBRID_JOINING,
@@ -933,6 +983,7 @@ class ElasticHybridPool:
             self._assert_join_current(worker_id, generation, deadline)
             if activation_barrier is not None:
                 with self._lock:
+                    self._assert_join_current(worker_id, generation, deadline)
                     worker = self._workers[worker_id]
                     worker.transition(
                         ReplicaRole.HYBRID_JOINING,
@@ -941,7 +992,10 @@ class ElasticHybridPool:
                         state_version=version,
                         transition_generation=generation,
                     )
-                activation_barrier(worker_id, target_core_id, version)
+                self._invoke_activation(
+                    activation_barrier, (worker_id, target_core_id, version),
+                    identity=worker_id, generation=generation, replica=False, deadline=deadline,
+                )
                 self._assert_join_current(worker_id, generation, deadline)
 
             with self._lock:
@@ -964,7 +1018,7 @@ class ElasticHybridPool:
             # visible before the future is observed by the planner.
             with self._lock:
                 worker = self._workers.get(worker_id)
-                if worker is not None and self._join_generations.get(worker_id) == generation + 1:
+                if not self._closed and worker is not None and self._join_generations.get(worker_id) == generation + 1:
                     self.gradient_domain.detach(worker_id)
                     worker.transition(
                         ReplicaRole.HYBRID_ROLLOUT,
@@ -976,7 +1030,7 @@ class ElasticHybridPool:
         except Exception:
             with self._lock:
                 worker = self._workers[worker_id]
-                if self._join_generations.get(worker_id) == generation:
+                if not self._closed and self._join_generations.get(worker_id) == generation:
                     worker.transition(
                         ReplicaRole.HYBRID_ROLLOUT,
                         target_core_id=None,
@@ -1004,6 +1058,7 @@ class ElasticHybridPool:
         try:
             self._assert_replica_join_current(replica_id, generation, deadline)
             with self._lock:
+                self._assert_replica_join_current(replica_id, generation, deadline)
                 for worker_id in members:
                     self._workers[worker_id].transition(
                         ReplicaRole.HYBRID_JOINING,
@@ -1021,6 +1076,7 @@ class ElasticHybridPool:
                 )
             version = versions[0]
             with self._lock:
+                self._assert_replica_join_current(replica_id, generation, deadline)
                 for worker_id in members:
                     self._workers[worker_id].transition(
                         ReplicaRole.HYBRID_JOINING,
@@ -1034,6 +1090,7 @@ class ElasticHybridPool:
             self._assert_replica_join_current(replica_id, generation, deadline)
             if replica_activation_barrier is not None:
                 with self._lock:
+                    self._assert_replica_join_current(replica_id, generation, deadline)
                     for worker_id in members:
                         self._workers[worker_id].transition(
                             ReplicaRole.HYBRID_JOINING,
@@ -1042,10 +1099,14 @@ class ElasticHybridPool:
                             state_version=version,
                             transition_generation=generation,
                         )
-                replica_activation_barrier(replica_id, members, target_core_id, version)
+                self._invoke_activation(
+                    replica_activation_barrier, (replica_id, members, target_core_id, version),
+                    identity=replica_id, generation=generation, replica=True, deadline=deadline,
+                )
                 self._assert_replica_join_current(replica_id, generation, deadline)
             elif activation_barrier is not None:
                 with self._lock:
+                    self._assert_replica_join_current(replica_id, generation, deadline)
                     for worker_id in members:
                         self._workers[worker_id].transition(
                             ReplicaRole.HYBRID_JOINING,
@@ -1055,7 +1116,10 @@ class ElasticHybridPool:
                             transition_generation=generation,
                         )
                 for worker_id in members:
-                    activation_barrier(worker_id, target_core_id, version)
+                    self._invoke_activation(
+                        activation_barrier, (worker_id, target_core_id, version),
+                        identity=replica_id, generation=generation, replica=True, deadline=deadline,
+                    )
                     self._assert_replica_join_current(replica_id, generation, deadline)
 
             with self._lock:
@@ -1075,7 +1139,7 @@ class ElasticHybridPool:
                 return tuple(active)
         except JoinCancelledError:
             with self._lock:
-                if self._replica_generations.get(replica_id) == generation + 1:
+                if not self._closed and self._replica_generations.get(replica_id) == generation + 1:
                     self.gradient_domain.detach(replica_id)
                     for worker_id in members:
                         self._workers[worker_id].transition(
@@ -1087,7 +1151,7 @@ class ElasticHybridPool:
             raise
         except Exception:
             with self._lock:
-                if self._replica_generations.get(replica_id) == generation:
+                if not self._closed and self._replica_generations.get(replica_id) == generation:
                     self.gradient_domain.detach(replica_id)
                     for worker_id in members:
                         self._workers[worker_id].transition(
