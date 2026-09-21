@@ -12,6 +12,7 @@ import shutil
 import socket
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -125,6 +126,7 @@ class AsyncRLTrainer:
         )
         self._elastic_gradient_server: ElasticGradientServer | None = None
         self._elastic_membership_epochs: dict[str, int] = {}
+        self._elastic_membership_run_id = ""
         self._pending_hybrid_training_batches: dict[str, list[dict[str, Any]]] = {}
 
     def _run_grp_memory_preflight(self) -> None:
@@ -780,18 +782,7 @@ class AsyncRLTrainer:
                 self._follow_runtime_reconfiguration_if_requested()
                 self._trace_train_phase(step, "follow_reconfig_done")
 
-            self._refresh_nonblocking_elastic_membership()
-            active_hybrid_ids: list[str] = []
-            domain = getattr(self.train_engine, "elastic_gradient_domain", None)
-            if domain is not None:
-                active_hybrid_ids = list(
-                    domain.active_hybrid_ids_for_core(
-                        f"dp{self.train_engine.get_data_parallel_rank()}"
-                    )
-                )
-            set_step = getattr(self.train_engine, "set_elastic_training_step", None)
-            if callable(set_step):
-                set_step(step, active_hybrid_ids)
+            active_hybrid_ids = self._prepare_elastic_training_step(step)
 
             if self._use_heterogeneous and hasattr(self.rollout_engine, "notify_epoch_start"):
                 self.rollout_engine.notify_epoch_start(epoch=step)
@@ -1831,6 +1822,7 @@ class AsyncRLTrainer:
             train_engine=self.train_engine,
             rollout_engine=self.rollout_engine,
             dispatcher=self.dispatcher,
+            membership_run_id=self._elastic_membership_run_id or None,
         )
         if self._elastic_gradient_server is not None:
             self.runtime_elastic_executor.gradient_server = self._elastic_gradient_server
@@ -1927,8 +1919,19 @@ class AsyncRLTrainer:
             endpoint_dir / f"rank_{self.rank}.json",
             {**endpoint.to_dict(), **lane, "host": public_host, "backend": "tcp"},
         )
+        session_path = task_dir / "membership_session.json"
+        if self.is_main_process:
+            self._write_json_atomic(session_path, {"run_id": uuid.uuid4().hex})
+        # Reuse the existing endpoint setup barrier: the fresh leader record
+        # must be visible before any rank accepts membership from this run.
         if dist.is_initialized():
             dist.barrier()
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+        run_id = session.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            raise RuntimeError(f"invalid EHP membership session: {session_path}")
+        self._elastic_membership_run_id = run_id
+        self._elastic_membership_epochs.clear()
 
         def publish_update(update: GradientUpdate) -> None:
             server.publish_update(update)
@@ -2437,28 +2440,47 @@ class AsyncRLTrainer:
             if worker_id in active_hybrid_ids:
                 domain.mark_active(worker_id)
 
+    def _prepare_elastic_training_step(self, step: int) -> list[str]:
+        """Refresh membership before freezing this step's gradient sources."""
+        self._refresh_nonblocking_elastic_membership()
+        active_hybrid_ids: list[str] = []
+        domain = getattr(self.train_engine, "elastic_gradient_domain", None)
+        if domain is not None:
+            active_hybrid_ids = list(domain.active_hybrid_ids_for_core(
+                f"dp{self.train_engine.get_data_parallel_rank()}",
+            ))
+        set_step = getattr(self.train_engine, "set_elastic_training_step", None)
+        if callable(set_step):
+            set_step(step, active_hybrid_ids)
+        return active_hybrid_ids
+
     def _refresh_nonblocking_elastic_membership(self) -> None:
         planner_cfg = getattr(self.config, "global_resource_planner", None)
         domain = getattr(self.train_engine, "elastic_gradient_domain", None)
-        if domain is None or planner_cfg is None:
+        run_id = self._elastic_membership_run_id
+        if domain is None or planner_cfg is None or not run_id:
             return
         membership_dir = Path(getattr(planner_cfg, "hybrid_worker_task_dir", "./logs/elastic_training_tasks")) / "membership"
         for path in membership_dir.glob("*.json"):
             try:
                 state = json.loads(path.read_text(encoding="utf-8"))
+                if state.get("run_id") != run_id:
+                    continue
                 worker_id = str(state.get("worker_id", ""))
                 target = str(state.get("target_core_id", ""))
                 epoch = int(state.get("membership_epoch", 0))
                 role = str(state.get("role", ""))
+                if role not in {"hybrid_training", "hybrid_joining", "hybrid_rollout", "core_rollout"}:
+                    continue
                 if not worker_id or epoch < self._elastic_membership_epochs.get(worker_id, -1):
                     continue
                 if role in {"hybrid_rollout", "core_rollout"}:
-                    domain.detach(worker_id)
+                    domain.detach(worker_id, membership_epoch=epoch)
                 else:
                     if epoch > self._elastic_membership_epochs.get(worker_id, -1):
                         domain.request_join(worker_id, target, membership_epoch=epoch)
                     if role == "hybrid_training" and domain.is_joining(worker_id):
-                        domain.mark_active(worker_id)
+                        domain.mark_active(worker_id, membership_epoch=epoch)
                 self._elastic_membership_epochs[worker_id] = epoch
             except (OSError, ValueError, KeyError, json.JSONDecodeError):
                 continue
@@ -2475,7 +2497,8 @@ class AsyncRLTrainer:
             if not membership_path.exists():
                 continue
             state = json.loads(membership_path.read_text(encoding="utf-8"))
-            if str(state.get("role")) != "hybrid_training":
+            if (state.get("run_id") != self._elastic_membership_run_id
+                    or str(state.get("role")) != "hybrid_training"):
                 continue
             task_path = task_dir / f"{worker_id}.step_{step}.pt"
             tmp_path = task_path.with_suffix(task_path.suffix + ".tmp")

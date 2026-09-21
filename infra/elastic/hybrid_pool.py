@@ -361,6 +361,7 @@ class InterReplicaGradientDomain:
             joining = tuple(sorted(self._joining))
             return {
                 "membership_epoch": self._membership_epoch,
+                "membership_epochs": dict(self._membership_epochs),
                 "core_replica_ids": self.core_replica_ids,
                 "hybrid_targets": targets,
                 "joining_replica_ids": joining,
@@ -390,20 +391,31 @@ class InterReplicaGradientDomain:
                 )
             self._membership_epochs[hybrid_replica_id] = int(membership_epoch)
 
-    def mark_active(self, hybrid_replica_id: str):
+    def mark_active(self, hybrid_replica_id: str, *, membership_epoch: int | None = None):
         with self._lock:
             if hybrid_replica_id not in self._hybrid_targets:
                 raise KeyError(f"unknown hybrid replica: {hybrid_replica_id}")
             self._joining.discard(hybrid_replica_id)
-            self._membership_epoch += 1
-            self._membership_epochs[hybrid_replica_id] = self._membership_epoch
+            if membership_epoch is None:
+                self._membership_epoch += 1
+                membership_epoch = self._membership_epoch
+            else:
+                self._membership_epoch = max(self._membership_epoch, int(membership_epoch))
+            self._membership_epochs[hybrid_replica_id] = int(membership_epoch)
 
-    def detach(self, hybrid_replica_id: str):
+    def detach(self, hybrid_replica_id: str, *, membership_epoch: int | None = None):
         with self._lock:
             self._joining.discard(hybrid_replica_id)
-            if self._hybrid_targets.pop(hybrid_replica_id, None) is not None:
-                self._membership_epoch += 1
-                self._membership_epochs.pop(hybrid_replica_id, None)
+            attached = self._hybrid_targets.pop(hybrid_replica_id, None) is not None
+            if attached or membership_epoch is not None:
+                if membership_epoch is None:
+                    self._membership_epoch += 1
+                    membership_epoch = self._membership_epoch
+                else:
+                    self._membership_epoch = max(self._membership_epoch, int(membership_epoch))
+                # Keep the exit version so the publisher can emit an explicit
+                # rollout record even after the replica leaves the pool.
+                self._membership_epochs[hybrid_replica_id] = int(membership_epoch)
 
     def is_joining(self, hybrid_replica_id: str) -> bool:
         with self._lock:
@@ -825,6 +837,31 @@ class ElasticHybridPool:
             for replica_id, members in memberships.items()
         }
 
+    def membership_snapshot(self) -> dict[str, dict[str, object]]:
+        """Snapshot attached replicas and versioned exits under the pool lock."""
+        with self._lock:
+            state = self.gradient_domain.membership_state()
+            targets = state["hybrid_targets"]
+            joining = set(state["joining_replica_ids"])
+            records = {}
+            for replica_id, epoch in state["membership_epochs"].items():
+                members = self._replica_members.get(
+                    replica_id, (replica_id,) if replica_id in self._workers else (),
+                )
+                role = ReplicaRole.HYBRID_ROLLOUT
+                if replica_id in targets:
+                    role = (ReplicaRole.HYBRID_JOINING if replica_id in joining
+                            else ReplicaRole.HYBRID_TRAINING)
+                records[replica_id] = {
+                    "worker_id": replica_id,
+                    "target_core_id": targets.get(replica_id, ""),
+                    "role": role.value,
+                    "membership_epoch": epoch,
+                    "members": list(members),
+                    "replica_world_size": len(members) or self.gradient_domain.replica_world_size,
+                }
+            return records
+
     def cancel_join(self, worker_id: str, generation: int) -> None:
         with self._lock:
             worker = self._workers.get(worker_id)
@@ -907,8 +944,11 @@ class ElasticHybridPool:
                 activation_barrier(worker_id, target_core_id, version)
                 self._assert_join_current(worker_id, generation, deadline)
 
-            self.gradient_domain.mark_active(worker_id)
             with self._lock:
+                # Cancellation and activation must not interleave between the
+                # final generation check and the membership/role update.
+                self._assert_join_current(worker_id, generation, deadline)
+                self.gradient_domain.mark_active(worker_id)
                 worker = self._workers[worker_id]
                 worker.transition(
                     ReplicaRole.HYBRID_TRAINING,
@@ -1018,8 +1058,9 @@ class ElasticHybridPool:
                     activation_barrier(worker_id, target_core_id, version)
                     self._assert_replica_join_current(replica_id, generation, deadline)
 
-            self.gradient_domain.mark_active(replica_id)
             with self._lock:
+                self._assert_replica_join_current(replica_id, generation, deadline)
+                self.gradient_domain.mark_active(replica_id)
                 active = []
                 for worker_id in members:
                     worker = self._workers[worker_id]

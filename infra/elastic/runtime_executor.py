@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -123,6 +124,7 @@ class RuntimeElasticExecutor:
         rollout_engine: Any | None = None,
         dispatcher: Any | None = None,
         elastic_pool: "ElasticHybridPool | None" = None,
+        membership_run_id: str | None = None,
     ):
         self.config = config
         self.planner = planner
@@ -140,6 +142,8 @@ class RuntimeElasticExecutor:
         self._pending_hybrid_join_lock = threading.RLock()
         self._active_elastic_signal: dict[str, Any] | None = None
         self.gradient_server = None
+        self.membership_run_id = membership_run_id or uuid.uuid4().hex
+        self._membership_publication_lock = threading.Lock()
 
     def execute(self, decision: PlannerDecision) -> RuntimeReconfigurationResult:
         result = RuntimeReconfigurationResult(applied=False, reason=decision.reason)
@@ -569,6 +573,7 @@ class RuntimeElasticExecutor:
                 except (KeyError, RuntimeError):
                     # A cancellation may already have completed the rollback.
                     pass
+                self._publish_hybrid_membership()
                 for worker_id in members:
                     self._stop_hybrid_worker_process(worker_id, result)
                 actions.append(
@@ -591,6 +596,7 @@ class RuntimeElasticExecutor:
                         self.elastic_pool.release_to_rollout(worker_id)
                     except (KeyError, RuntimeError):
                         continue
+                    self._publish_hybrid_membership()
                     self._stop_hybrid_worker_process(worker_id, result)
                     actions.append(f"release_to_rollout:{worker_id}")
         else:
@@ -690,6 +696,30 @@ class RuntimeElasticExecutor:
             groups.append((f"ehp_replica_{members[0]}", members))
         return groups
 
+    def _publish_hybrid_membership(self) -> dict[str, dict[str, Any]]:
+        """Publish current membership, including retained detach versions.
+
+        Serializing snapshot acquisition and publication prevents a delayed
+        writer from overwriting a release with an older training record.
+        """
+        if self.elastic_pool is None:
+            return {}
+        directory = Path(getattr(
+            self.config.global_resource_planner,
+            "hybrid_worker_task_dir", "./logs/elastic_training_tasks",
+        )) / "membership"
+        with self._membership_publication_lock:
+            records = self.elastic_pool.membership_snapshot()
+            for replica_id, record in records.items():
+                path = directory / f"{replica_id}.json"
+                try:
+                    self._write_json_atomic(path, {**record, "run_id": self.membership_run_id})
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"failed to publish EHP membership for {replica_id}: {path}"
+                    ) from exc
+            return records
+
     def hybrid_runtime_state(self) -> dict[str, Any]:
         """Expose EHP state to GRP without sharing mutable pool internals."""
         self._reconcile_pending_hybrid_joins()
@@ -698,39 +728,9 @@ class RuntimeElasticExecutor:
         joining = 0
         domain_state: dict[str, Any] = {}
         if self.elastic_pool is not None:
-            replica_snapshot = (
-                self.elastic_pool.replica_snapshot()
-                if hasattr(self.elastic_pool, "replica_snapshot")
-                else {}
-            )
-            for members in replica_snapshot.values():
-                roles = {self._role_name(worker.role) for worker in members}
-            membership_dir = Path(getattr(self.config.global_resource_planner, "hybrid_worker_task_dir", "./logs/elastic_training_tasks")) / "membership"
-            membership_dir.mkdir(parents=True, exist_ok=True)
-            domain_membership = self.elastic_pool.gradient_domain.membership_state()
-            targets = domain_membership.get("hybrid_targets") or {}
-            active_ids = set(domain_membership.get("active_replica_ids") or ())
-            for replica_id, members in replica_snapshot.items():
-                target = str(targets.get(replica_id, ""))
-                role = "hybrid_training" if replica_id in active_ids else "hybrid_joining"
-                self._write_json_atomic(
-                    membership_dir / f"{replica_id}.json",
-                    {"worker_id": replica_id, "target_core_id": target,
-                     "role": role, "membership_epoch": int(domain_membership.get("membership_epoch", 0)),
-                     "members": [worker.worker_id for worker in members],
-                     "replica_world_size": len(members)},
-                )
-                if roles == {"hybrid_training"}:
-                    active += 1
-                elif "hybrid_joining" in roles:
-                    joining += 1
-            if not replica_snapshot and self._elastic_replica_size_gpus() == 1:
-                for worker in self.elastic_pool.snapshot().values():
-                    role = self._role_name(worker.role)
-                    if role == "hybrid_training":
-                        active += 1
-                    elif role == "hybrid_joining":
-                        joining += 1
+            records = self._publish_hybrid_membership()
+            active = sum(record["role"] == "hybrid_training" for record in records.values())
+            joining = sum(record["role"] == "hybrid_joining" for record in records.values())
             gradient_domain = getattr(self.elastic_pool, "gradient_domain", None)
             if gradient_domain is not None and hasattr(
                 gradient_domain, "membership_state"
@@ -821,6 +821,7 @@ class RuntimeElasticExecutor:
             self._pending_hybrid_join_started_at.clear()
         for replica_id, handle in pending_items:
             handle.cancel()
+            self._publish_hybrid_membership()
             members = tuple(getattr(handle, "member_worker_ids", (replica_id,)))
             for worker_id in members:
                 self._stop_hybrid_worker_process(worker_id, result)
@@ -847,6 +848,7 @@ class RuntimeElasticExecutor:
                 self.elastic_pool.release_replica_to_rollout(replica_id)
             except (KeyError, RuntimeError):
                 continue
+            self._publish_hybrid_membership()
             for worker in members:
                 self._stop_hybrid_worker_process(worker.worker_id, result)
             if result is not None:
@@ -864,6 +866,7 @@ class RuntimeElasticExecutor:
                     self.elastic_pool.release_to_rollout(worker_id)
                 except RuntimeError:
                     continue
+                self._publish_hybrid_membership()
                 self._stop_hybrid_worker_process(worker_id, result)
 
     def close(self) -> None:
@@ -896,6 +899,7 @@ class RuntimeElasticExecutor:
                 )
                 if time.time() - started > timeout:
                     handle.cancel()
+                    self._publish_hybrid_membership()
                     with self._pending_hybrid_join_lock:
                         self._pending_hybrid_joins.pop(replica_id, None)
                         self._pending_hybrid_join_started_at.pop(replica_id, None)
@@ -918,6 +922,7 @@ class RuntimeElasticExecutor:
                         f"generation={handle.generation}"
                     )
             except Exception as exc:
+                self._publish_hybrid_membership()
                 for worker_id in tuple(
                     getattr(handle, "member_worker_ids", (replica_id,))
                 ):
