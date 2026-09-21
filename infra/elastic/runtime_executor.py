@@ -15,7 +15,7 @@ import uuid
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from RL_Framework.config import AsyncRLConfig
 from RL_Framework.infra.cost_model.global_resource_planner import (
@@ -85,6 +85,26 @@ class RuntimeReconfigurationResult:
         }
 
 
+@dataclass(frozen=True)
+class PreparedRuntimeTransaction:
+    """Immutable eligibility snapshot for one runtime boundary decision."""
+
+    decision: PlannerDecision
+    result: RuntimeReconfigurationResult
+    should_execute: bool
+    reason: str
+    candidate_plan: GlobalResourcePlan | None
+    effective_planner_signal: Any | None
+    current_train_gpus: int
+    rollout_runtime_enabled: bool
+    strategy: str
+    cluster_swap_enabled: bool
+    drain_before_reconfigure: bool
+    should_pause_dispatcher: bool
+    drain_required: bool
+    coord_id: str
+
+
 class RuntimeElasticExecutor:
     """Apply planner decisions to rollout and elastic training control planes."""
 
@@ -148,6 +168,9 @@ class RuntimeElasticExecutor:
         self._lifecycle_lock = threading.RLock()
         self._closing = threading.Event()
         self._closed = False
+        self.runtime_run_id = ""
+        self._peer_drain_request_coord_id = ""
+        self._peer_drain_completed_coord_id = ""
 
     @contextmanager
     def _hybrid_resource_guard(self, handle=None):
@@ -165,28 +188,17 @@ class RuntimeElasticExecutor:
             with guard:
                 yield
 
-    def execute(self, decision: PlannerDecision) -> RuntimeReconfigurationResult:
-        result = RuntimeReconfigurationResult(applied=False, reason=decision.reason)
-        self._reconcile_pending_hybrid_joins(result)
-        self.accept_planner_signal(
-            getattr(decision, "elastic_hybrid_signal", None),
-            result=result,
-        )
-        if not decision.should_reconfigure or decision.candidate_plan is None:
-            return result
-
-        plan = decision.candidate_plan
+    def prepare_transaction(self, decision: PlannerDecision) -> PreparedRuntimeTransaction:
+        """Freeze runtime eligibility without launching, stopping, or waiting."""
         planner_cfg = self.config.global_resource_planner
+        plan = decision.candidate_plan
+        should_execute = bool(decision.should_reconfigure and plan is not None)
+        reason = str(decision.reason)
+        current_train_gpus = int(self.config.train_gpus)
         rollout_runtime_enabled = bool(
             getattr(planner_cfg, "apply_to_runtime", True)
             or getattr(planner_cfg, "runtime_manage_rollout_processes", False)
         )
-        if not getattr(planner_cfg, "runtime_dynamic_reconfiguration_enabled", True):
-            return RuntimeReconfigurationResult(
-                applied=False,
-                reason="runtime_dynamic_reconfiguration_disabled",
-            )
-        current_train_gpus = int(self.config.train_gpus)
         strategy = getattr(
             planner_cfg,
             "runtime_rollout_reconfigure_strategy",
@@ -199,24 +211,137 @@ class RuntimeElasticExecutor:
         should_pause_dispatcher = not (
             cluster_swap_enabled and not drain_before_reconfigure
         )
-        if getattr(planner_cfg, "runtime_manage_rollout_processes", False):
+
+        if should_execute and not getattr(
+            planner_cfg,
+            "runtime_dynamic_reconfiguration_enabled",
+            True,
+        ):
+            should_execute = False
+            reason = "runtime_dynamic_reconfiguration_disabled"
+
+        if (
+            should_execute
+            and plan is not None
+            and getattr(planner_cfg, "runtime_manage_rollout_processes", False)
+        ):
+            # Metadata adoption is part of the eligibility snapshot. It does not
+            # launch, stop, wait for, or reconfigure any worker.
             self._adopt_existing_rollout_processes()
             if self._runtime_plan_already_applied(
                 plan,
                 current_train_gpus=current_train_gpus,
             ):
-                self._write_rollout_manifest(plan, phase="applied")
-                self._write_peer_rank_reconfiguration_state(plan, phase="applied")
-                return RuntimeReconfigurationResult(
-                    applied=False,
-                    reason="runtime_plan_already_applied",
-                    actions=["runtime_plan_already_applied"],
-                )
+                should_execute = False
+                reason = "runtime_plan_already_applied"
+
+        drain_required = bool(
+            should_execute
+            and drain_before_reconfigure
+            and getattr(planner_cfg, "runtime_coordinate_reconfiguration_ranks", True)
+            and int(os.environ.get("WORLD_SIZE", "1") or "1") > 1
+            and int(os.environ.get("RANK", "0") or "0") == 0
+        )
+        coord_id = uuid.uuid4().hex if should_execute else ""
+        result = RuntimeReconfigurationResult(applied=False, reason=reason)
+        return PreparedRuntimeTransaction(
+            decision=decision,
+            result=result,
+            should_execute=should_execute,
+            reason=reason,
+            candidate_plan=plan,
+            effective_planner_signal=getattr(decision, "elastic_hybrid_signal", None),
+            current_train_gpus=current_train_gpus,
+            rollout_runtime_enabled=rollout_runtime_enabled,
+            strategy=strategy,
+            cluster_swap_enabled=cluster_swap_enabled,
+            drain_before_reconfigure=drain_before_reconfigure,
+            should_pause_dispatcher=should_pause_dispatcher,
+            drain_required=drain_required,
+            coord_id=coord_id,
+        )
+
+    def execute(
+        self,
+        decision: PlannerDecision,
+        *,
+        before_execute: Callable[[str, bool], None] | None = None,
+        request_published: Callable[[str], None] | None = None,
+    ) -> RuntimeReconfigurationResult:
+        """Compatibility entry point for callers without boundary orchestration."""
+        prepared = self.prepare_transaction(decision)
+        try:
+            if prepared.should_execute:
+                self._active_runtime_coord_id = prepared.coord_id
+                if prepared.drain_required:
+                    self.publish_peer_rank_drain_request(prepared)
+                    if request_published is not None:
+                        request_published(prepared.coord_id)
+                if before_execute is not None:
+                    before_execute(prepared.coord_id, prepared.drain_required)
+                if prepared.drain_required:
+                    self.wait_for_peer_rank_drain(prepared)
+        except Exception as exc:
+            self.abort_prepared_transaction(prepared, exc)
+            raise
+        return self.execute_prepared(prepared)
+
+    def abort_prepared_transaction(
+        self,
+        prepared: PreparedRuntimeTransaction,
+        error: BaseException,
+    ) -> None:
+        if prepared.should_execute and prepared.candidate_plan is not None:
+            self._write_peer_rank_reconfiguration_state(
+                prepared.candidate_plan,
+                phase="aborted",
+                coord_id=prepared.coord_id,
+                error=str(error),
+            )
+
+    def execute_prepared(
+        self,
+        prepared: PreparedRuntimeTransaction,
+    ) -> RuntimeReconfigurationResult:
+        """Perform maintenance and execute one previously frozen transaction."""
+        self._active_runtime_coord_id = prepared.coord_id
+        self._runtime_transaction_started = prepared.should_execute
+        try:
+            return self._execute_prepared(prepared)
+        except Exception as exc:
+            self.abort_prepared_transaction(prepared, exc)
+            raise
+
+    def _execute_prepared(
+        self,
+        prepared: PreparedRuntimeTransaction,
+    ) -> RuntimeReconfigurationResult:
+        decision = prepared.decision
+        result = prepared.result
+        self._reconcile_pending_hybrid_joins(result)
+        self.accept_planner_signal(
+            prepared.effective_planner_signal,
+            result=result,
+        )
+        if not prepared.should_execute or prepared.candidate_plan is None:
+            return result
+
+        plan = prepared.candidate_plan
+        planner_cfg = self.config.global_resource_planner
+        rollout_runtime_enabled = prepared.rollout_runtime_enabled
+        current_train_gpus = prepared.current_train_gpus
+        strategy = prepared.strategy
+        cluster_swap_enabled = prepared.cluster_swap_enabled
+        drain_before_reconfigure = prepared.drain_before_reconfigure
+        should_pause_dispatcher = prepared.should_pause_dispatcher
         config_applied = False
         prewarmed_rollout = False
         prewarmed_stopped: list[ManagedRolloutProcess] = []
         prewarmed_started: list[ManagedRolloutProcess] = []
-        coordinated_peers = False
+        coordinated_peers = bool(
+            prepared.drain_required
+            and self._peer_drain_completed_coord_id == prepared.coord_id
+        )
         if (
             getattr(planner_cfg, "runtime_manage_rollout_processes", False)
             and strategy == "prewarm"
@@ -258,6 +383,7 @@ class RuntimeElasticExecutor:
         if (
             cluster_swap_enabled
             and config_applied
+            and not coordinated_peers
             and getattr(
                 planner_cfg,
                 "runtime_coordinate_reconfiguration_ranks",
@@ -295,7 +421,8 @@ class RuntimeElasticExecutor:
             paused = True
             result.actions.append("dispatcher_pause")
             if (
-                getattr(planner_cfg, "runtime_manage_rollout_processes", False)
+                not coordinated_peers
+                and getattr(planner_cfg, "runtime_manage_rollout_processes", False)
                 and config_applied
             ):
                 self._coordinate_peer_rank_drain(plan, result)
@@ -436,7 +563,6 @@ class RuntimeElasticExecutor:
             return result
         except Exception as exc:
             result.errors.append(str(exc))
-            self._write_peer_rank_reconfiguration_state(plan, phase="aborted", error=str(exc))
             raise
         finally:
             if paused and self.dispatcher is not None and hasattr(self.dispatcher, "resume"):
@@ -1505,10 +1631,7 @@ class RuntimeElasticExecutor:
         return Path(self.config.log_dir) / "runtime_reconfiguration"
 
     def _current_coordination_id(self, plan: GlobalResourcePlan) -> str:
-        return (
-            f"rollout_{int(time.time())}_"
-            f"{'_'.join(str(tp) for tp in plan.rollout_tp_list)}"
-        )
+        return getattr(self, "_active_runtime_coord_id", "") or uuid.uuid4().hex
 
     def _write_peer_rank_reconfiguration_state(
         self,
@@ -1517,6 +1640,7 @@ class RuntimeElasticExecutor:
         phase: str,
         coord_id: str | None = None,
         error: str = "",
+        elastic_signal: Any | None = None,
     ) -> Path:
         coord_dir = self._coordination_dir()
         coord_dir.mkdir(parents=True, exist_ok=True)
@@ -1524,6 +1648,7 @@ class RuntimeElasticExecutor:
             coord_id = getattr(self, "_active_runtime_coord_id", "")
         payload = {
             "coord_id": coord_id,
+            "run_id": self.runtime_run_id,
             "phase": phase,
             "job_id": os.environ.get("SLURM_JOB_ID", os.environ.get("JOB_ID", "")),
             "updated_at": time.time(),
@@ -1538,7 +1663,10 @@ class RuntimeElasticExecutor:
                 }
                 for idx, inst in enumerate(self.config.heterogeneous_rollout.instances)
             ],
-            "training": self._peer_training_reconfiguration_state(plan),
+            "training": self._peer_training_reconfiguration_state(
+                plan,
+                elastic_signal=elastic_signal,
+            ),
             "error": error,
         }
         path = coord_dir / f"{phase}.json"
@@ -1550,6 +1678,8 @@ class RuntimeElasticExecutor:
     def _peer_training_reconfiguration_state(
         self,
         plan: GlobalResourcePlan,
+        *,
+        elastic_signal: Any | None = None,
     ) -> dict[str, Any]:
         planner_cfg = self.config.global_resource_planner
         if not getattr(planner_cfg, "runtime_reconfigure_training", False):
@@ -1590,6 +1720,12 @@ class RuntimeElasticExecutor:
                 for worker_id in membership.get("active_replica_ids", ())
                 if str(worker_id) in hybrid_targets
             ]
+        if elastic_signal is None:
+            signal_payload = dict(self._active_elastic_signal or {})
+        elif hasattr(elastic_signal, "to_dict"):
+            signal_payload = dict(elastic_signal.to_dict())
+        else:
+            signal_payload = dict(elastic_signal)
         return {
             "enabled": True,
             "plan_only": bool(
@@ -1601,12 +1737,71 @@ class RuntimeElasticExecutor:
             "hybrid_targets": hybrid_targets,
             "active_hybrid_ids": active_hybrid_ids,
             "replica_size_gpus": self._elastic_replica_size_gpus(),
-            "elastic_hybrid_signal": dict(self._active_elastic_signal or {}),
+            "elastic_hybrid_signal": signal_payload,
             # Compatibility summary for older readers. Peers use the explicit
             # list above so a submitted join cannot become active before its
             # worker crosses the activation barrier.
             "activate_hybrids": bool(active_hybrid_ids),
         }
+
+    def publish_peer_rank_drain_request(
+        self,
+        prepared: PreparedRuntimeTransaction,
+    ) -> None:
+        """Atomically expose a prepared drain request before its boundary decision."""
+        if not prepared.should_execute or not prepared.drain_required:
+            raise RuntimeError("peer drain request requires a draining transaction")
+        if prepared.candidate_plan is None or not prepared.coord_id:
+            raise RuntimeError("prepared drain transaction is incomplete")
+        self._active_runtime_coord_id = prepared.coord_id
+        self._publish_peer_rank_drain_request(
+            prepared.candidate_plan,
+            prepared.result,
+            coord_id=prepared.coord_id,
+            elastic_signal=prepared.effective_planner_signal,
+        )
+
+    def wait_for_peer_rank_drain(
+        self,
+        prepared: PreparedRuntimeTransaction,
+    ) -> None:
+        """Wait for ready records after request and boundary publication."""
+        if not prepared.should_execute or not prepared.drain_required:
+            raise RuntimeError("peer ready wait requires a draining transaction")
+        if prepared.candidate_plan is None or not prepared.coord_id:
+            raise RuntimeError("prepared drain transaction is incomplete")
+        self._active_runtime_coord_id = prepared.coord_id
+        self._coordinate_peer_rank_drain(
+            prepared.candidate_plan,
+            prepared.result,
+        )
+
+    def _publish_peer_rank_drain_request(
+        self,
+        plan: GlobalResourcePlan,
+        result: RuntimeReconfigurationResult,
+        *,
+        coord_id: str,
+        elastic_signal: Any | None = None,
+    ) -> None:
+        if self._peer_drain_request_coord_id == coord_id:
+            return
+        coord_dir = self._coordination_dir()
+        ready_dir = coord_dir / "ready"
+        ready_dir.mkdir(parents=True, exist_ok=True)
+        for old_ready in ready_dir.glob("rank_*.json"):
+            old_ready.unlink(missing_ok=True)
+        for old_state in ("request.json", "applied.json", "aborted.json"):
+            (coord_dir / old_state).unlink(missing_ok=True)
+        self._write_peer_rank_reconfiguration_state(
+            plan,
+            phase="request",
+            coord_id=coord_id,
+            elastic_signal=elastic_signal,
+        )
+        self._peer_drain_request_coord_id = coord_id
+        self._peer_drain_completed_coord_id = ""
+        result.actions.append("peer_reconfig_request")
 
     def _coordinate_peer_rank_drain(
         self,
@@ -1635,20 +1830,16 @@ class RuntimeElasticExecutor:
 
         coord_id = self._current_coordination_id(plan)
         self._active_runtime_coord_id = coord_id
+        if self._peer_drain_completed_coord_id == coord_id:
+            return
         coord_dir = self._coordination_dir()
         ready_dir = coord_dir / "ready"
-        ready_dir.mkdir(parents=True, exist_ok=True)
-        for old_ready in ready_dir.glob("rank_*.json"):
-            old_ready.unlink(missing_ok=True)
-        for old_state in ("request.json", "applied.json", "aborted.json"):
-            (coord_dir / old_state).unlink(missing_ok=True)
-
-        self._write_peer_rank_reconfiguration_state(
-            plan,
-            phase="request",
-            coord_id=coord_id,
-        )
-        result.actions.append("peer_reconfig_request")
+        if self._peer_drain_request_coord_id != coord_id:
+            self._publish_peer_rank_drain_request(
+                plan,
+                result,
+                coord_id=coord_id,
+            )
 
         timeout = float(
             getattr(
@@ -1671,6 +1862,8 @@ class RuntimeElasticExecutor:
                 return False
             if str(payload.get("coord_id", "")) != coord_id:
                 return False
+            if self.runtime_run_id and payload.get("run_id") != self.runtime_run_id:
+                return False
             ready_job_id = str(payload.get("job_id", ""))
             return not job_id or ready_job_id == job_id
 
@@ -1680,6 +1873,7 @@ class RuntimeElasticExecutor:
                     "peer_reconfig_drain:"
                     + ",".join(str(rank) for rank in expected_ranks)
                 )
+                self._peer_drain_completed_coord_id = coord_id
                 return
             time.sleep(0.5)
         missing = [str(path) for path in expected if not ready_matches(path)]
@@ -2983,6 +3177,8 @@ class RuntimeElasticExecutor:
             return
         payload = {
             "phase": phase,
+            "run_id": self.runtime_run_id,
+            "coord_id": getattr(self, "_active_runtime_coord_id", ""),
             "updated_at": time.time(),
             "plan": plan.to_dict(),
             "instances": [
