@@ -539,7 +539,16 @@ def test_runtime_executor_training_pool_plan_only_does_not_attach_domain():
     assert train_engine.domain is None
 
 
-def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path):
+def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    # Exercise ownership/ordering without leaving a real shell/sleep process.
+    process = Mock(pid=12345)
+    process.poll.return_value = None
+    monkeypatch.setattr(
+        "RL_Framework.infra.elastic.runtime_executor.subprocess.Popen",
+        lambda *args, **kwargs: process,
+    )
     if ElasticHybridPool is None:
         pytest.skip("torch is not installed in this local environment")
 

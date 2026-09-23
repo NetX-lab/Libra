@@ -12,6 +12,7 @@ import shutil
 import socket
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -32,6 +33,7 @@ from RL_Framework.engine.train_factory import create_train_engine
 from RL_Framework.infra.cost_model.global_resource_planner import GlobalResourcePlanner
 from RL_Framework.infra.cost_model.startup_profile import load_length_profile_records
 from RL_Framework.infra.elastic.runtime_executor import RuntimeElasticExecutor
+from RL_Framework.infra.elastic.runtime_boundary import RuntimeBoundaryProtocol, read_record
 from RL_Framework.infra.elastic.gradient_ipc import ElasticGradientServer, GradientUpdate
 from RL_Framework.infra.execution.async_runner import AsyncTaskRunner
 from RL_Framework.infra.execution.batch_dispatcher import BatchTaskDispatcher, TaskInput
@@ -104,6 +106,13 @@ class AsyncRLTrainer:
         self._runtime_reconfiguration_coord_id: str = ""
         self._runtime_follow_stop = threading.Event()
         self._runtime_follow_thread: threading.Thread | None = None
+        self._runtime_follow_lock = threading.RLock()
+        self._runtime_boundary_protocol: RuntimeBoundaryProtocol | None = None
+        self._runtime_post_boundary: int | None = None
+        self._runtime_boundary_published = False
+        self._runtime_announced_coord_id = ""
+        self._runtime_handled_request_ids: set[str] = set()
+        self._runtime_done_published = False
         self._rollout_engine_rebind_lock = threading.RLock()
         self._trace_train_phases = os.environ.get("RL_TRAIN_PHASE_TRACE", "0") == "1"
         trace_enabled = self._trace_train_phases or bool(
@@ -125,6 +134,7 @@ class AsyncRLTrainer:
         )
         self._elastic_gradient_server: ElasticGradientServer | None = None
         self._elastic_membership_epochs: dict[str, int] = {}
+        self._elastic_membership_run_id = ""
         self._pending_hybrid_training_batches: dict[str, list[dict[str, Any]]] = {}
 
     def _run_grp_memory_preflight(self) -> None:
@@ -775,23 +785,18 @@ class AsyncRLTrainer:
             step_start = time.time()
             self._trace_train_phase(step, "step_start")
 
-            if not self.is_main_process:
+            if self.is_main_process:
+                # Reconcile late hybrid joins and publish their membership before
+                # opening the next step to peers.
+                if self.runtime_elastic_executor is not None:
+                    self.runtime_elastic_executor.hybrid_runtime_state()
+                active_hybrid_ids = self._prepare_elastic_training_step(step)
+                self._runtime_reconfiguration_boundary(step, "pre")
+            else:
                 self._trace_train_phase(step, "follow_reconfig_start")
-                self._follow_runtime_reconfiguration_if_requested()
+                self._runtime_reconfiguration_boundary(step, "pre")
                 self._trace_train_phase(step, "follow_reconfig_done")
-
-            self._refresh_nonblocking_elastic_membership()
-            active_hybrid_ids: list[str] = []
-            domain = getattr(self.train_engine, "elastic_gradient_domain", None)
-            if domain is not None:
-                active_hybrid_ids = list(
-                    domain.active_hybrid_ids_for_core(
-                        f"dp{self.train_engine.get_data_parallel_rank()}"
-                    )
-                )
-            set_step = getattr(self.train_engine, "set_elastic_training_step", None)
-            if callable(set_step):
-                set_step(step, active_hybrid_ids)
+                active_hybrid_ids = self._prepare_elastic_training_step(step)
 
             if self._use_heterogeneous and hasattr(self.rollout_engine, "notify_epoch_start"):
                 self.rollout_engine.notify_epoch_start(epoch=step)
@@ -823,6 +828,7 @@ class AsyncRLTrainer:
             if not batch:
                 if self.is_main_process:
                     print(f"Step {step}: received no valid trajectories; skipping")
+                self._runtime_reconfiguration_boundary(step, "post")
                 continue
 
             align_trajectories = getattr(
@@ -974,11 +980,11 @@ class AsyncRLTrainer:
                                           weight_sync_time, advantage_time,
                                           recompute_time, step_total_time)
                 self._trace_train_phase(step, "resource_planner_start")
-                self._run_global_resource_planner(step, batch, stats)
+                self._run_global_resource_planner_at_boundary(step, batch, stats)
                 self._trace_train_phase(step, "resource_planner_done")
             else:
                 self._trace_train_phase(step, "follow_reconfig_after_step_start")
-                self._follow_runtime_reconfiguration_if_requested()
+                self._runtime_reconfiguration_boundary(step, "post")
                 self._trace_train_phase(step, "follow_reconfig_after_step_done")
 
 
@@ -1718,12 +1724,37 @@ class AsyncRLTrainer:
             self._grp_future = None
             self._grp_future_step = None
 
-        if self.runtime_elastic_executor is not None:
-            self.runtime_elastic_executor.close()
-            self.runtime_elastic_executor = None
-        elif self._elastic_gradient_server is not None:
-            self._elastic_gradient_server.close()
-        self._elastic_gradient_server = None
+        protocol = self._runtime_boundary_protocol
+        if self.is_main_process:
+            try:
+                if self.runtime_elastic_executor is not None:
+                    self.runtime_elastic_executor.close()
+                    self.runtime_elastic_executor = None
+                elif self._elastic_gradient_server is not None:
+                    self._elastic_gradient_server.close()
+                self._elastic_gradient_server = None
+            except Exception as exc:
+                if protocol is not None and not self._runtime_done_published:
+                    protocol.publish_runtime_done(status="failed", error=str(exc))
+                    self._runtime_done_published = True
+                raise
+            if protocol is not None and not self._runtime_done_published:
+                protocol.publish_runtime_done(status="success")
+                self._runtime_done_published = True
+        else:
+            if protocol is not None:
+                planner_cfg = getattr(self.config, "global_resource_planner", None)
+                protocol.wait_runtime_done(
+                    timeout=float(
+                        getattr(planner_cfg, "runtime_drain_timeout_s", 3600.0)
+                    )
+                )
+            if self.runtime_elastic_executor is not None:
+                self.runtime_elastic_executor.close()
+                self.runtime_elastic_executor = None
+            elif self._elastic_gradient_server is not None:
+                self._elastic_gradient_server.close()
+            self._elastic_gradient_server = None
 
         close_elastic = getattr(
             self.train_engine,
@@ -1815,6 +1846,14 @@ class AsyncRLTrainer:
 
     def _init_global_resource_planner(self):
         """Init global resource planner."""
+        planner_cfg = getattr(self.config, "global_resource_planner", None)
+        if (planner_cfg is not None and getattr(planner_cfg, "enabled", False)
+                and getattr(planner_cfg, "runtime_coordinate_reconfiguration_ranks", True)):
+            self._runtime_boundary_protocol = RuntimeBoundaryProtocol(
+                self._runtime_reconfiguration_coord_dir(), self.rank, self.world_size,
+                timeout=float(getattr(planner_cfg, "runtime_peer_request_wait_s", 45.0)),
+            )
+            self._runtime_boundary_protocol.join()
         if not self.is_main_process:
             self._start_runtime_reconfiguration_follower()
             return
@@ -1831,7 +1870,10 @@ class AsyncRLTrainer:
             train_engine=self.train_engine,
             rollout_engine=self.rollout_engine,
             dispatcher=self.dispatcher,
+            membership_run_id=self._elastic_membership_run_id or None,
         )
+        if self._runtime_boundary_protocol is not None:
+            self.runtime_elastic_executor.runtime_run_id = self._runtime_boundary_protocol.run_id
         if self._elastic_gradient_server is not None:
             self.runtime_elastic_executor.gradient_server = self._elastic_gradient_server
         if getattr(planner_cfg, "runtime_async_planning", True):
@@ -1927,8 +1969,19 @@ class AsyncRLTrainer:
             endpoint_dir / f"rank_{self.rank}.json",
             {**endpoint.to_dict(), **lane, "host": public_host, "backend": "tcp"},
         )
+        session_path = task_dir / "membership_session.json"
+        if self.is_main_process:
+            self._write_json_atomic(session_path, {"run_id": uuid.uuid4().hex})
+        # Reuse the existing endpoint setup barrier: the fresh leader record
+        # must be visible before any rank accepts membership from this run.
         if dist.is_initialized():
             dist.barrier()
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+        run_id = session.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            raise RuntimeError(f"invalid EHP membership session: {session_path}")
+        self._elastic_membership_run_id = run_id
+        self._elastic_membership_epochs.clear()
 
         def publish_update(update: GradientUpdate) -> None:
             server.publish_update(update)
@@ -1951,7 +2004,13 @@ class AsyncRLTrainer:
         def follow_loop() -> None:
             while not self._runtime_follow_stop.is_set():
                 try:
-                    self._follow_runtime_reconfiguration_if_requested()
+                    # Boundary decisions are the sole authority for entering a
+                    # drain handshake. This poller only catches up completed
+                    # non-draining transactions between PRE boundaries.
+                    with self._runtime_follow_lock:
+                        self._follow_applied_runtime_reconfiguration_if_available(
+                            self._runtime_reconfiguration_coord_dir(),
+                        )
                 except Exception as exc:
                     print(f"[RuntimeElasticExecutor] follower error: {exc}")
                 self._runtime_follow_stop.wait(0.5)
@@ -2001,36 +2060,85 @@ class AsyncRLTrainer:
         except OSError:
             pass
 
-    def _follow_runtime_reconfiguration_if_requested(self) -> None:
+    def _runtime_state_is_current(self, state: dict[str, Any]) -> bool:
+        protocol = self._runtime_boundary_protocol
+        return protocol is None or state.get("run_id") == protocol.run_id
+
+    def _runtime_reconfiguration_boundary(self, step: int, point: str) -> None:
+        protocol = self._runtime_boundary_protocol
+        if protocol is None:
+            return
+        if self.is_main_process:
+            protocol.publish(step, point)
+            return
+        decision = protocol.wait(step, point)
+        if decision["decision"] == "no_reconfig":
+            # Preserve completed-state catch-up, without waiting for a new request.
+            if point == "pre":
+                with self._runtime_follow_lock:
+                    self._follow_applied_runtime_reconfiguration_if_available(
+                        self._runtime_reconfiguration_coord_dir(),
+                    )
+            return
+        self._runtime_announced_coord_id = decision["coord_id"]
+        if not decision["drain_required"]:
+            return
+        self._follow_runtime_reconfiguration_if_requested(
+            expected_coord_id=decision["coord_id"],
+        )
+
+    def _publish_runtime_boundary_transaction(self, coord_id: str, drain_required: bool) -> None:
+        protocol = self._runtime_boundary_protocol
+        if protocol is None or self._runtime_post_boundary is None:
+            return
+        if drain_required:
+            request = read_record(self._runtime_reconfiguration_coord_dir() / "request.json")
+            if request.get("coord_id") != coord_id or not self._runtime_state_is_current(request):
+                raise RuntimeError("cannot publish boundary before its drain request is visible")
+        protocol.publish(self._runtime_post_boundary, "post", coord_id=coord_id,
+                         drain_required=drain_required)
+        self._runtime_boundary_published = True
+
+    def _publish_runtime_boundary_noop(self) -> None:
+        protocol = self._runtime_boundary_protocol
+        if protocol is None or self._runtime_post_boundary is None:
+            return
+        protocol.publish(self._runtime_post_boundary, "post")
+        self._runtime_boundary_published = True
+
+    def _run_global_resource_planner_at_boundary(self, step: int, batch: list, stats: dict) -> None:
+        self._runtime_post_boundary = step
+        self._runtime_boundary_published = False
+        try:
+            # The only result-consumption location remains the existing POST path.
+            self._run_global_resource_planner(step, batch, stats)
+        finally:
+            try:
+                if not self._runtime_boundary_published:
+                    self._runtime_reconfiguration_boundary(step, "post")
+            finally:
+                self._runtime_post_boundary = None
+
+    def _follow_runtime_reconfiguration_if_requested(self, *, expected_coord_id: str = "") -> None:
+        # The main boundary and background follower can observe the same request.
+        with self._runtime_follow_lock:
+            self._consume_runtime_reconfiguration_request(expected_coord_id=expected_coord_id)
+
+    def _consume_runtime_reconfiguration_request(self, *, expected_coord_id: str = "") -> None:
         planner_cfg = getattr(self.config, "global_resource_planner", None)
         if planner_cfg is None or not getattr(planner_cfg, "enabled", False):
             return
         if not getattr(planner_cfg, "runtime_coordinate_reconfiguration_ranks", True):
             return
-
+        if expected_coord_id and expected_coord_id in self._runtime_handled_request_ids:
+            return
         coord_dir = self._runtime_reconfiguration_coord_dir()
         request_path = coord_dir / "request.json"
-        if not request_path.exists():
-            pending_path = self._runtime_reconfiguration_pending_path()
-            wait_s = float(getattr(planner_cfg, "runtime_peer_request_wait_s", 45.0))
-            deadline = time.time() + max(wait_s, 0.0)
-            while time.time() < deadline:
-                if pending_path.exists():
-                    try:
-                        pending = json.loads(pending_path.read_text(encoding="utf-8"))
-                        current_job_id = os.environ.get("SLURM_JOB_ID", os.environ.get("JOB_ID", ""))
-                        pending_job_id = str(pending.get("job_id", ""))
-                        if current_job_id and pending_job_id != current_job_id:
-                            return
-                        if time.time() > float(pending.get("expires_at", 0.0)):
-                            return
-                    except Exception:
-                        return
-                if request_path.exists():
-                    break
-                if (coord_dir / "applied.json").exists() or (coord_dir / "aborted.json").exists():
-                    break
-                time.sleep(0.2)
+        if expected_coord_id:
+            request = read_record(request_path)
+            if (request.get("coord_id") != expected_coord_id
+                    or not self._runtime_state_is_current(request)):
+                raise RuntimeError(f"missing or mismatched drain request: {expected_coord_id}")
         if not request_path.exists():
             self._follow_applied_runtime_reconfiguration_if_available(coord_dir)
             return
@@ -2040,10 +2148,14 @@ class AsyncRLTrainer:
             return
         current_job_id = os.environ.get("SLURM_JOB_ID", os.environ.get("JOB_ID", ""))
         request_job_id = str(request.get("job_id", ""))
+        if not self._runtime_state_is_current(request):
+            self._follow_applied_runtime_reconfiguration_if_available(coord_dir)
+            return
         if current_job_id and request_job_id != current_job_id:
             return
         coord_id = str(request.get("coord_id", ""))
-        if not coord_id or coord_id == self._runtime_reconfiguration_coord_id:
+        if not coord_id or coord_id in self._runtime_handled_request_ids:
+            self._follow_applied_runtime_reconfiguration_if_available(coord_dir)
             return
 
         # Rank 0 deliberately skips peer draining when this option is false.
@@ -2085,6 +2197,7 @@ class AsyncRLTrainer:
                 json.dumps(
                     {
                         "coord_id": coord_id,
+                        "run_id": request.get("run_id", ""),
                         "rank": int(self.rank),
                         "job_id": current_job_id,
                         "updated_at": time.time(),
@@ -2095,28 +2208,32 @@ class AsyncRLTrainer:
             )
             tmp_ready.replace(ready_path)
 
-            deadline = time.time() + float(
+            deadline = time.monotonic() + float(
                 getattr(planner_cfg, "runtime_drain_timeout_s", 3600.0)
             )
             applied_path = coord_dir / "applied.json"
             aborted_path = coord_dir / "aborted.json"
             state: dict[str, Any] | None = None
-            while time.time() < deadline:
+            while time.monotonic() < deadline:
                 if aborted_path.exists():
                     aborted = json.loads(aborted_path.read_text(encoding="utf-8"))
                     aborted_job_id = str(aborted.get("job_id", ""))
-                    if not current_job_id or aborted_job_id == current_job_id:
+                    if (aborted.get("coord_id") == coord_id
+                            and self._runtime_state_is_current(aborted)
+                            and (not current_job_id or aborted_job_id == current_job_id)):
                         raise RuntimeError(
                             "runtime reconfiguration aborted on rank0: "
                             f"{aborted.get('error', '')}"
                         )
                 if applied_path.exists():
-                    state = json.loads(applied_path.read_text(encoding="utf-8"))
-                    state_job_id = str(state.get("job_id", ""))
+                    candidate = json.loads(applied_path.read_text(encoding="utf-8"))
+                    state_job_id = str(candidate.get("job_id", ""))
                     if (
-                        str(state.get("coord_id", "")) == coord_id
+                        str(candidate.get("coord_id", "")) == coord_id
+                        and self._runtime_state_is_current(candidate)
                         and (not current_job_id or state_job_id == current_job_id)
                     ):
+                        state = candidate
                         break
                 time.sleep(0.5)
             if state is None:
@@ -2126,6 +2243,7 @@ class AsyncRLTrainer:
             self._apply_runtime_reconfiguration_state(state)
             self._reset_rollout_pipeline_after_reconfigure()
             self._runtime_reconfiguration_coord_id = coord_id
+            self._runtime_handled_request_ids.add(coord_id)
         finally:
             if paused and self.dispatcher is not None and hasattr(self.dispatcher, "resume"):
                 self.dispatcher.resume()
@@ -2145,6 +2263,8 @@ class AsyncRLTrainer:
                 return
         current_job_id = os.environ.get("SLURM_JOB_ID", os.environ.get("JOB_ID", ""))
         state_job_id = str(state.get("job_id", ""))
+        if not self._runtime_state_is_current(state):
+            return
         if current_job_id and state_job_id != current_job_id:
             return
         coord_id = str(state.get("coord_id", ""))
@@ -2262,14 +2382,16 @@ class AsyncRLTrainer:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except Exception:
             return None
-        if str(manifest.get("phase", "")) != "applied":
+        if (str(manifest.get("phase", "")) != "applied"
+                or not self._runtime_state_is_current(manifest)):
             return None
         instances = manifest.get("instances") or []
         if not instances:
             return None
         updated_at = float(manifest.get("updated_at", time.time()) or time.time())
         return {
-            "coord_id": f"manifest_{updated_at:.6f}",
+            "coord_id": manifest.get("coord_id") or f"manifest_{updated_at:.6f}",
+            "run_id": manifest.get("run_id", ""),
             "phase": "applied",
             "job_id": os.environ.get("SLURM_JOB_ID", os.environ.get("JOB_ID", "")),
             "updated_at": updated_at,
@@ -2437,28 +2559,47 @@ class AsyncRLTrainer:
             if worker_id in active_hybrid_ids:
                 domain.mark_active(worker_id)
 
+    def _prepare_elastic_training_step(self, step: int) -> list[str]:
+        """Refresh membership before freezing this step's gradient sources."""
+        self._refresh_nonblocking_elastic_membership()
+        active_hybrid_ids: list[str] = []
+        domain = getattr(self.train_engine, "elastic_gradient_domain", None)
+        if domain is not None:
+            active_hybrid_ids = list(domain.active_hybrid_ids_for_core(
+                f"dp{self.train_engine.get_data_parallel_rank()}",
+            ))
+        set_step = getattr(self.train_engine, "set_elastic_training_step", None)
+        if callable(set_step):
+            set_step(step, active_hybrid_ids)
+        return active_hybrid_ids
+
     def _refresh_nonblocking_elastic_membership(self) -> None:
         planner_cfg = getattr(self.config, "global_resource_planner", None)
         domain = getattr(self.train_engine, "elastic_gradient_domain", None)
-        if domain is None or planner_cfg is None:
+        run_id = self._elastic_membership_run_id
+        if domain is None or planner_cfg is None or not run_id:
             return
         membership_dir = Path(getattr(planner_cfg, "hybrid_worker_task_dir", "./logs/elastic_training_tasks")) / "membership"
         for path in membership_dir.glob("*.json"):
             try:
                 state = json.loads(path.read_text(encoding="utf-8"))
+                if state.get("run_id") != run_id:
+                    continue
                 worker_id = str(state.get("worker_id", ""))
                 target = str(state.get("target_core_id", ""))
                 epoch = int(state.get("membership_epoch", 0))
                 role = str(state.get("role", ""))
+                if role not in {"hybrid_training", "hybrid_joining", "hybrid_rollout", "core_rollout"}:
+                    continue
                 if not worker_id or epoch < self._elastic_membership_epochs.get(worker_id, -1):
                     continue
                 if role in {"hybrid_rollout", "core_rollout"}:
-                    domain.detach(worker_id)
+                    domain.detach(worker_id, membership_epoch=epoch)
                 else:
                     if epoch > self._elastic_membership_epochs.get(worker_id, -1):
                         domain.request_join(worker_id, target, membership_epoch=epoch)
                     if role == "hybrid_training" and domain.is_joining(worker_id):
-                        domain.mark_active(worker_id)
+                        domain.mark_active(worker_id, membership_epoch=epoch)
                 self._elastic_membership_epochs[worker_id] = epoch
             except (OSError, ValueError, KeyError, json.JSONDecodeError):
                 continue
@@ -2475,7 +2616,8 @@ class AsyncRLTrainer:
             if not membership_path.exists():
                 continue
             state = json.loads(membership_path.read_text(encoding="utf-8"))
-            if str(state.get("role")) != "hybrid_training":
+            if (state.get("run_id") != self._elastic_membership_run_id
+                    or str(state.get("role")) != "hybrid_training"):
                 continue
             task_path = task_dir / f"{worker_id}.step_{step}.pt"
             tmp_path = task_path.with_suffix(task_path.suffix + ".tmp")
@@ -2700,56 +2842,88 @@ class AsyncRLTrainer:
     def _apply_global_resource_planner_decision(self, step: int, decision, stats: dict):
         stats["global_resource_planner"] = decision.to_dict()
 
-        if not decision.should_reconfigure or decision.candidate_plan is None:
-            if (
-                self.runtime_elastic_executor is not None
-                and getattr(decision, "elastic_hybrid_signal", None) is not None
-            ):
-                self.runtime_elastic_executor.accept_planner_signal(
-                    decision.elastic_hybrid_signal
-                )
+        requested_reconfiguration = bool(
+            decision.should_reconfigure and decision.candidate_plan is not None
+        )
+        if not requested_reconfiguration:
             if decision.reason not in {"interval_skip", "warmup"}:
                 print(
                     "[GlobalResourcePlanner] "
                     f"step={step} skip reason={decision.reason} "
                     f"history={decision.num_requests}"
                 )
-            return
-
-        plan = decision.candidate_plan
-        print(
-            "[GlobalResourcePlanner] "
-            f"step={step} apply "
-            f"train={plan.train_config.tp}x{plan.train_config.pp}x{plan.train_config.dp} "
-            f"rollout_tp={plan.rollout_tp_list} "
-            f"T={plan.t_global:.3f}s "
-            f"net_gain={plan.expected_gain_s:.3f}s"
-        )
+        else:
+            plan = decision.candidate_plan
+            print(
+                "[GlobalResourcePlanner] "
+                f"step={step} apply "
+                f"train={plan.train_config.tp}x{plan.train_config.pp}x{plan.train_config.dp} "
+                f"rollout_tp={plan.rollout_tp_list} "
+                f"T={plan.t_global:.3f}s "
+                f"net_gain={plan.expected_gain_s:.3f}s"
+            )
 
         if self.runtime_elastic_executor is not None:
-            pre_reset = self._should_pre_reset_rollout_pipeline_for_reconfigure()
-            if pre_reset:
-                self._pause_rollout_pipeline()
-                if self.dispatcher is not None and hasattr(
-                    self.dispatcher,
-                    "wait_until_idle",
-                ):
-                    self.dispatcher.wait_until_idle(
-                        timeout=float(
-                            getattr(
-                                self.config.global_resource_planner,
-                                "runtime_drain_timeout_s",
-                                3600.0,
-                            )
-                        )
-                    )
-                self._reset_rollout_pipeline_after_reconfigure()
-                print(
-                    "[RuntimeElasticExecutor] rollout pipeline drained and reset "
-                    "before runtime reconfiguration"
-                )
+            prepared = self.runtime_elastic_executor.prepare_transaction(decision)
+            pre_reset = bool(
+                prepared.should_execute
+                and self._should_pre_reset_rollout_pipeline_for_reconfigure()
+            )
+            paused_for_reset = False
             try:
-                result = self.runtime_elastic_executor.execute(decision)
+                try:
+                    if prepared.should_execute:
+                        if prepared.drain_required:
+                            self.runtime_elastic_executor.publish_peer_rank_drain_request(
+                                prepared
+                            )
+                        self._publish_runtime_boundary_transaction(
+                            prepared.coord_id,
+                            prepared.drain_required,
+                        )
+                    else:
+                        # Close this boundary before release-only EHP maintenance.
+                        self._publish_runtime_boundary_noop()
+                except Exception as exc:
+                    self.runtime_elastic_executor.abort_prepared_transaction(
+                        prepared,
+                        exc,
+                    )
+                    raise
+
+                try:
+                    if pre_reset:
+                        paused_for_reset = True
+                        self._pause_rollout_pipeline()
+                        if self.dispatcher is not None and hasattr(
+                            self.dispatcher,
+                            "wait_until_idle",
+                        ):
+                            self.dispatcher.wait_until_idle(
+                                timeout=float(
+                                    getattr(
+                                        self.config.global_resource_planner,
+                                        "runtime_drain_timeout_s",
+                                        3600.0,
+                                    )
+                                )
+                            )
+                        self._reset_rollout_pipeline_after_reconfigure()
+                        print(
+                            "[RuntimeElasticExecutor] rollout pipeline drained and reset "
+                            "before runtime reconfiguration"
+                        )
+                    if prepared.drain_required:
+                        self.runtime_elastic_executor.wait_for_peer_rank_drain(prepared)
+                except Exception as exc:
+                    self.runtime_elastic_executor.abort_prepared_transaction(
+                        prepared,
+                        exc,
+                    )
+                    raise
+                result = self.runtime_elastic_executor.execute_prepared(
+                    prepared,
+                )
                 stats["global_resource_planner_runtime"] = result.to_dict()
                 self._record_runtime_reconfiguration_event(step, decision, result)
                 if result.applied:
@@ -2779,10 +2953,13 @@ class AsyncRLTrainer:
                         f"training_actions={','.join(result.training_actions) or 'none'}"
                     )
             finally:
-                if pre_reset:
+                if paused_for_reset:
                     self._resume_rollout_pipeline()
-        else:
-            self.global_resource_planner.apply_plan_to_config(plan, self.config)
+        elif requested_reconfiguration:
+            self.global_resource_planner.apply_plan_to_config(
+                decision.candidate_plan,
+                self.config,
+            )
 
         if self._resource_config_snapshot is not None:
             self._resource_config_snapshot = HistoryDataCollector.snapshot_resource_config(

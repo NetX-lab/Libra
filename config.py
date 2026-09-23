@@ -539,6 +539,7 @@ class GlobalResourcePlannerConfig:
     runtime_use_nccl_barrier_before_weight_sync: bool = False
     runtime_coordinate_reconfiguration_ranks: bool = True
     runtime_coordinate_batch_source_only: bool = True
+    # Session/boundary decision timeout; expiry is a protocol error, not a no-op.
     runtime_peer_request_wait_s: float = 45.0
     vllm_launch_command_template: str = ""
     vllm_stop_command_template: str = ""
