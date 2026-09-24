@@ -26,6 +26,7 @@
   <a href="#latest-news">Latest News</a> ·
   <a href="#features">Features</a> ·
   <a href="#system-overview">Architecture</a> ·
+  <a href="#evaluation-highlights">Evaluation</a> ·
   <a href="#installation">Installation</a> ·
   <a href="docs/manual.md">Manual</a> ·
   <a href="#citation">Citation</a>
@@ -33,14 +34,19 @@
 
 Libra coordinates training and rollout clusters, routes requests across
 heterogeneous vLLM workers, and adapts resource allocation as workload pressure
-changes during training.
+changes during training. Across three agentic RL benchmarks on both GPU and NPU
+clusters, Libra delivers up to **4.2x higher throughput** and **2.7x faster
+reward convergence**.
 
 This repository accompanies the paper **"Libra: Efficient Resource Management
 for Agentic RL Post-Training"**. Read the [paper](https://arxiv.org/abs/2606.03077) for the full design.
 
 ## Latest News
 
-- **2026-08-11** -- A new NPU_support branch has been added, enabling NPU support for all core functionalities.
+- **2026-09-16** -- arXiv v3 adds GPU and NPU evaluation, causality-guided
+  scheduling, and non-blocking elastic coordination.
+- **2026-08-11** -- The `NPU_Support` branch added NPU support for all core
+  functionalities.
 - **2026-08-03** -- Libra was officially open sourced.
 
 ## System Overview
@@ -49,11 +55,13 @@ for Agentic RL Post-Training"**. Read the [paper](https://arxiv.org/abs/2606.030
 
 Libra splits RL post-training into a core training pool, a core rollout pool,
 and an elastic hybrid pool. The Global Resource Planner chooses how many GPUs
-belong to training and rollout, then selects the training parallelism and the
-heterogeneous rollout TP buckets. The C-MLFQ scheduler routes rollout requests
-through the core rollout pool according to causality-aware trajectory state.
-Elastic execution applies planner decisions by moving capacity between the
-training and rollout sides while keeping the core training process group stable.
+belong to training and rollout, then jointly selects the training parallelism
+(TP/EP/PP/DP) and heterogeneous rollout TP buckets. The Causality-Guided Bucket
+Scheduler uses tool-return states to estimate residual sequence length and route
+requests to suitable buckets. Elastic execution moves complete data-parallel
+replicas between rollout and training through decoupled communication domains
+and a non-blocking RDMA joining protocol, keeping the core training topology
+stable.
 
 ## Repository Layout
 
@@ -87,19 +95,21 @@ RL_Framework/
 - **Online dynamic replanning.** Periodically consumes runtime history and queue
   pressure, evaluates candidate allocations, and applies a new plan only when
   the expected benefit exceeds the configured transition cost.
-- **C-MLFQ scheduler.** Maintains a causality-aware prefix tree from completed
-  trajectories and routes new or resumed rollout requests to TP buckets based on
-  observed tool-return state and remaining work.
+- **Causality-Guided Bucket Scheduler.** Maintains a causality-aware prefix tree
+  over tool type, payload size, and execution status. It uses the resulting
+  residual-length distribution to route or migrate requests across TP buckets
+  without a separately trained length predictor.
 - **Heterogeneous rollout cluster.** Runs multiple OpenAI-compatible vLLM
   instances with different tensor-parallel degrees, such as TP-1, TP-2, TP-4,
   and TP-8 buckets.
-- **Elastic Hybrid Pool.** Models workers that can move between rollout and
-  training roles without changing the fixed core training topology.
+- **Elastic Hybrid Pool.** Moves complete data-parallel replicas between rollout
+  and training without changing the fixed core training topology.
 - **Decoupled communication domains.** Keeps core training collectives separate
   from elastic hybrid-worker gradient exchange, so dynamic training-side
   changes do not perturb Megatron-Core or FSDP process groups.
-- **Cluster-swap execution.** Supports no-spare-GPU resource exchange between
-  rollout and training pools when the planner changes the allocation.
+- **Two-tier reconfiguration.** Handles transient imbalance by switching hybrid
+  workers between roles, while persistent workload shifts trigger planned core
+  pool repartitioning during pipeline slack windows.
 - **Megatron-Core training backend.** Supports tensor parallelism, distributed
   optimizer, sharded checkpoint metadata, precision-aware optimizer settings,
   and CPU optimizer offload for large models.
@@ -109,7 +119,19 @@ RL_Framework/
 - **Agentic workloads.** Includes workflows and rewards for R2E-Gym,
   Search-R1, DAPO-Math-17K, GSM8K, and code-agent style experiments.
 - **Observability.** Records history, runtime planner decisions, throughput,
-  rewards, C-MLFQ prefix trees, rollout manifests, and reconfiguration events.
+  rewards, scheduler prefix trees, rollout manifests, and reconfiguration events.
+
+## Evaluation Highlights
+
+The updated paper evaluates Libra with Qwen3-14B and Qwen3-30B-A3B on
+Search-R1, R2E-Gym, and DAPO-Math-17K:
+
+- **48x NVIDIA A800-SXM4-80GB GPUs:** 4.2x peak throughput improvement and up
+  to 2.73x faster end-to-end reward convergence.
+- **160x Ascend 910B3 NPUs:** 18%-37% higher throughput than DynaRL and up to
+  2.26x faster end-to-end reward convergence.
+- **Online causality-aware routing:** reacts to tool payloads and failures at
+  runtime, avoiding repeated threshold-based migrations as trajectories grow.
 
 ## Documentation
 
@@ -166,7 +188,8 @@ If Libra is useful in your research, please cite:
 ```bibtex
 @misc{chen2026libraefficientresourcemanagement,
       title={Libra: Efficient Resource Management for Agentic RL Post-Training},
-      author={Kaiwen Chen and Xin Tan and Jingzong Li and Hong Xu},
+      author={Kaiwen Chen and Xin Tan and Jingzong Li and Zhi Zhou and Cen Li and
+              Jiang Liu and Jie Meng and Jiazhi Jiang and Hong Xu},
       year={2026},
       eprint={2606.03077},
       archivePrefix={arXiv},
