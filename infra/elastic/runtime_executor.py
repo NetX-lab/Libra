@@ -805,6 +805,7 @@ class RuntimeElasticExecutor:
         cfg = self.config.global_resource_planner
         topology_width = (
             max(1, int(getattr(self.config, "train_tp_size", 1) or 1))
+            * max(1, int(getattr(self.config, "train_ep_size", 1) or 1))
             * max(1, int(getattr(self.config, "train_pp_size", 1) or 1))
             * max(1, int(getattr(self.config, "train_cp_size", 1) or 1))
         )
@@ -1554,6 +1555,7 @@ class RuntimeElasticExecutor:
             "n_total_gpus": self.config.n_total_gpus,
             "train_gpus": self.config.train_gpus,
             "train_tp_size": self.config.train_tp_size,
+            "train_ep_size": self.config.train_ep_size,
             "tp_size": self.config.tp_size,
             "train_pp_size": self.config.train_pp_size,
             "train_dp_size": self.config.train_dp_size,

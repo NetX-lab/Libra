@@ -19,6 +19,7 @@ class RolloutStat:
     running: int = 0
     accepted: int = 0
     rejected: int = 0
+    cancelled: int = 0
 
 
 class StalenessManager:
@@ -35,6 +36,7 @@ class StalenessManager:
         self.max_concurrent_rollouts = max_concurrent_rollouts
         self.consumer_batch_size = consumer_batch_size
         self.max_staleness = max_staleness
+        self.runtime_max_concurrent_rollouts: int | None = None
 
         self.lock = Lock()
         self.rollout_stat = RolloutStat()
@@ -49,7 +51,12 @@ class StalenessManager:
             current_version = self.version_provider.get_version()
 
 
-            max_concurrent = max(1, self.max_concurrent_rollouts)
+            configured_max = (
+                self.runtime_max_concurrent_rollouts
+                if self.runtime_max_concurrent_rollouts is not None
+                else self.max_concurrent_rollouts
+            )
+            max_concurrent = max(1, configured_max)
             concurrency_capacity = max_concurrent - self.rollout_stat.running
 
 
@@ -59,6 +66,13 @@ class StalenessManager:
             staleness_capacity = (ofp + current_version + 1) * consumer_bs - sample_cnt
 
             return min(concurrency_capacity, staleness_capacity)
+
+    def set_runtime_max_concurrent_rollouts(self, limit: int | None) -> None:
+        """Temporarily cap rollout concurrency near a weight-sync boundary."""
+        if limit is not None and limit < 1:
+            raise ValueError(f"runtime rollout limit must be positive; got {limit}")
+        with self.lock:
+            self.runtime_max_concurrent_rollouts = limit
 
     def on_rollout_enqueued(self) -> None:
         """On rollout enqueued."""
@@ -83,6 +97,15 @@ class StalenessManager:
             self.rollout_stat.running -= 1
             self.rollout_stat.rejected += 1
 
+    def on_rollouts_cancelled(self, *, enqueued: int = 0, running: int = 0) -> None:
+        """Release capacity for work cancelled before reaching vLLM."""
+        if enqueued < 0 or running < 0:
+            raise ValueError("cancelled rollout counts cannot be negative")
+        with self.lock:
+            self.rollout_stat.enqueued = max(0, self.rollout_stat.enqueued - enqueued)
+            self.rollout_stat.running = max(0, self.rollout_stat.running - running)
+            self.rollout_stat.cancelled += enqueued + running
+
     def on_batch_consumed(self, count: int) -> None:
         """On batch consumed."""
         with self.lock:
@@ -96,6 +119,7 @@ class StalenessManager:
                 running=self.rollout_stat.running,
                 accepted=self.rollout_stat.accepted,
                 rejected=self.rollout_stat.rejected,
+                cancelled=self.rollout_stat.cancelled,
             )
 
     def reset_runtime_state(self) -> None:
@@ -104,3 +128,4 @@ class StalenessManager:
             self.rollout_stat.enqueued = 0
             self.rollout_stat.running = 0
             self.rollout_stat.accepted = 0
+            self.rollout_stat.cancelled = 0

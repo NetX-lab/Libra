@@ -57,6 +57,7 @@ class GlobalResourcePlan:
         return {
             "train": {
                 "tp": self.train_config.tp,
+                "ep": self.train_config.ep,
                 "pp": self.train_config.pp,
                 "dp": self.train_config.dp,
                 "cp": self.train_config.cp,
@@ -232,7 +233,11 @@ class GlobalResourcePlanner:
         allowed_rollout_tp: list[int] | None = None,
         require_heterogeneous_rollout_tp: bool = False,
         allowed_train_tp: list[int] | None = None,
+        allowed_train_ep: list[int] | None = None,
         allowed_train_pp: list[int] | None = None,
+        train_comm_compute_ratio_threshold: float = float("inf"),
+        train_ep_comm_compute_ratio_threshold: float = float("inf"),
+        train_pipeline_bubble_ratio_threshold: float = 0.30,
         fixed_train_gpus: int = 0,
         initial_allocation_strategy: str = "grp",
         allocation_granularity_gpus: int = 1,
@@ -264,6 +269,7 @@ class GlobalResourcePlanner:
         self.allowed_rollout_tp = allowed_rollout_tp or [1, 2, 4, 8]
         self.require_heterogeneous_rollout_tp = bool(require_heterogeneous_rollout_tp)
         self.allowed_train_tp = allowed_train_tp
+        self.allowed_train_ep = allowed_train_ep
         self.allowed_train_pp = allowed_train_pp
         self.fixed_train_gpus = int(fixed_train_gpus or 0)
         self.initial_allocation_strategy = str(initial_allocation_strategy or "grp")
@@ -315,6 +321,9 @@ class GlobalResourcePlanner:
             cost_model=evaluator,
             allowed_rollout_tp=self.allowed_rollout_tp,
             require_heterogeneous_rollout_tp=self.require_heterogeneous_rollout_tp,
+            train_comm_compute_ratio_threshold=train_comm_compute_ratio_threshold,
+            train_ep_comm_compute_ratio_threshold=train_ep_comm_compute_ratio_threshold,
+            train_pipeline_bubble_ratio_threshold=train_pipeline_bubble_ratio_threshold,
             verbose=verbose,
         )
         self._history: list[RequestInfo] = []
@@ -339,7 +348,17 @@ class GlobalResourcePlanner:
             allowed_rollout_tp=planner_cfg.allowed_rollout_tp,
             require_heterogeneous_rollout_tp=planner_cfg.require_heterogeneous_rollout_tp,
             allowed_train_tp=planner_cfg.allowed_train_tp or None,
+            allowed_train_ep=getattr(planner_cfg, "allowed_train_ep", []) or None,
             allowed_train_pp=planner_cfg.allowed_train_pp or None,
+            train_comm_compute_ratio_threshold=getattr(
+                planner_cfg, "train_comm_compute_ratio_threshold", float("inf")
+            ),
+            train_ep_comm_compute_ratio_threshold=getattr(
+                planner_cfg, "train_ep_comm_compute_ratio_threshold", float("inf")
+            ),
+            train_pipeline_bubble_ratio_threshold=getattr(
+                planner_cfg, "train_pipeline_bubble_ratio_threshold", 0.30
+            ),
             fixed_train_gpus=planner_cfg.fixed_train_gpus,
             initial_allocation_strategy=getattr(
                 planner_cfg, "initial_allocation_strategy", "grp"
@@ -546,11 +565,23 @@ class GlobalResourcePlanner:
             )
 
         current = self._build_current_plan(config, self._history)
+        forced_rollout_tp = self._forced_rollout_tp_list(config)
+        forced_train = self._forced_train_config(
+            config,
+            current,
+            rollout_gpus=(
+                sum(forced_rollout_tp)
+                if forced_rollout_tp is not None
+                else int(getattr(config, "rollout_gpus", 0) or 0)
+            ),
+        )
+        forced_candidate = forced_rollout_tp is not None or forced_train is not None
         result = self.optimizer.optimize(
             n_total_gpus=self.n_total_gpus,
             requests=list(self._history),
             B_global=config.batch_size,
             allowed_train_tp=self.allowed_train_tp,
+            allowed_train_ep=self.allowed_train_ep,
             allowed_train_pp=self.allowed_train_pp,
             micro_batch_sizes=self.micro_batch_sizes,
             fixed_train_gpus=(
@@ -569,7 +600,7 @@ class GlobalResourcePlanner:
             dp_batch_group_size=max(1, int(getattr(config, "n_samples", 1) or 1)),
         )
         candidate = self._plan_from_result(result, config)
-        if candidate is None:
+        if candidate is None and not forced_candidate:
             self._mark_rejected_trigger_observed(trigger, runtime_metrics)
             return self._remember(
                 PlannerDecision(
@@ -584,17 +615,6 @@ class GlobalResourcePlanner:
                 )
             )
 
-        forced_rollout_tp = self._forced_rollout_tp_list(config)
-        forced_train = self._forced_train_config(
-            config,
-            current,
-            rollout_gpus=(
-                sum(forced_rollout_tp)
-                if forced_rollout_tp is not None
-                else int(getattr(config, "rollout_gpus", 0) or 0)
-            ),
-        )
-        forced_candidate = forced_rollout_tp is not None or forced_train is not None
         if forced_rollout_tp is not None:
             forced_rollout = RolloutClusterConfig(tp_list=forced_rollout_tp)
             forced_rollout_time, forced_rollout_details = self.evaluator.evaluate_rollout(
@@ -604,15 +624,11 @@ class GlobalResourcePlanner:
             forced_train_time = current.t_train
             forced_train_details = current.metadata.get("training", {})
             if forced_train is not None:
-                avg_len = (
-                    int(np.mean([r.total_length for r in self._history]))
-                    if self._history
-                    else 1024
-                )
+                sequence_lengths = [r.total_length for r in self._history] or [1024]
                 forced_train_time, forced_train_details = self.evaluator.evaluate_training(
                     forced_train,
                     config.batch_size,
-                    avg_len,
+                    sequence_lengths,
                 )
             candidate = GlobalResourcePlan(
                 train_config=forced_train or current.train_config,
@@ -633,15 +649,11 @@ class GlobalResourcePlanner:
                 },
             )
         elif forced_train is not None:
-            avg_len = (
-                int(np.mean([r.total_length for r in self._history]))
-                if self._history
-                else 1024
-            )
+            sequence_lengths = [r.total_length for r in self._history] or [1024]
             forced_train_time, forced_train_details = self.evaluator.evaluate_training(
                 forced_train,
                 config.batch_size,
-                avg_len,
+                sequence_lengths,
             )
             candidate = GlobalResourcePlan(
                 train_config=forced_train,
@@ -740,6 +752,7 @@ class GlobalResourcePlanner:
         )
         topology_width = (
             max(1, int(getattr(config, "train_tp_size", 1) or 1))
+            * max(1, int(getattr(config, "train_ep_size", 1) or 1))
             * max(1, int(getattr(config, "train_pp_size", 1) or 1))
             * max(1, int(getattr(config, "train_cp_size", 1) or 1))
         )
@@ -865,21 +878,40 @@ class GlobalResourcePlanner:
 
     def _forced_rollout_tp_list(self, config: AsyncRLConfig) -> list[int] | None:
         raw = os.environ.get("GRP_FORCE_ROLLOUT_TP_LIST", "").strip()
-        if not raw:
-            return None
-        try:
+        if raw:
+            try:
+                tp_list = [
+                    int(item.strip())
+                    for item in re.split(r"[,;:]", raw)
+                    if item.strip()
+                ]
+            except ValueError as exc:
+                raise ValueError(f"Invalid GRP_FORCE_ROLLOUT_TP_LIST={raw!r}") from exc
+        else:
             tp_list = [
-                int(item.strip())
-                for item in re.split(r"[,;:]", raw)
-                if item.strip()
+                int(value)
+                for value in (
+                    getattr(
+                        config.global_resource_planner,
+                        "runtime_forced_rollout_tp_list",
+                        [],
+                    )
+                    or []
+                )
             ]
-        except ValueError as exc:
-            raise ValueError(f"Invalid GRP_FORCE_ROLLOUT_TP_LIST={raw!r}") from exc
         if not tp_list:
             return None
         if any(tp <= 0 for tp in tp_list):
             raise ValueError(f"GRP_FORCE_ROLLOUT_TP_LIST must be positive: {tp_list}")
         forced_train_raw = os.environ.get("GRP_FORCE_TRAIN_GPUS", "").strip()
+        configured_forced_train = int(
+            getattr(
+                config.global_resource_planner,
+                "runtime_forced_train_gpus",
+                0,
+            )
+            or 0
+        )
         rollout_gpus = int(getattr(config, "rollout_gpus", 0) or sum(tp_list))
         if forced_train_raw:
             try:
@@ -889,6 +921,8 @@ class GlobalResourcePlanner:
                     f"Invalid GRP_FORCE_TRAIN_GPUS={forced_train_raw!r}"
                 ) from exc
             rollout_gpus = int(self.n_total_gpus) - forced_train_gpus
+        elif configured_forced_train > 0:
+            rollout_gpus = int(self.n_total_gpus) - configured_forced_train
         if sum(tp_list) != rollout_gpus:
             raise ValueError(
                 "GRP_FORCE_ROLLOUT_TP_LIST must sum to rollout_gpus="
@@ -904,12 +938,22 @@ class GlobalResourcePlanner:
         rollout_gpus: int,
     ) -> TrainParallelConfig | None:
         raw = os.environ.get("GRP_FORCE_TRAIN_GPUS", "").strip()
-        if not raw:
-            return None
-        try:
-            train_gpus = int(raw)
-        except ValueError as exc:
-            raise ValueError(f"Invalid GRP_FORCE_TRAIN_GPUS={raw!r}") from exc
+        if raw:
+            try:
+                train_gpus = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"Invalid GRP_FORCE_TRAIN_GPUS={raw!r}") from exc
+        else:
+            train_gpus = int(
+                getattr(
+                    config.global_resource_planner,
+                    "runtime_forced_train_gpus",
+                    0,
+                )
+                or 0
+            )
+            if train_gpus == 0:
+                return None
         if train_gpus <= 0:
             raise ValueError(f"GRP_FORCE_TRAIN_GPUS must be positive: {train_gpus}")
         if train_gpus + rollout_gpus > self.n_total_gpus:
@@ -918,16 +962,18 @@ class GlobalResourcePlanner:
                 f"{self.n_total_gpus}, got train={train_gpus} rollout={rollout_gpus}"
             )
         tp = int(current.train_config.tp)
+        ep = int(current.train_config.ep)
         pp = int(current.train_config.pp)
         cp = max(1, int(getattr(config, "train_cp_size", 1) or 1))
-        model_parallel = max(1, tp * pp * cp)
+        model_parallel = max(1, tp * ep * pp * cp)
         if train_gpus % model_parallel != 0:
             raise ValueError(
-                "GRP_FORCE_TRAIN_GPUS must be divisible by train TP*PP*CP="
+                "GRP_FORCE_TRAIN_GPUS must be divisible by train TP*EP*PP*CP="
                 f"{model_parallel}, got {train_gpus}"
             )
         return TrainParallelConfig(
             tp=tp,
+            ep=ep,
             pp=pp,
             cp=cp,
             dp=train_gpus // model_parallel,
@@ -980,9 +1026,12 @@ class GlobalResourcePlanner:
         config.rollout_gpus = plan.rollout_gpus
         config.train_tp_size = plan.train_config.tp
         config.tp_size = plan.train_config.tp
+        config.train_ep_size = plan.train_config.ep
         config.train_pp_size = plan.train_config.pp
         config.train_cp_size = plan.train_config.cp
-        config.train_dp_size = plan.train_config.dp
+        # Megatron expresses EP as a subgroup of its runtime DP dimension,
+        # whereas the paper's planner factors N as TP*EP*PP*DP.
+        config.train_dp_size = plan.train_config.ep * plan.train_config.dp
         config.micro_batch_size = plan.train_config.b_micro
         config.max_concurrent_rollouts = plan.max_concurrent_rollouts
 
@@ -1057,8 +1106,11 @@ class GlobalResourcePlanner:
                 allocated = gpus[:tp]
                 pools[idx] = (host, gpus[tp:])
                 return host, allocated
-        host = pools[0][0] if pools else ""
-        return host, list(range(tp))
+        remaining = {host: list(gpus) for host, gpus in pools}
+        raise ValueError(
+            f"rollout plan cannot allocate a TP={tp} instance from host pools: "
+            f"{remaining}"
+        )
 
     def _remember(self, decision: PlannerDecision) -> PlannerDecision:
         self._last_decision = decision
@@ -1092,8 +1144,13 @@ class GlobalResourcePlanner:
     ) -> GlobalResourcePlan:
         train = TrainParallelConfig(
             tp=config.train_tp_size,
+            ep=max(1, int(getattr(config, "train_ep_size", 1) or 1)),
             pp=config.train_pp_size,
-            dp=config.train_dp_size,
+            dp=max(
+                1,
+                int(config.train_dp_size)
+                // max(1, int(getattr(config, "train_ep_size", 1) or 1)),
+            ),
             cp=config.train_cp_size,
             b_micro=config.micro_batch_size,
         )
@@ -1102,11 +1159,18 @@ class GlobalResourcePlanner:
             n_instances = max(1, config.rollout_gpus // max(1, config.vllm_tp_size))
             rollout_tp = [max(1, config.vllm_tp_size)] * n_instances
         rollout = RolloutClusterConfig(tp_list=rollout_tp)
-        avg_len = int(np.mean([r.total_length for r in requests])) if requests else 1024
+        lengths = [r.total_length for r in requests] or [1024]
         t_train, train_details = self.evaluator.evaluate_training(
-            train, config.batch_size, avg_len
+            train, config.batch_size, lengths
         )
-        t_rollout, rollout_details = self.evaluator.evaluate_rollout(rollout, requests)
+        if getattr(self.evaluator, "rollout_backend", "analytic") == "analytic":
+            t_rollout, rollout_details = self.optimizer.evaluate_fixed_rollout_config(
+                rollout, requests
+            )
+        else:
+            t_rollout, rollout_details = self.evaluator.evaluate_rollout(
+                rollout, requests
+            )
         return GlobalResourcePlan(
             train_config=train,
             rollout_config=rollout,
@@ -1156,6 +1220,7 @@ class GlobalResourcePlanner:
     ) -> bool:
         return (
             a.train_config.tp == b.train_config.tp
+            and a.train_config.ep == b.train_config.ep
             and a.train_config.pp == b.train_config.pp
             and a.train_config.dp == b.train_config.dp
             and a.train_config.cp == b.train_config.cp

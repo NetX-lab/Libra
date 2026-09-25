@@ -113,7 +113,7 @@ class SailorTrainingSimulatorAdapter:
         self,
         train_config: TrainParallelConfig,
         B_global: int,
-        L: int,
+        L: int | list[int],
     ) -> SimulatorEstimate:
         command = (self.planner_config.sailor_train_command or "").strip()
         if not command:
@@ -130,10 +130,16 @@ class SailorTrainingSimulatorAdapter:
             work = Path(td)
             input_json = work / "input.json"
             output_json = work / "output.json"
+            sequence_lengths = (
+                [int(value) for value in L]
+                if isinstance(L, list)
+                else [int(L)]
+            )
             payload = {
                 "train_config": asdict(train_config),
                 "batch_size": B_global,
-                "avg_sequence_length": L,
+                "avg_sequence_length": int(np.mean(sequence_lengths)),
+                "sequence_lengths": sequence_lengths,
                 "hardware": asdict(self.rl_config.hardware),
                 "model_arch": asdict(self.rl_config.model_arch),
                 "profiling": asdict(self.rl_config.profiling),
@@ -466,7 +472,7 @@ class HybridSimulatorCostModel:
         self,
         config: TrainParallelConfig,
         B_global: int,
-        L: int,
+        L: int | list[int],
     ) -> tuple[float, dict]:
         if self.train_backend == "analytic":
             seconds, details = self.analytic.evaluate_training(config, B_global, L)
@@ -493,6 +499,45 @@ class HybridSimulatorCostModel:
                 }
             )
             return seconds, details
+
+    def evaluate_rollout_instance(
+        self,
+        tp: int,
+        requests: list[RequestInfo],
+    ) -> tuple[float, dict]:
+        """Expose the paper's Cost(tp, a, b) interface to RolloutDP."""
+        if self.rollout_backend == "analytic":
+            seconds, details = self.analytic.evaluate_rollout_instance(tp, requests)
+            details = dict(details)
+            details["backend"] = "analytic"
+            return seconds, details
+        return self.evaluate_rollout(RolloutClusterConfig(tp_list=[int(tp)]), requests)
+
+    def evaluate_rollout_segment(
+        self,
+        tp: int,
+        *,
+        num_requests: int,
+        total_prompt_tokens: int,
+        total_gen_tokens: int,
+        max_seq: int,
+    ) -> tuple[float, dict]:
+        # A command-backed Vidur invocation per O(L^2) DP transition would make
+        # planning unusable. Use the calibrated analytic operator model for all
+        # segment transitions, then validate the recovered cluster once through
+        # the configured external backend in the outer optimizer.
+        seconds, details = self.analytic.evaluate_rollout_segment(
+            tp,
+            num_requests=num_requests,
+            total_prompt_tokens=total_prompt_tokens,
+            total_gen_tokens=total_gen_tokens,
+            max_seq=max_seq,
+        )
+        details = dict(details)
+        details["backend"] = "analytic"
+        if self.rollout_backend != "analytic":
+            details["requested_backend"] = self.rollout_backend
+        return seconds, details
 
     def evaluate_rollout(
         self,

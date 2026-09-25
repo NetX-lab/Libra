@@ -40,7 +40,9 @@ global_resource_planner:
   allocation_granularity_gpus: 8
   min_train_gpus: 8
   min_rollout_gpus: 8
-  rollout_node_tp_pattern: [1, 1, 2, 4]
+  # Let the paper-style RolloutDP choose bucket capacities; physical placement
+  # still packs complete TP instances within each eight-GPU host.
+  rollout_node_tp_pattern: []
   # Production planning waits for representative long-context observations and
   # requires a material predicted gain before changing the logical pool.
   plan_interval: 10

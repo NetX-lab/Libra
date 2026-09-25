@@ -461,11 +461,20 @@ class R2EGymWorkflow:
         rewards = [r["reward"] for r in results]
         accurate = [r["accurate"] for r in results]
         failures = [r for r in results if not r["ok"]]
+        dense_metric_keys = (
+            "lexical_f1",
+            "test_coverage",
+            "file_coverage",
+            "format_score",
+        )
         stats = {
             "eval_samples": n_eval,
             "eval_total_rows": n_total,
             "eval_index_strategy": eval_strategy,
             "eval_indices": eval_indices,
+            "eval_index_digest": hashlib.sha256(
+                ",".join(str(index) for index in eval_indices).encode("utf-8")
+            ).hexdigest(),
             "eval_accuracy": sum(accurate) / max(1, len(accurate)),
             "eval_accuracy_threshold": float(accuracy_threshold),
             "eval_reward_ge_0_3": sum(float(r >= 0.3) for r in rewards) / max(1, len(rewards)),
@@ -478,6 +487,11 @@ class R2EGymWorkflow:
             "eval_first_error": failures[0].get("error", "") if failures else "",
             "eval_mode": "multi_turn" if use_feedback else "single_turn",
         }
+        for metric_key in dense_metric_keys:
+            stats[f"eval_{metric_key}"] = sum(
+                float(result.get("metrics", {}).get(metric_key, 0.0))
+                for result in results
+            ) / max(1, len(results))
         if record_limit:
             stats["eval_records"] = results[:record_limit]
         return stats

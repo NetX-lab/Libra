@@ -452,7 +452,11 @@ class GlobalResourcePlannerConfig:
     rollout_node_tp_pattern: list[int] = field(default_factory=list)
     require_heterogeneous_rollout_tp: bool = False
     allowed_train_tp: list[int] = field(default_factory=list)
+    allowed_train_ep: list[int] = field(default_factory=list)
     allowed_train_pp: list[int] = field(default_factory=list)
+    train_comm_compute_ratio_threshold: float = float("inf")
+    train_ep_comm_compute_ratio_threshold: float = float("inf")
+    train_pipeline_bubble_ratio_threshold: float = 0.30
     fixed_train_gpus: int = 0
     # Startup placement is a GRP decision.  ``fixed_train_gpus`` is retained
     # only for backwards-compatible, explicitly configured deployments and is
@@ -483,6 +487,8 @@ class GlobalResourcePlannerConfig:
     memory_budget_logits_dtype_bytes: int = 4
     memory_budget_workspace_factor: float = 1.5
     apply_to_runtime: bool = True
+    runtime_forced_train_gpus: int = 0
+    runtime_forced_rollout_tp_list: list[int] = field(default_factory=list)
     verbose: bool = False
     runtime_length_profile_enabled: bool = True
     runtime_length_profile_jsonl: str = ""
@@ -636,6 +642,7 @@ class AsyncRLConfig:
     queue_size: int = 256
     enable_rollout_tracing: bool = False
     sync_interval: int = 1
+    rollout_sync_drain_lead_steps: int = 2
 
 
     recompute_logprobs: bool = True

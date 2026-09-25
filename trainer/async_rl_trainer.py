@@ -418,11 +418,15 @@ class AsyncRLTrainer:
                 if rollout_engine is None:
                     raise RuntimeError("rollout engine is not initialized")
 
-                trajectory = await workflow.run_episode(
-                    rollout_engine,
-                    task_input.data,
-                    version=task_input.version,
-                    rollout_index=task_input.rollout_index,
+                timeout_s = float(os.environ.get("ROLLOUT_TASK_TIMEOUT_S", "900"))
+                trajectory = await asyncio.wait_for(
+                    workflow.run_episode(
+                        rollout_engine,
+                        task_input.data,
+                        version=task_input.version,
+                        rollout_index=task_input.rollout_index,
+                    ),
+                    timeout=timeout_s,
                 )
                 trajectory["grpo_group_id"] = (
                     task_input.group_id or f"task:{task_input.task_id}"
@@ -448,6 +452,20 @@ class AsyncRLTrainer:
                         )
                     return None
 
+            except asyncio.TimeoutError:
+                staleness_manager.on_rollout_rejected()
+                if self.is_main_process:
+                    print(
+                        f"ERROR: Rollout task_id={task_input.task_id} "
+                        "failed: task_timeout",
+                        flush=True,
+                    )
+                return {
+                    "status": "failed",
+                    "failure_reason": "task_timeout",
+                    "task_id": task_input.task_id,
+                    "grpo_group_id": task_input.group_id or f"task:{task_input.task_id}",
+                }
             except Exception as e:
                 staleness_manager.on_rollout_rejected()
                 if self.is_main_process:
@@ -539,11 +557,22 @@ class AsyncRLTrainer:
                     )
                 self._reset_rollout_pipeline_after_reconfigure()
                 if retries > max_retries:
-                    raise
+                    # Do not strand non-source ranks at the next collective
+                    # when long generations leave the queue short.  Return
+                    # complete groups collected so far; the caller will
+                    # distribute the same partial batch to every rank.
+                    if is_main_process:
+                        print(
+                            "[BatchCollection] returning partial batch after "
+                            f"{retries} timeout(s): {len(selected)} trajectories"
+                        )
+                    return selected
                 continue
             if self.staleness_manager is not None:
                 self.staleness_manager.on_batch_consumed(len(raw_batch))
             for trajectory in raw_batch:
+                if trajectory.get("status") == "failed":
+                    continue
                 group_id = str(trajectory["grpo_group_id"])
                 self._pending_grpo_groups.setdefault(group_id, []).append(trajectory)
 
@@ -784,6 +813,10 @@ class AsyncRLTrainer:
             self.global_step = step
             step_start = time.time()
             self._trace_train_phase(step, "step_start")
+            self._configure_sync_aware_rollout_prefetch(
+                step=step,
+                batch_size=local_batch_size,
+            )
 
             if self.is_main_process:
                 # Reconcile late hybrid joins and publish their membership before
@@ -815,7 +848,17 @@ class AsyncRLTrainer:
                     batch_size=len(batch),
                 )
             self._trace_train_phase(step, "distribute_start")
-            batch = self.train_engine.distribute_trajectories(batch)
+            # The Megatron helper broadcasts only within each tensor-parallel
+            # group.  With data parallelism, the other TP group's source rank
+            # would receive None and enter the next collective early.  Use one
+            # explicit world-wide batch broadcast so every rank observes the
+            # same batch decision and payload before any training collective.
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                payload = [batch if self.rank == 0 else None]
+                torch.distributed.broadcast_object_list(payload, src=0)
+                batch = payload[0] or []
+            else:
+                batch = self.train_engine.distribute_trajectories(batch)
             self._trace_train_phase(
                 step,
                 "distribute_done",
@@ -907,10 +950,15 @@ class AsyncRLTrainer:
 
 
             weight_sync_time = 0.0
+            rollout_sync_drain = None
             if self.config.sync_interval > 0 and step > 0 and step % self.config.sync_interval == 0:
                 self._trace_train_phase(step, "weight_sync_start")
                 if self.dispatcher is not None:
+                    drain_started = time.time()
                     self.dispatcher.pause()
+                    cancelled = self.dispatcher.cancel_queued()
+                    metrics = self.dispatcher.get_runtime_metrics()
+                    active_to_drain = int(metrics.get("staleness_running", 0))
                     self.dispatcher.wait_until_idle(
                         timeout=float(
                             getattr(
@@ -920,6 +968,21 @@ class AsyncRLTrainer:
                             )
                         )
                     )
+                    rollout_sync_drain = {
+                        "cancelled_dispatcher_queue": int(cancelled["dispatcher_queue"]),
+                        "cancelled_runner_queue": int(cancelled["runner_queue"]),
+                        "active_to_drain": active_to_drain,
+                        "drain_seconds": time.time() - drain_started,
+                    }
+                    if self.is_main_process:
+                        print(
+                            "[RolloutDrain] "
+                            f"step={step} active={active_to_drain} "
+                            f"cancelled_dispatcher={cancelled['dispatcher_queue']} "
+                            f"cancelled_runner={cancelled['runner_queue']} "
+                            f"seconds={rollout_sync_drain['drain_seconds']:.3f}",
+                            flush=True,
+                        )
 
                 self._wait_for_all_ranks_before_weight_sync(step)
                 sync_start = time.time()
@@ -967,6 +1030,8 @@ class AsyncRLTrainer:
             stats["recompute_logprob_time"] = recompute_time
             stats["step_time"] = step_total_time
             stats["version"] = self.train_engine.get_version()
+            if rollout_sync_drain is not None:
+                stats["rollout_sync_drain"] = rollout_sync_drain
             stats.update(getattr(self, "_advantage_stats", {}))
             self.stats = stats
 
@@ -1035,6 +1100,45 @@ class AsyncRLTrainer:
             print("=" * 60)
 
         self._cleanup()
+
+    def _sync_aware_rollout_limit(
+        self,
+        *,
+        step: int,
+        batch_size: int,
+    ) -> int | None:
+        """Return a temporary in-flight cap near the next weight sync."""
+        interval = int(getattr(self.config, "sync_interval", 0) or 0)
+        lead_steps = int(
+            getattr(self.config, "rollout_sync_drain_lead_steps", 0) or 0
+        )
+        if interval <= 0 or lead_steps <= 0:
+            return None
+        remainder = step % interval
+        steps_until_sync = 0 if step > 0 and remainder == 0 else interval - remainder
+        if steps_until_sync > lead_steps:
+            return None
+        prefetch_batches = max(1, steps_until_sync)
+        return min(
+            int(getattr(self.config, "max_concurrent_rollouts", batch_size)),
+            max(1, int(batch_size)) * prefetch_batches,
+        )
+
+    def _configure_sync_aware_rollout_prefetch(
+        self,
+        *,
+        step: int,
+        batch_size: int,
+    ) -> None:
+        if self.staleness_manager is None:
+            return
+        limit = self._sync_aware_rollout_limit(step=step, batch_size=batch_size)
+        self.staleness_manager.set_runtime_max_concurrent_rollouts(limit)
+        if self.is_main_process and limit is not None:
+            print(
+                f"[RolloutDrain] step={step} prefetch_limit={limit}",
+                flush=True,
+            )
 
 
     def _run_periodic_evaluation(self, workflow, dataset, step: int):
@@ -1166,16 +1270,37 @@ class AsyncRLTrainer:
 
     def _nccl_rollout_topology(self) -> tuple[int, dict[str, int]]:
         """Return NCCL world size and per-instance rank offsets."""
-        if self._use_heterogeneous:
+        # Batch-source ranks own a live rollout client, while other training
+        # ranks intentionally keep ``self.rollout_engine`` unset.  NCCL weight
+        # synchronization still runs on every training rank, so derive the
+        # topology from the planner's config when no local client exists.
+        rollout_engine = self.rollout_engine
+        hetero_cfg = getattr(self.config, "heterogeneous_rollout", None)
+        configured_instances = getattr(hetero_cfg, "instances", []) if hetero_cfg else []
+        if self._use_heterogeneous or configured_instances:
+            instance_configs = getattr(rollout_engine, "instance_configs", None)
+            if not instance_configs:
+                instance_configs = [
+                    {
+                        "instance_id": str(getattr(cfg, "instance_id", f"instance_{index}")),
+                        "tp_degree": int(getattr(cfg, "tp", 1)),
+                    }
+                    for index, cfg in enumerate(configured_instances)
+                ]
             entries = [
                 (str(cfg["instance_id"]), int(cfg.get("tp_degree", 1)))
-                for cfg in self.rollout_engine.instance_configs
+                for cfg in instance_configs
             ]
         else:
             tp = int(getattr(self.config, "vllm_tp_size", 1) or 1)
+            num_instances = int(
+                getattr(rollout_engine, "num_instances", 0)
+                or getattr(self.config, "vllm_num_instances", 0)
+                or max(1, int(self.config.rollout_gpus) // max(1, tp))
+            )
             entries = [
                 (f"instance_{index}", tp)
-                for index in range(self.rollout_engine.num_instances)
+                for index in range(num_instances)
             ]
         offsets: dict[str, int] = {}
         next_rank = 0
@@ -1772,6 +1897,18 @@ class AsyncRLTrainer:
             self.dispatcher.destroy()
         elif self.async_runner is not None:
             self.async_runner.destroy()
+
+        # Tear down the independent rollout-weight TCPStore/NCCL objects while
+        # torch and CUDA are still fully initialized.  Leaving this cache to
+        # interpreter shutdown makes its destruction race torchrun's store
+        # teardown and can abort an otherwise completed training process.
+        from RL_Framework.infra.sync.nccl_weight_sync import (
+            clear_communicator_cache,
+        )
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        clear_communicator_cache()
 
         if self.wandb_run is not None:
             self.wandb_run.finish()
@@ -2857,7 +2994,9 @@ class AsyncRLTrainer:
             print(
                 "[GlobalResourcePlanner] "
                 f"step={step} apply "
-                f"train={plan.train_config.tp}x{plan.train_config.pp}x{plan.train_config.dp} "
+                f"train={plan.train_config.tp}x"
+                f"{getattr(plan.train_config, 'ep', 1)}x"
+                f"{plan.train_config.pp}x{plan.train_config.dp} "
                 f"rollout_tp={plan.rollout_tp_list} "
                 f"T={plan.t_global:.3f}s "
                 f"net_gain={plan.expected_gain_s:.3f}s"
@@ -3144,6 +3283,7 @@ class AsyncRLTrainer:
         for key in (
             "global_resource_planner",
             "global_resource_planner_runtime",
+            "rollout_sync_drain",
         ):
             if key in stats:
                 control_plane[key] = stats[key]

@@ -174,6 +174,8 @@ class VLLMRolloutEngine:
         n: int = 1,
         input_tokens: int = 0,
         seed: int | None = None,
+        stop: str | list[str] | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         """Generate."""
         await self._ensure_client()
@@ -189,6 +191,13 @@ class VLLMRolloutEngine:
         }
         if seed is not None:
             payload["seed"] = int(seed)
+        if stop is not None:
+            payload["stop"] = stop
+        # Keep the engine forward-compatible with workflow-level generation
+        # options that are not understood by the OpenAI-compatible endpoint.
+        # Known endpoint options are promoted explicitly above; unknown options
+        # are intentionally ignored instead of crashing the rollout loop.
+        del kwargs
 
         try:
             response = await self.http_client.post(

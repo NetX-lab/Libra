@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import ipaddress
 import threading
 import time
 from dataclasses import dataclass
@@ -28,6 +29,16 @@ class NcclReloadSpec:
     timeout_s: float = 1200.0
     chunk_bytes: int = 256 * 1024 * 1024
     rate_limit_gbps: float = 0.0
+
+    def __post_init__(self):
+        if not self.host.strip():
+            raise ValueError("NCCL rendezvous host must be a reachable sender hostname or IP")
+        try:
+            address = ipaddress.ip_address(self.host)
+        except ValueError:
+            return  # DNS hostnames are resolved by the transport.
+        if address.is_unspecified:
+            raise ValueError("NCCL rendezvous cannot advertise a wildcard address: " + self.host)
 
 
 def _group(spec: NcclReloadSpec):

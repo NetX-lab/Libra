@@ -21,6 +21,7 @@ from RL_Framework.infra.elastic.runtime_boundary import (
 )
 from RL_Framework.infra.elastic.runtime_executor import RuntimeElasticExecutor
 from RL_Framework.infra.elastic import runtime_executor as runtime_module
+from RL_Framework.infra.sync import nccl_weight_sync
 from RL_Framework.trainer.async_rl_trainer import AsyncRLTrainer
 
 
@@ -201,6 +202,17 @@ def test_final_boundary_waits_for_leader_close_before_follower_teardown(tmp_path
     assert read_record(done_path)["status"] == "success"
     assert follower.train_engine.closed
     assert follower._elastic_gradient_server is None
+
+
+def test_cleanup_releases_cached_rollout_weight_communicators(tmp_path):
+    """Catch interpreter-shutdown aborts from lingering TCPStore owners."""
+    leader, _follower = make_cleanup_trainers(tmp_path)
+    cache_key = ("127.0.0.1", 29620, 2, 0, "cuda:0")
+    nccl_weight_sync._COMMUNICATOR_CACHE[cache_key] = object()
+
+    leader._cleanup()
+
+    assert nccl_weight_sync._COMMUNICATOR_CACHE == {}
 
 
 def test_final_draining_transaction_reaches_terminal_then_done(tmp_path):
