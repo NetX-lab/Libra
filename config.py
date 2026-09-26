@@ -280,7 +280,7 @@ class HeterogeneousInstanceConfig:
 class SchedulingConfig:
     """Scheduling config implementation."""
 
-    scheduler_type: str = "length_aware"  # "length_aware" / "la_mlfq" / "cmlfq" / "load_balance"
+    scheduler_type: str = "length_aware"  # length_aware / la_mlfq / cmlfq / cmlfq_cost / load_balance
 
 
 
@@ -330,6 +330,12 @@ class SchedulingConfig:
     cmlfq_rebuild_interval: int = 50
 
     cmlfq_migration_profile_path: str = ""
+
+    # Opt-in scheduler_type="cmlfq_cost"; legacy cmlfq is unchanged.
+    cmlfq_cost_profile_path: str = ""
+    cmlfq_kv_backend: str = "recompute"  # recompute / nixl / cpu_offload
+    # Explicitly validated directional TP pairs, e.g. [[1, 4], [4, 1]].
+    cmlfq_kv_transfer_tp_pairs: list = field(default_factory=list)
 
     cmlfq_tree_path: str = ""
 

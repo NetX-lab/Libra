@@ -199,7 +199,7 @@ class CMLFQScheduler(BaseScheduler):
             self._request_states[request_id] = CMLFQRequestState(
                 request_id=request_id,
                 prompt_id=prompt_id,
-                current_bucket=shortest_bucket,
+                current_bucket=result.category,
                 current_instance_index=result.instance_index if result.instance_index >= 0 else -1,
             )
             result.request_id = request_id
@@ -318,13 +318,14 @@ class CMLFQScheduler(BaseScheduler):
             if old_handle:
                 with self._lock:
                     self._decrement_active(old_handle)
-            req_state.current_bucket = decision.target_bucket
+            req_state.current_bucket = result.category
             req_state.current_instance_index = result.instance_index
-            req_state.has_migrated = True
+            moved = result.instance_index != old_idx
+            req_state.has_migrated = req_state.has_migrated or moved
             result.request_id = request_id
-            self._migration_count += 1
+            self._migration_count += int(moved)
             with self._lock:
-                self._stats.migrated_routes += 1
+                self._stats.migrated_routes += int(moved)
 
         return result
 
@@ -507,7 +508,7 @@ class CMLFQScheduler(BaseScheduler):
                     return SchedulingResult(
                         instance_index=selected.index,
                         tp_degree=selected.tp_degree,
-                        category=bucket,
+                        category=self.bucket_for_tp(selected.tp_degree, bucket),
                         is_fallback=True,
                         reason=f"{reason}_fallback",
                         prompt_id=prompt_id,
@@ -527,7 +528,7 @@ class CMLFQScheduler(BaseScheduler):
                 return SchedulingResult(
                     instance_index=selected.index,
                     tp_degree=selected.tp_degree,
-                    category=bucket,
+                    category=self.bucket_for_tp(selected.tp_degree, bucket),
                     is_fallback=True,
                     reason="global_fallback",
                     prompt_id=prompt_id,
@@ -545,6 +546,16 @@ class CMLFQScheduler(BaseScheduler):
                 prompt_id=prompt_id,
                 request_id="",
             )
+
+    def bucket_for_tp(self, tp_degree: int, preferred: str = "") -> str:
+        """Report the bucket of the actual instance, including on fallback."""
+        matches = [
+            name for name in self._sorted_bucket_names
+            if tp_degree in self._buckets[name].get("tp_degrees", [])
+        ]
+        if preferred in matches:
+            return preferred
+        return matches[0] if matches else "unmapped"
 
     def _try_select(
         self,

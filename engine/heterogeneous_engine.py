@@ -14,6 +14,8 @@ from RL_Framework.infra.scheduling.base import (
     SchedulingResult,
 )
 from RL_Framework.infra.scheduling.factory import SchedulerFactory
+from RL_Framework.infra.scheduling.cmlfq_cost_scheduler import CMLFQCostScheduler
+from RL_Framework.engine.cmlfq_backend import CMLFQGenerationBackend
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,7 @@ class HeterogeneousRolloutEngine:
 
 
         self._pending_futures: dict[str, list[asyncio.Future]] = {}
+        self._cmlfq_backend = CMLFQGenerationBackend()
 
     # ----------------------------------------------------------------
 
@@ -78,6 +81,7 @@ class HeterogeneousRolloutEngine:
             instance_id=instance_id,
             tp_degree=tp_degree,
         )
+        self._configure_cost_runtime()
         logger.info(
             f"Added heterogeneous instance {instance_id}: TP={tp_degree}, "
             f"address={host}:{port}, GPUs={gpu_ids}"
@@ -121,6 +125,7 @@ class HeterogeneousRolloutEngine:
             self.instance_configs = []
             self._rr_counter = 0
             self._pending_futures.clear()
+            self._configure_cost_model(config)
 
             base_port = hetero.vllm_base_port
             global_host = hetero.vllm_host
@@ -185,6 +190,7 @@ class HeterogeneousRolloutEngine:
 
     async def close(self):
         """Close."""
+        await self._cmlfq_backend.close()
         for engine in self.engines:
             await engine.close()
 
@@ -219,6 +225,13 @@ class HeterogeneousRolloutEngine:
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Generate."""
+
+        if isinstance(self.scheduler, CMLFQCostScheduler):
+            return await self._generate_cost_routed(
+                prompt=prompt, max_new_tokens=max_new_tokens, temperature=temperature,
+                top_p=top_p, n=n, input_tokens=input_tokens, prompt_id=prompt_id,
+                n_samples=n_samples, epoch=epoch, request_id=request_id, **kwargs,
+            )
 
         if input_tokens <= 0:
             input_tokens = max(1, len(prompt) // 3)
@@ -307,6 +320,95 @@ class HeterogeneousRolloutEngine:
                             final_bucket=result.category,
                             output_tokens=output_tokens,
                         )
+
+    def _configure_cost_runtime(self):
+        if isinstance(self.scheduler, CMLFQCostScheduler):
+            self.scheduler.configure_runtime(
+                self.instance_configs,
+                lambda src, dst: self._cmlfq_backend.supports_transfer(
+                    self.instance_configs[src], self.instance_configs[dst],
+                ),
+            )
+
+    def _configure_cost_model(self, config):
+        if not isinstance(self.scheduler, CMLFQCostScheduler):
+            return
+        from RL_Framework.infra.cost_model.model import CostModel
+
+        # The same configured analytic rollout model as the global planner.
+        self.scheduler.routing_costs.rollout_model = CostModel(
+            hardware=config.hardware, model_arch=config.model_arch,
+            profiling=config.profiling,
+        ).rollout_model
+        sched = config.heterogeneous_rollout.scheduling
+        self._cmlfq_backend = CMLFQGenerationBackend(
+            mode=getattr(sched, "cmlfq_kv_backend", "recompute"),
+            transfer_tp_pairs=getattr(sched, "cmlfq_kv_transfer_tp_pairs", []),
+        )
+        self._configure_cost_runtime()
+
+    async def _generate_cost_routed(
+        self, prompt: str, max_new_tokens: int, temperature: float, top_p: float,
+        n: int, input_tokens: int, prompt_id: str, n_samples: int, epoch: int,
+        request_id: str, **kwargs,
+    ) -> dict[str, Any]:
+        if n != 1 or n_samples != 1:
+            raise ValueError("cmlfq_cost requires one sample per trajectory")
+        scheduler = self.scheduler
+        managed = bool(request_id)
+        if managed and not scheduler.has_request(request_id):
+            raise ValueError(f"Unknown CMLFQ request: {request_id}")
+        if not managed:
+            route = scheduler.schedule(
+                input_tokens=max(1, input_tokens or len(prompt) // 3),
+                prompt_id=prompt_id, epoch=epoch,
+            )
+            if route.instance_index < 0:
+                raise RuntimeError("No available CMLFQ instance")
+            request_id = route.request_id
+        decision = None
+        output_tokens = 0
+        try:
+            decision = scheduler.reserve_generation(
+                request_id, input_tokens if input_tokens > 0 else None,
+            )
+            outcome = await self._cmlfq_backend.generate(
+                source=self.engines[decision.source_instance_index],
+                target=self.engines[decision.target_instance_index],
+                prompt=prompt, path=decision.execution_path,
+                request_id=request_id,
+                max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
+                n=n, **kwargs,
+            )
+            scheduler.commit_generation(request_id, decision)
+            route = scheduler.get_request_route(request_id)
+            output = outcome.output
+            output_tokens = len(output.get("tokens", []))
+            output["_schedule_info"] = {
+                "instance_index": route.instance_index,
+                "instance_id": self.instance_configs[route.instance_index]["instance_id"],
+                "tp_degree": route.tp_degree, "category": route.category,
+                "is_fallback": bool(outcome.fallback_reason),
+                "reason": decision.reason, "prompt_id": route.prompt_id,
+                "request_id": request_id, "execution_path": outcome.path,
+                "planned_execution_path": decision.execution_path,
+                "fallback_reason": outcome.fallback_reason,
+                "estimated_decode_seconds": decision.decode_seconds,
+                "estimated_migration_seconds": decision.migration_seconds,
+            }
+            return output
+        except BaseException:
+            # Do not roll back another coroutine's reservation if this one
+            # failed to reserve (e.g. a duplicate concurrent generation).
+            if decision is not None:
+                scheduler.rollback_generation(request_id)
+            if not scheduler.has_request(request_id):
+                self._cmlfq_backend.release_request(request_id)
+            raise
+        finally:
+            if not managed:
+                self._cmlfq_backend.release_request(request_id)
+                scheduler.finish_request(request_id, output_tokens)
 
     async def _wait_for_scout(
         self,
@@ -462,11 +564,13 @@ class HeterogeneousRolloutEngine:
 
     def finish_cmlfq_request(self, request_id: str, total_output_tokens: int):
         """Finish cmlfq request."""
+        self._cmlfq_backend.release_request(request_id)
         if request_id and hasattr(self.scheduler, "finish_request"):
             self.scheduler.finish_request(request_id, total_output_tokens)
 
     def cancel_cmlfq_request(self, request_id: str):
         """Cancel cmlfq request."""
+        self._cmlfq_backend.release_request(request_id)
         if request_id and hasattr(self.scheduler, "cancel_request"):
             self.scheduler.cancel_request(request_id)
 
@@ -543,6 +647,7 @@ class HeterogeneousRolloutEngine:
             model_path=config.model_path,
             scheduler=scheduler,
         )
+        engine._configure_cost_model(config)
 
 
         base_port = hetero.vllm_base_port

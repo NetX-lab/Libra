@@ -193,6 +193,11 @@ class VLLMRolloutEngine:
             payload["seed"] = int(seed)
         if stop is not None:
             payload["stop"] = stop
+        kv_transfer_params = kwargs.pop("kv_transfer_params", None)
+        if kv_transfer_params is not None:
+            if not isinstance(kv_transfer_params, dict):
+                raise ValueError("kv_transfer_params must be a dictionary")
+            payload["kv_transfer_params"] = kv_transfer_params
         # Keep the engine forward-compatible with workflow-level generation
         # options that are not understood by the OpenAI-compatible endpoint.
         # Known endpoint options are promoted explicitly above; unknown options
@@ -257,6 +262,27 @@ class VLLMRolloutEngine:
 
         return valid_results
 
+    async def wait_for_cpu_offload(self, key: str, source_tp: int, timeout: float = 30.0):
+        """Await only the portion of offload not hidden by tool execution."""
+        await self._ensure_client()
+        deadline = time.monotonic() + timeout
+        while True:
+            response = await self.http_client.get(
+                f"{self.base_url}/libra/kv/{key}", params={"source_tp": source_tp},
+            )
+            response.raise_for_status()
+            status = response.json()
+            if status.get("ready"):
+                return status
+            if time.monotonic() >= deadline:
+                raise TimeoutError("CPU KV offload did not become ready")
+            await asyncio.sleep(0.01)
+
+    async def release_cpu_offload(self, key: str):
+        await self._ensure_client()
+        response = await self.http_client.delete(f"{self.base_url}/libra/kv/{key}")
+        response.raise_for_status()
+
     # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
@@ -289,12 +315,15 @@ class VLLMRolloutEngine:
         tokens = logprobs_data.get("tokens") or []
         token_logprobs = logprobs_data.get("token_logprobs") or []
 
-        return {
+        parsed = {
             "text": text or "",
             "tokens": tokens,
             "logprobs": token_logprobs,
             "finish_reason": choice.get("finish_reason", "length"),
         }
+        if isinstance(response.get("kv_transfer_params"), dict):
+            parsed["kv_transfer_params"] = response["kv_transfer_params"]
+        return parsed
 
     # ------------------------------------------------------------------
 

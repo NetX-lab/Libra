@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import re
 from pathlib import Path
 import time
 
@@ -37,6 +40,43 @@ class ReloadWeightsNcclRequest(BaseModel):
 
 _reload_lock = asyncio.Lock()
 _custom_router = APIRouter()
+
+
+def _kv_directory(key: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}", key):
+        raise HTTPException(status_code=400, detail="invalid KV key")
+    return Path(os.environ.get("LIBRA_KV_STORAGE_PATH", "/dev/shm/libra-kv")) / key
+
+
+@_custom_router.get("/libra/kv/{key}")
+async def cpu_offload_status(key: str, source_tp: int = 1):
+    directory = _kv_directory(key)
+    if not 1 <= source_tp <= 64:
+        raise HTTPException(status_code=400, detail="invalid source TP")
+    if (directory / "released").exists():
+        raise HTTPException(status_code=410, detail="KV released")
+    manifests = []
+    for rank in range(source_tp):
+        error = directory / f"rank_{rank}.error.json"
+        if error.exists():
+            raise HTTPException(status_code=500, detail=error.read_text())
+        path = directory / f"rank_{rank}.json"
+        if not path.exists():
+            return {"ready": False}
+        manifests.append(json.loads(path.read_text()))
+    return {"ready": True, "workers": [
+        {k: v for k, v in manifest.items() if k != "tokens"} for manifest in manifests
+    ]}
+
+
+@_custom_router.delete("/libra/kv/{key}")
+async def release_cpu_offload(key: str):
+    directory = _kv_directory(key)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "released").touch()
+    for path in directory.glob("rank_*"):
+        path.unlink(missing_ok=True)
+    return {"released": True}
 
 
 @_custom_router.post("/reload_weights")

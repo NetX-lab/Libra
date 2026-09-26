@@ -11,6 +11,7 @@ from .base import (
 from .length_aware import LengthAwareScheduler, HeterogeneousScheduler
 from .la_mlfq import LAMLFQScheduler
 from .cmlfq_scheduler import CMLFQScheduler
+from .cmlfq_cost_scheduler import CMLFQCostScheduler
 from .load_balance import LoadBalanceScheduler
 from .factory import SchedulerFactory
 
@@ -25,6 +26,7 @@ __all__ = [
     "HeterogeneousScheduler",
     "LAMLFQScheduler",
     "CMLFQScheduler",
+    "CMLFQCostScheduler",
     "LoadBalanceScheduler",
     "SchedulerFactory",
 ]

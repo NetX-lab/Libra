@@ -196,6 +196,30 @@ class CausalPrefixTree:
             return mean_bucket
         return None
 
+    def residual_distribution(
+        self, prompt_id: str, return_states: list[ToolReturnState],
+        bucket_thresholds: dict[str, int],
+    ) -> list[tuple[str, float, float]]:
+        """Snapshot (bin, probability, conditional mean length) for cost routing.
+
+        Uses the persisted bounded observation window, including the overflow
+        in the final bin. Legacy checkpoints without observations yield no
+        distribution rather than inventing one from mean/P90.
+        """
+        with self._lock:
+            node = self.lookup_with_fallback(prompt_id, return_states)
+            if node is None or not node.remaining_lengths:
+                return []
+            bins: dict[str, list[float]] = {}
+            for length in node.remaining_lengths:
+                name = self._length_to_bucket(length, bucket_thresholds)
+                bins.setdefault(name, []).append(length)
+            count = len(node.remaining_lengths)
+            return [
+                (name, len(values) / count, sum(values) / len(values))
+                for name, values in bins.items()
+            ]
+
     # ----------------------------------------------------------------
 
     # ----------------------------------------------------------------
