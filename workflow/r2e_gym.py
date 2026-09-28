@@ -6,10 +6,12 @@ import asyncio
 import hashlib
 import os
 import random
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
-from transformers import PreTrainedTokenizerBase
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 from RL_Framework.env.r2e_patch_harness import (
     R2EPatchExecutionHarness,
     R2ESingularityPatchHarness,
