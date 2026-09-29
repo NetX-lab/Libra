@@ -176,6 +176,7 @@ class CMLFQScheduler(BaseScheduler):
         prompt_id: str = "",
         n_samples: int = 1,
         epoch: int = -1,
+        max_new_tokens: int = 0,
     ) -> SchedulingResult:
         """Schedule."""
         with self._lock:
