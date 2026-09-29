@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import asyncio
 from typing import Any, Callable
 
 import torch
@@ -122,10 +123,18 @@ class SearchR1Workflow:
 
 
             generate_kwargs = {
+                "prompt_id": prompt_id,
                 "prompt": current_text,
                 "max_new_tokens": self.max_new_tokens,
                 "temperature": self.temperature,
                 "n": 1,
+                # Reused segment count (BPE boundaries may differ from a
+                # full-text encode); avoids another tokenization pass.
+                # Includes prompt +
+                # prior outputs + tool results); skips engine estimation.
+                "input_tokens": sum(
+                    len(tokens) for tokens, _, _ in segments
+                ),
             }
             if cmlfq_request_id:
                 generate_kwargs.update({
@@ -134,7 +143,10 @@ class SearchR1Workflow:
                 })
             try:
                 response = await engine.generate(**generate_kwargs)
-            except Exception:
+            except BaseException:
+                # BaseException: CancelledError (task cancellation) must
+                # also release the C-MLFQ request state, otherwise the
+                # leaked entry wedges wait_until_idle until timeout.
                 cancel_cmlfq = getattr(
                     engine, "cancel_cmlfq_request", None
                 )
@@ -159,6 +171,11 @@ class SearchR1Workflow:
                 try:
                     search_result = await self.search_tool.search(tool_query)
                     tool_status = "success"
+                except asyncio.CancelledError:
+                    cancel = getattr(engine, "cancel_cmlfq_request", None)
+                    if cmlfq_request_id and callable(cancel):
+                        cancel(cmlfq_request_id)
+                    raise
                 except Exception as exc:
                     search_result = f"Error: {exc}"
                     tool_status = "failure"

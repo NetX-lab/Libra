@@ -54,6 +54,7 @@ class RLVRWorkflow:
 
         response = await engine.generate(
             prompt=prompt_str,
+            prompt_id=str(data.get("prompt_id") or data.get("id") or question),
             max_new_tokens=self.max_new_tokens,
             temperature=self.temperature,
             n=1,

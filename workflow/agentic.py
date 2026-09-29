@@ -44,6 +44,7 @@ class AgenticWorkflow:
         all_actions = []
 
         current_turn = 0
+        prompt_id = str(data.get("prompt_id") or data.get("id") or "")
 
         while current_turn < self.max_turns:
             input_ids = self.tokenizer.apply_chat_template(
@@ -53,12 +54,18 @@ class AgenticWorkflow:
             )
 
             prompt_str = self.tokenizer.decode(input_ids)
+            if not prompt_id:
+                import hashlib
+                prompt_id = hashlib.sha256(prompt_str.encode("utf-8")).hexdigest()
 
             response = await engine.generate(
                 prompt=prompt_str,
+                prompt_id=prompt_id,
                 max_new_tokens=self.max_new_tokens,
                 temperature=self.temperature,
                 n=1,
+                # apply_chat_template already produced the exact ids.
+                input_tokens=len(input_ids),
             )
 
             output_text = response["text"]
