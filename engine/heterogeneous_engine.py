@@ -44,9 +44,139 @@ class HeterogeneousRolloutEngine:
 
         self._pending_futures: dict[str, list[asyncio.Future]] = {}
 
+        # Engine-owned telemetry. Whole-engine replacement stops these
+        # resources before creating new ones; they are not global singletons.
+        self._metrics_poller: Any = None
+        # Engine-layer cross-rank load publisher/aggregator (same
+        # lifetime rules as the poller).
+        self._shared_state: Any = None
+
     # ----------------------------------------------------------------
 
     # ----------------------------------------------------------------
+
+    def _setup_metrics_polling(self, hetero_cfg: Any) -> None:
+        """Create/replace/stop the /metrics poller per scheduling config."""
+        from RL_Framework.infra.scheduling.base import MetricsFeedbackConfig
+        from RL_Framework.infra.scheduling.metrics_feed import VLLMMetricsPoller
+
+        feedback = MetricsFeedbackConfig.from_scheduling(
+            getattr(hetero_cfg, "scheduling", None)
+        )
+        if not feedback.enabled:
+            self._stop_metrics_poller()
+            return
+        self._stop_metrics_poller()
+        poller = VLLMMetricsPoller(
+            interval_s=feedback.poll_interval_s,
+            timeout_s=feedback.request_timeout_s,
+            ttl_s=feedback.staleness_ttl_s,
+        )
+        self._metrics_poller = poller
+        self._refresh_metrics_endpoints()
+        poller.start()
+        if self.scheduler is not None:
+            self.scheduler.attach_metrics_feed(poller)
+
+    def _refresh_metrics_endpoints(self) -> None:
+        if self._metrics_poller is None:
+            return
+        urls = {
+            cfg["instance_id"]: f"http://{cfg['host']}:{cfg['port']}/metrics"
+            for cfg in self.instance_configs
+        }
+        self._metrics_poller.set_endpoints(urls)
+
+    def _calibrate_capacities_from_metrics(self) -> None:
+        """Retain fresh profiled capacities per instance, never max by TP.
+
+        Same-TP endpoints can have different budgets. The scheduler uses
+        fresh snapshots first, then this last profiled value, then the
+        explicitly configured/analytic per-TP estimate.
+        """
+        if self._metrics_poller is None or self.scheduler is None:
+            return
+        calibrated: dict[str, int] = {}
+        for cfg, snap in (
+            (cfg, snap)
+            for cfg in self.instance_configs
+            for snap in [self._metrics_poller.get(cfg["instance_id"])]
+            if snap is not None
+        ):
+            capacity = int(getattr(snap, "kv_capacity_tokens", -1))
+            if capacity > 0:
+                calibrated[cfg["instance_id"]] = capacity
+        with self.scheduler._lock:
+            for handle in self.scheduler._instances:
+                if handle.instance_id in calibrated:
+                    handle.kv_capacity_tokens = calibrated[handle.instance_id]
+        if calibrated:
+            logger.info("[MetricsFeedback] profiled capacity by instance: %s", calibrated)
+
+    def _stop_metrics_poller(self) -> None:
+        if self._metrics_poller is not None:
+            try:
+                self._metrics_poller.stop()
+            except Exception as exc:
+                logger.warning("Failed stopping metrics poller: %s", exc)
+            self._metrics_poller = None
+            self.scheduler.attach_metrics_feed(None)
+
+    def _setup_shared_state(self, hetero_cfg: Any) -> None:
+        """Create the cross-rank load state once per engine lifetime."""
+        sched = getattr(hetero_cfg, "scheduling", None)
+        directory = str(getattr(sched, "shared_load_dir", "") or "")
+        if not directory:
+            return
+        if hasattr(self.scheduler, "get_request_route"):
+            logger.warning("C-MLFQ uses cmlfq_shared_load_dir, ignoring shared_load_dir")
+            return
+        from RL_Framework.infra.scheduling.shared_token_state import (
+            SharedTokenLoadState,
+        )
+
+        self._shared_state = SharedTokenLoadState(
+            directory=directory,
+            ttl_s=float(getattr(sched, "shared_load_ttl_s", 30.0)),
+            heartbeat_interval_s=float(
+                getattr(sched, "shared_load_heartbeat_s", 10.0)
+            ),
+            cache_ttl_s=float(getattr(sched, "shared_load_cache_ttl_s", 1.0)),
+        )
+        if self.scheduler is not None:
+            self.scheduler.attach_shared_state(self._shared_state)
+        logger.info(
+            "Attached cross-rank shared load state: dir=%s writer=%s",
+            directory,
+            self._shared_state.writer_id,
+        )
+
+    def _reattach_shared_state(self) -> None:
+        """Wire the existing shared state into a freshly built scheduler.
+
+        The new scheduler's local counters start at zero, so this rank's
+        published totals must be zeroed to match (other ranks untouched).
+        """
+        if self._shared_state is None or self.scheduler is None:
+            return
+        try:
+            self._shared_state.reset()
+        except Exception as exc:
+            logger.warning("Shared-state reset on reattach failed: %s", exc)
+        self.scheduler.attach_shared_state(self._shared_state)
+
+    def _close_shared_state(self) -> None:
+        if self._shared_state is not None:
+            try:
+                self._shared_state.close()
+            except Exception as exc:
+                logger.warning("Failed closing shared load state: %s", exc)
+            self._shared_state = None
+
+    def metrics_snapshots(self) -> dict[str, Any]:
+        if self._metrics_poller is None:
+            return {}
+        return self._metrics_poller.snapshots()
 
     def add_instance(
         self,
@@ -71,6 +201,7 @@ class HeterogeneousRolloutEngine:
             "tp_degree": tp_degree,
             "gpu_ids": gpu_ids or [],
         })
+        self._refresh_metrics_endpoints()
 
 
         self.scheduler.register_instance(
@@ -105,6 +236,10 @@ class HeterogeneousRolloutEngine:
         start or stop workers before this method is called.
         """
         with self._lock:
+            if any(h.active_requests for h in self.scheduler._instances) or any(
+                not f.done() for futures in self._pending_futures.values() for f in futures
+            ):
+                raise RuntimeError("Drain rollout requests before reconfiguring the engine")
             for engine in self.engines:
                 if hasattr(engine, "close_sync"):
                     engine.close_sync()
@@ -115,6 +250,16 @@ class HeterogeneousRolloutEngine:
                 scheduler_type=scheduler_type,
                 hetero_config=hetero,
             )
+            old_scheduler = self.scheduler
+            if old_scheduler is not None and old_scheduler is not scheduler:
+                try:
+                    scheduler.import_learned_state(
+                        old_scheduler.export_learned_state()
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to carry scheduler state across reconfigure: %s", exc
+                    )
 
             self.scheduler = scheduler
             self.engines = []
@@ -142,6 +287,9 @@ class HeterogeneousRolloutEngine:
                 self.num_instances,
             )
 
+            self._setup_metrics_polling(hetero)
+            self._reattach_shared_state()
+
     # ----------------------------------------------------------------
 
     # ----------------------------------------------------------------
@@ -160,6 +308,17 @@ class HeterogeneousRolloutEngine:
             f"All {self.num_instances} heterogeneous instances are ready: "
             f"TP layout={self.tp_list}"
         )
+        # Give the metrics poller a moment to capture its first snapshots,
+        # then calibrate KV capacities against vLLM's own profiling.
+        if self._metrics_poller is not None:
+            import time as _time
+
+            deadline = _time.time() + 15.0
+            while _time.time() < deadline:
+                if len(self.metrics_snapshots()) >= self.num_instances:
+                    break
+                _time.sleep(0.5)
+            self._calibrate_capacities_from_metrics()
 
     def wait_until_idle(self, timeout: float = 3600.0, poll_interval: float = 0.5):
         """Block until no rollout requests are active before reconfiguration."""
@@ -185,8 +344,18 @@ class HeterogeneousRolloutEngine:
 
     async def close(self):
         """Close."""
+        self._stop_metrics_poller()
+        self._close_shared_state()
         for engine in self.engines:
             await engine.close()
+
+    def close_sync(self):
+        """Synchronous close used when the engine is replaced at rebind."""
+        self._stop_metrics_poller()
+        self._close_shared_state()
+        for engine in self.engines:
+            if hasattr(engine, "close_sync"):
+                engine.close_sync()
 
     # ----------------------------------------------------------------
 
@@ -221,10 +390,15 @@ class HeterogeneousRolloutEngine:
         """Generate."""
 
         if input_tokens <= 0:
-            input_tokens = max(1, len(prompt) // 3)
+            # Cheap chars-based fallback only: every bundled workflow now
+            # passes its exact token count, so this path serves unknown
+            # future callers. ~4 chars/token is a better prior than the
+            # legacy //3 (which overestimated English ~40%).
+            input_tokens = max(1, int(len(prompt) / 4))
 
 
         with self._lock:
+            route_scheduler = self.scheduler
             requested_cmlfq_route = bool(
                 request_id and hasattr(self.scheduler, "get_request_route")
             )
@@ -240,6 +414,7 @@ class HeterogeneousRolloutEngine:
                     prompt_id=prompt_id,
                     n_samples=n_samples,
                     epoch=epoch,
+                    max_new_tokens=max_new_tokens,
                 )
 
 
@@ -249,12 +424,23 @@ class HeterogeneousRolloutEngine:
                 input_tokens=input_tokens,
                 n_samples=n_samples,
                 epoch=epoch,
+                max_new_tokens=max_new_tokens,
             )
 
         with self._lock:
-            if result.instance_index < 0:
-                idx = self._rr_counter % max(1, self.num_instances)
+            scheduled_by_scheduler = result.instance_index >= 0
+            if not scheduled_by_scheduler:
+                if hasattr(route_scheduler, "finish_request"):
+                    raise RuntimeError(f"C-MLFQ routing failed: {result.reason}")
+                with route_scheduler._lock:
+                    ready = route_scheduler._selectable([
+                        h for h in route_scheduler._instances if h.is_ready
+                    ])
+                if not ready:
+                    raise RuntimeError(f"No ready rollout instance: {result.reason}")
+                idx = ready[self._rr_counter % len(ready)].index
                 self._rr_counter += 1
+                result.is_fallback = True
                 logger.warning(
                     f"Scheduling failed ({result.reason}), falling back to instance {idx}"
                 )
@@ -262,6 +448,27 @@ class HeterogeneousRolloutEngine:
                 idx = result.instance_index
             engine = self.engines[idx]
             instance_config = dict(self.instance_configs[idx])
+            # The scheduler never accounted a fallback route (its schedule()
+            # call failed), so debit it here. Otherwise the completion path
+            # would dec a request that was never inc'd and silently steal
+            # tokens from whichever request is still in flight on idx.
+            if not scheduled_by_scheduler and not cmlfq_managed:
+                with_signal = getattr(
+                    self.scheduler, "_record_route", None
+                )
+                if callable(with_signal):
+                    with self.scheduler._lock:
+                        result.reserved_tokens = with_signal(
+                            self.scheduler.get_instance_handle(idx),
+                            input_tokens,
+                            category=result.category or "any",
+                            prompt_id=prompt_id,
+                            max_new_tokens=max_new_tokens,
+                        )
+                else:
+                    handle = self.scheduler.get_instance_handle(idx)
+                    if handle is not None:
+                        handle.inc_active()
         output_tokens = 0
 
         try:
@@ -292,20 +499,24 @@ class HeterogeneousRolloutEngine:
 
             if not cmlfq_managed:
                 if result.request_id and hasattr(
-                    self.scheduler, "finish_request"
+                    route_scheduler, "finish_request"
                 ):
                     with self._lock:
-                        self.scheduler.finish_request(
+                        route_scheduler.finish_request(
                             result.request_id,
                             output_tokens,
                         )
                 else:
                     with self._lock:
-                        self.scheduler.on_request_done(
+                        completion_kwargs = {}
+                        if result.reserved_tokens is not None:
+                            completion_kwargs["reserved_tokens"] = result.reserved_tokens
+                        route_scheduler.on_request_done(
                             instance_index=idx,
                             prompt_id=prompt_id,
                             final_bucket=result.category,
                             output_tokens=output_tokens,
+                            **completion_kwargs,
                         )
 
     async def _wait_for_scout(
@@ -315,10 +526,12 @@ class HeterogeneousRolloutEngine:
         n_samples: int,
         epoch: int,
         timeout: float = 60.0,
+        max_new_tokens: int = 0,
     ) -> SchedulingResult:
         """Wait for scout."""
         loop = asyncio.get_event_loop()
         future = loop.create_future()
+        self._pending_futures.setdefault(prompt_id, []).append(future)
 
 
         from RL_Framework.infra.scheduling.la_mlfq import WaitingRequest
@@ -330,6 +543,7 @@ class HeterogeneousRolloutEngine:
                 epoch=epoch,
                 sample_index=-1,
                 future=future,
+                max_new_tokens=max_new_tokens,
             )
             self.scheduler.scout_manager.add_waiting(wr)
 
@@ -347,6 +561,12 @@ class HeterogeneousRolloutEngine:
                 f"Error while waiting for scout: prompt={prompt_id}, error={e}, "
                 f"using default routing"
             )
+        finally:
+            futures = self._pending_futures.get(prompt_id, [])
+            if future in futures:
+                futures.remove(future)
+            if not futures:
+                self._pending_futures.pop(prompt_id, None)
 
 
         return self.scheduler.schedule(
@@ -354,6 +574,7 @@ class HeterogeneousRolloutEngine:
             prompt_id="",
             n_samples=1,
             epoch=epoch,
+            max_new_tokens=max_new_tokens,
         )
 
     async def generate_batch(
@@ -393,7 +614,7 @@ class HeterogeneousRolloutEngine:
 
         valid_results = []
         for i, result in enumerate(results):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 logger.warning(f"Prompt {i} Generation failed: {result}")
                 continue
             valid_results.append(result)
@@ -527,8 +748,18 @@ class HeterogeneousRolloutEngine:
     # ----------------------------------------------------------------
 
     @classmethod
-    def from_config(cls, config) -> "HeterogeneousRolloutEngine":
-        """From config."""
+    def from_config(
+        cls,
+        config,
+        carry_scheduler_state_from: "BaseScheduler | None" = None,
+    ) -> "HeterogeneousRolloutEngine":
+        """From config.
+
+        ``carry_scheduler_state_from`` transfers learned scheduler state
+        (output-length EMA, history tables) across a rebind. Weight sync
+        rebinds rebuild the engine every sync step; without the carry the
+        EMA would reset to its prior every step and never converge.
+        """
         hetero = config.heterogeneous_rollout
 
 
@@ -537,6 +768,20 @@ class HeterogeneousRolloutEngine:
             scheduler_type=scheduler_type,
             hetero_config=hetero,
         )
+        if carry_scheduler_state_from is not None:
+            try:
+                scheduler.import_learned_state(
+                    carry_scheduler_state_from.export_learned_state()
+                )
+                logger.info(
+                    "Carried learned scheduler state (%s -> %s) across rebind",
+                    type(carry_scheduler_state_from).__name__,
+                    type(scheduler).__name__,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to carry scheduler state across rebind: %s", exc
+                )
 
 
         engine = cls(
@@ -582,6 +827,8 @@ class HeterogeneousRolloutEngine:
             f"Created heterogeneous engine from configuration: {engine.num_instances} instances, "
             f"TP layout={engine.tp_list}, scheduler={scheduler_type}"
         )
+        engine._setup_metrics_polling(hetero)
+        engine._setup_shared_state(hetero)
         return engine
 
     # ----------------------------------------------------------------
