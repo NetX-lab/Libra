@@ -1,0 +1,11 @@
+# Opt-in alternative to search_r1_cmlfq_qwen3_14b.yaml. The legacy file is unchanged.
+base_config: search_r1_cmlfq_qwen3_14b.yaml
+
+heterogeneous_rollout:
+  scheduling:
+    scheduler_type: cmlfq_cost
+    # Empty => use configured planner analytic rollout model; no guessed transfer cost.
+    cmlfq_cost_profile_path: ""
+    cmlfq_kv_backend: recompute
+    cmlfq_kv_transfer_tp_pairs: []
+    cmlfq_tree_path: ./logs/search_r1_cost/cmlfq_tree.json

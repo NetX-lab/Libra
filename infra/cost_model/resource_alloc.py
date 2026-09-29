@@ -208,6 +208,7 @@ class CostModelAllocator:
         length_distribution: list[tuple[int, int]] | None = None,
         B_global: int = 32,
         allowed_train_tp: list[int] | None = None,
+        allowed_train_ep: list[int] | None = None,
         allowed_train_pp: list[int] | None = None,
     ):
         """Allocate resources."""
@@ -241,6 +242,7 @@ class CostModelAllocator:
             requests=requests,
             B_global=B_global,
             allowed_train_tp=allowed_train_tp,
+            allowed_train_ep=allowed_train_ep,
             allowed_train_pp=allowed_train_pp,
         )
 
@@ -274,7 +276,8 @@ class CostModelAllocator:
                 "t_rollout": r.t_rollout,
                 "t_global": r.t_global,
                 "train_config": {
-                    "tp": r.train_config.tp, "pp": r.train_config.pp,
+                    "tp": r.train_config.tp, "ep": r.train_config.ep,
+                    "pp": r.train_config.pp,
                     "dp": r.train_config.dp,
                 } if r.train_config else None,
                 "rollout_config": r.rollout_config.tp_list if r.rollout_config else None,

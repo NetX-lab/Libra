@@ -187,7 +187,8 @@ class AsyncTaskRunner(Generic[T]):
                 # accepted by this runner must still be started and reaped so
                 # callers can drain the rollout pipeline before restarting
                 # serving processes for a weight update.
-                self._drain_pending_inputs(running_tasks, input_queue)
+                if not pause_event.is_set():
+                    self._drain_pending_inputs(running_tasks, input_queue)
 
 
                 if not running_tasks:
@@ -392,6 +393,35 @@ class AsyncTaskRunner(Generic[T]):
         """Resume."""
         self.paused.clear()
         self._signal_new_input()
+
+    def cancel_queued(self, timeout: float = 2.0) -> list[int]:
+        """Cancel accepted tasks that have not yet started their coroutine."""
+        if not self.paused.is_set():
+            raise RuntimeError("pause() must be called before cancel_queued()")
+
+        cancelled: list[int] = []
+        completed = threading.Event()
+
+        def drain_input_queue() -> None:
+            while True:
+                try:
+                    task_input = self.input_queue.get_nowait()
+                except queue.Empty:
+                    break
+                task_id = int(task_input["task_id"])
+                cancelled.append(task_id)
+                with self._active_task_ids_lock:
+                    self._active_task_ids.discard(task_id)
+            completed.set()
+
+        loop = self._loop
+        if loop is None:
+            drain_input_queue()
+        else:
+            loop.call_soon_threadsafe(drain_input_queue)
+            if not completed.wait(timeout):
+                raise TimeoutError("timed out cancelling queued rollout tasks")
+        return sorted(cancelled)
 
     def wait_until_idle(self, timeout: float = 3600.0) -> None:
         """Wait until every task accepted before pause has completed."""

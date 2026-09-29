@@ -1,0 +1,9 @@
+# Requires LibraCPUOffloadConnector on every vLLM endpoint; see docs/cmlfq_cost_scheduler.md.
+base_config: search_r1_cmlfq_cost_qwen3_14b.yaml
+heterogeneous_rollout:
+  scheduling:
+    cmlfq_kv_backend: cpu_offload
+    cmlfq_kv_transfer_tp_pairs: [[2, 4], [2, 8], [4, 2], [4, 8], [8, 2], [8, 4]]
+    # Supply measured costs to enable cross-instance transfer selection.
+    # Without measurements, cross-instance routing still uses recomputation.
+    cmlfq_cost_profile_path: ""

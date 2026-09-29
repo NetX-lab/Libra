@@ -1,0 +1,6 @@
+# CPU-only CI dependencies; intentionally excludes the CUDA runtime stack.
+pytest==8.3.5
+pytest-asyncio==0.26.0
+numpy==1.26.4
+PyYAML==6.0.2
+httpx==0.28.1

@@ -61,6 +61,7 @@ EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-32}"
 EVAL_CONCURRENCY="${EVAL_CONCURRENCY:-16}"
 EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-512}"
 SYNC_INTERVAL="${SYNC_INTERVAL:-5}"
+ROLLOUT_SYNC_DRAIN_LEAD_STEPS="${ROLLOUT_SYNC_DRAIN_LEAD_STEPS:-2}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.80}"
 VLLM_BASE_PORT="${VLLM_BASE_PORT:-8000}"
 MASTER_PORT="${MASTER_PORT:-29500}"
@@ -177,7 +178,7 @@ if [ "$VLLM_DISABLE_CUSTOM_ALL_REDUCE" = "1" ]; then
     VLLM_CUSTOM_ALL_REDUCE_FLAG="--disable-custom-all-reduce"
 fi
 if [ "$GRP_MANAGE_ROLLOUT_PROCESSES" = "1" ] && [ -z "$GRP_VLLM_LAUNCH_COMMAND_TEMPLATE" ]; then
-    GRP_VLLM_LAUNCH_COMMAND_TEMPLATE="srun --exclusive --nodes=1 --ntasks=1 --nodelist={host} --gpus={tp} --cpus-per-task=16 bash -lc \"source '$VENV_PATH' && export TOKENIZERS_PARALLELISM=false && export PLANNED_CUDA_VISIBLE_DEVICES={gpus} && if [ -z \\\"\\\${{CUDA_VISIBLE_DEVICES:-}}\\\" ]; then export CUDA_VISIBLE_DEVICES=\\\"\\\$PLANNED_CUDA_VISIBLE_DEVICES\\\"; fi && echo \\\"CUDA_VISIBLE_DEVICES=\\\${{CUDA_VISIBLE_DEVICES}} planned=\\\${{PLANNED_CUDA_VISIBLE_DEVICES}}\\\" && export MASTER_ADDR=127.0.0.1 && export MASTER_PORT=\\\$((20000 + {port})) && export NCCL_P2P_DISABLE='$VLLM_NCCL_P2P_DISABLE' && export NCCL_IB_DISABLE='$VLLM_NCCL_IB_DISABLE' && export CUDA_LAUNCH_BLOCKING='$VLLM_CUDA_LAUNCH_BLOCKING' && {python} '$PROJECT_DIR/scripts/restartable_vllm_server.py' --instance-id {instance_id} --control-dir {control_dir} --health-url {local_health_url} --initial-model {initial_model} --ready-timeout '$MAX_WAIT' -- python3 -m vllm.entrypoints.openai.api_server --model __MODEL_PATH__ --served-model-name {model_path} --host 0.0.0.0 --port {port} --tensor-parallel-size {tp} --max-model-len {max_model_len} --dtype bfloat16 --gpu-memory-utilization {gpu_memory_utilization} --trust-remote-code --enforce-eager $VLLM_CUSTOM_ALL_REDUCE_FLAG\""
+    GRP_VLLM_LAUNCH_COMMAND_TEMPLATE="srun --exclusive --nodes=1 --ntasks=1 --nodelist={host} --gpus={tp} --cpus-per-task=16 bash -lc \"source '$VENV_PATH' && export TOKENIZERS_PARALLELISM=false && export PLANNED_CUDA_VISIBLE_DEVICES={gpus} && if [ -z \\\"\\\${{CUDA_VISIBLE_DEVICES:-}}\\\" ]; then export CUDA_VISIBLE_DEVICES=\\\"\\\$PLANNED_CUDA_VISIBLE_DEVICES\\\"; fi && echo \\\"CUDA_VISIBLE_DEVICES=\\\${{CUDA_VISIBLE_DEVICES}} planned=\\\${{PLANNED_CUDA_VISIBLE_DEVICES}}\\\" && export MASTER_ADDR=127.0.0.1 && export MASTER_PORT=\\\$((20000 + {port})) && export NCCL_P2P_DISABLE='$VLLM_NCCL_P2P_DISABLE' && export NCCL_IB_DISABLE='$VLLM_NCCL_IB_DISABLE' && export CUDA_LAUNCH_BLOCKING='$VLLM_CUDA_LAUNCH_BLOCKING' && {python} '$PROJECT_DIR/scripts/restartable_vllm_server.py' --instance-id {instance_id} --control-dir {control_dir} --health-url {local_health_url} --initial-model {initial_model} --ready-timeout '$MAX_WAIT' -- python3 '$PROJECT_DIR/scripts/vllm_hot_reload_api_server.py' --model __MODEL_PATH__ --served-model-name {model_path} --host 0.0.0.0 --port {port} --tensor-parallel-size {tp} --max-model-len {max_model_len} --dtype bfloat16 --gpu-memory-utilization {gpu_memory_utilization} --trust-remote-code --enforce-eager $VLLM_CUSTOM_ALL_REDUCE_FLAG\""
 fi
 if [ "$GRP_MANAGE_ROLLOUT_PROCESSES" = "1" ] && [ -z "$GRP_VLLM_STOP_COMMAND_TEMPLATE" ]; then
     GRP_VLLM_STOP_COMMAND_TEMPLATE="srun --overlap --nodes=1 --ntasks=1 --nodelist={host} bash -lc \"pkill -TERM -f 'restartable_vllm_server.py.*--instance-id {instance_id}' || pkill -TERM -f 'vllm.entrypoints.openai.api_server.*--port {port}' || true\""
@@ -372,6 +373,7 @@ ROLLOUT_NODES=("${NODES[@]:$TRAIN_NODE_COUNT}")
 ROLLOUT_GPUS=$((${#ROLLOUT_NODES[@]} * GPUS_PER_NODE))
 TOTAL_GPUS=$((TRAIN_GPUS + ROLLOUT_GPUS))
 MASTER_ADDR="${TRAIN_NODES[0]}"
+export MASTER_ADDR
 RUNTIME_CONFIG="$PROJECT_DIR/configs/.r2e_gym_cmlfq_24gpu_${JOB_ID}.yaml"
 PLAN_ENV="$JOB_LOG_DIR/planned_rollout.env"
 
@@ -437,7 +439,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "[1/6] Running GlobalResourcePlanner preflight for ${TOTAL_GPUS}-GPU runtime config"
-export PROJECT_DIR MODEL_PATH MODEL_ARCH_CONFIG TOTAL_STEPS MAX_MODEL_LEN MAX_NEW_TOKENS EVAL_INTERVAL MAX_WAIT SYNC_INTERVAL RL_TRAIN_PHASE_TRACE NCCL_RELOAD_PORT
+export PROJECT_DIR MODEL_PATH MODEL_ARCH_CONFIG TOTAL_STEPS MAX_MODEL_LEN MAX_NEW_TOKENS EVAL_INTERVAL MAX_WAIT SYNC_INTERVAL ROLLOUT_SYNC_DRAIN_LEAD_STEPS RL_TRAIN_PHASE_TRACE NCCL_RELOAD_PORT
 export TRAIN_BATCH_SIZE TRAIN_MICRO_BATCH_SIZE N_SAMPLES MAX_CONCURRENT_ROLLOUTS QUEUE_SIZE VLLM_BASE_PORT GPU_MEMORY_UTILIZATION JOB_ID
 export JOB_LOG_DIR EXPERIMENT_TAG SCHEDULER_TYPE GRP_ENABLED
 export LONG_CONTEXT_TP_FIRST VLLM_READ_TIMEOUT VLLM_CONNECT_TIMEOUT VLLM_WRITE_TIMEOUT VLLM_POOL_TIMEOUT
@@ -548,6 +550,7 @@ seed = {
     "n_samples": int(os.environ["N_SAMPLES"]),
     "total_steps": int(os.environ["TOTAL_STEPS"]),
     "sync_interval": int(os.environ["SYNC_INTERVAL"]),
+    "rollout_sync_drain_lead_steps": int(os.environ["ROLLOUT_SYNC_DRAIN_LEAD_STEPS"]),
     "eval_interval": int(os.environ["EVAL_INTERVAL"]),
     "max_new_tokens": int(os.environ["MAX_NEW_TOKENS"]),
     "max_seq_length": int(os.environ["MAX_MODEL_LEN"]),
@@ -560,7 +563,7 @@ seed = {
     "weight_sync_mode": "nccl",
     "rollout_weight_sync_control_dir": str(project / "logs" / "r2e_gym_cmlfq_24gpu" / f"job_{os.environ['JOB_ID']}" / "rollout_weight_sync"),
     "rollout_weight_sync_timeout_s": int(os.environ["MAX_WAIT"]),
-    "rollout_nccl_host": os.environ.get("MASTER_ADDR", "0.0.0.0"),
+    "rollout_nccl_host": os.environ["MASTER_ADDR"],
     "rollout_nccl_port": int(os.environ.get("NCCL_RELOAD_PORT", "29620")),
     "rollout_nccl_chunk_mb": 256,
     "rollout_weight_sync_poll_interval_s": 0.05,
@@ -971,7 +974,6 @@ if [ "$RUN_NCCL_PREFLIGHT" = "1" ]; then
         --nodelist="$TRAIN_NODE_LIST_CSV" \
         --gpus-per-task=4 \
         --cpus-per-task=8 \
-        --mem=32G \
         bash -lc "
             source '$VENV_PATH'
             cd '$PROJECT_DIR'
@@ -1042,7 +1044,8 @@ start_vllm() {
                 --health-url 'http://127.0.0.1:$port/health' \
                 --initial-model '$MODEL_PATH' \
                 --ready-timeout '$MAX_WAIT' \
-                -- python3 -m vllm.entrypoints.openai.api_server \
+                -- python3 '$PROJECT_DIR/scripts/vllm_hot_reload_api_server.py' \
+                --worker-extension-cls RL_Framework.vllm_hot_reload.InplaceReloadWorkerExtension \
                 --model '__MODEL_PATH__' \
                 --served-model-name '$MODEL_PATH' \
                 --host 0.0.0.0 \

@@ -280,7 +280,7 @@ class HeterogeneousInstanceConfig:
 class SchedulingConfig:
     """Scheduling config implementation."""
 
-    scheduler_type: str = "length_aware"  # "length_aware" / "la_mlfq" / "cmlfq" / "load_balance"
+    scheduler_type: str = "length_aware"  # length_aware / la_mlfq / cmlfq / cmlfq_cost / load_balance
 
 
 
@@ -380,6 +380,12 @@ class SchedulingConfig:
     cmlfq_rebuild_interval: int = 50
 
     cmlfq_migration_profile_path: str = ""
+
+    # Opt-in scheduler_type="cmlfq_cost"; legacy cmlfq is unchanged.
+    cmlfq_cost_profile_path: str = ""
+    cmlfq_kv_backend: str = "recompute"  # recompute / nixl / cpu_offload
+    # Explicitly validated directional TP pairs, e.g. [[1, 4], [4, 1]].
+    cmlfq_kv_transfer_tp_pairs: list = field(default_factory=list)
 
     cmlfq_tree_path: str = ""
 
@@ -502,7 +508,11 @@ class GlobalResourcePlannerConfig:
     rollout_node_tp_pattern: list[int] = field(default_factory=list)
     require_heterogeneous_rollout_tp: bool = False
     allowed_train_tp: list[int] = field(default_factory=list)
+    allowed_train_ep: list[int] = field(default_factory=list)
     allowed_train_pp: list[int] = field(default_factory=list)
+    train_comm_compute_ratio_threshold: float = float("inf")
+    train_ep_comm_compute_ratio_threshold: float = float("inf")
+    train_pipeline_bubble_ratio_threshold: float = 0.30
     fixed_train_gpus: int = 0
     # Startup placement is a GRP decision.  ``fixed_train_gpus`` is retained
     # only for backwards-compatible, explicitly configured deployments and is
@@ -533,6 +543,8 @@ class GlobalResourcePlannerConfig:
     memory_budget_logits_dtype_bytes: int = 4
     memory_budget_workspace_factor: float = 1.5
     apply_to_runtime: bool = True
+    runtime_forced_train_gpus: int = 0
+    runtime_forced_rollout_tp_list: list[int] = field(default_factory=list)
     verbose: bool = False
     runtime_length_profile_enabled: bool = True
     runtime_length_profile_jsonl: str = ""
@@ -589,6 +601,7 @@ class GlobalResourcePlannerConfig:
     runtime_use_nccl_barrier_before_weight_sync: bool = False
     runtime_coordinate_reconfiguration_ranks: bool = True
     runtime_coordinate_batch_source_only: bool = True
+    # Session/boundary decision timeout; expiry is a protocol error, not a no-op.
     runtime_peer_request_wait_s: float = 45.0
     vllm_launch_command_template: str = ""
     vllm_stop_command_template: str = ""
@@ -685,6 +698,7 @@ class AsyncRLConfig:
     queue_size: int = 256
     enable_rollout_tracing: bool = False
     sync_interval: int = 1
+    rollout_sync_drain_lead_steps: int = 2
 
 
     recompute_logprobs: bool = True

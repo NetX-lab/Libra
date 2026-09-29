@@ -41,6 +41,7 @@ class InstanceConfig:
 class TrainParallelConfig:
     """Train parallel config implementation."""
     tp: int = 1
+    ep: int = 1
     pp: int = 1
     dp: int = 1
     b_micro: int = 4       # micro batch size
@@ -49,7 +50,7 @@ class TrainParallelConfig:
 
     @property
     def n_gpus(self) -> int:
-        return self.tp * self.pp * self.cp * self.dp
+        return self.tp * self.ep * self.pp * self.cp * self.dp
 
 
 @dataclass
@@ -271,10 +272,27 @@ class RolloutCostModel:
             return 0.0
 
 
-        avg_prompt = float(np.mean([r.prompt_length for r in requests]))
-        avg_gen = float(np.mean([r.gen_length for r in requests]))
         total_prompt_tokens = sum(r.prompt_length for r in requests)
         total_gen_tokens = sum(r.gen_length for r in requests)
+        return self.compute_instance_makespan_from_totals(
+            num_requests=len(requests),
+            total_prompt_tokens=total_prompt_tokens,
+            total_gen_tokens=total_gen_tokens,
+            tp=tp,
+        )
+
+    def compute_instance_makespan_from_totals(
+        self,
+        *,
+        num_requests: int,
+        total_prompt_tokens: int,
+        total_gen_tokens: int,
+        tp: int,
+    ) -> float:
+        if num_requests <= 0:
+            return 0.0
+        avg_prompt = total_prompt_tokens / num_requests
+        avg_gen = total_gen_tokens / num_requests
 
 
         b_bar = self.compute_steady_state_batch(tp, avg_prompt, avg_gen)
@@ -397,6 +415,9 @@ class TrainingCostModel:
         recompute_logits_dtype_bytes: int = 4,
         recompute_workspace_factor: float = 1.5,
         memory_safety_margin_bytes: float = 0.0,
+        is_moe: bool = False,
+        num_experts: int = 1,
+        num_activated_experts: int = 1,
     ):
         self.P = num_params
         self.P_active = effective_num_params or num_params
@@ -437,6 +458,9 @@ class TrainingCostModel:
         self.recompute_logits_dtype_bytes = max(1, int(recompute_logits_dtype_bytes))
         self.recompute_workspace_factor = max(1.0, float(recompute_workspace_factor))
         self.memory_safety_margin_bytes = max(0.0, float(memory_safety_margin_bytes))
+        self.is_moe = bool(is_moe)
+        self.num_experts = max(1, int(num_experts))
+        self.num_activated_experts = max(1, int(num_activated_experts))
 
 
 
@@ -444,14 +468,17 @@ class TrainingCostModel:
         self, config: TrainParallelConfig, b_micro: int, L: int,
     ) -> float:
         """Estimate memory per gpu."""
-        tp, pp, dp = config.tp, config.pp, config.dp
+        tp, ep, pp, dp = config.tp, config.ep, config.pp, config.dp
         P = self.P
 
         if config.zero_level >= 2:
-            shard = max(tp * pp * dp, 1)
-            tp_pp = max(tp * pp, 1)
+            shard = max(tp * ep * pp * dp, 1)
+            tp_pp = max(tp * ep * pp, 1)
             m_weight = 2.0 * P / shard
-            m_opt = 2.0 * P / shard
+            # Adam keeps FP32 master weights plus two FP32 moments. ZeRO/FSDP
+            # shards those 12 bytes/parameter; counting only a BF16-sized state
+            # materially underestimates the planner's feasibility boundary.
+            m_opt = 12.0 * P / shard
             m_grad = 2.0 * P / shard
             # FSDP all-gathers full layer shards during compute and PyTorch
             # keeps allocator/cache headroom around optimizer.step().
@@ -459,10 +486,10 @@ class TrainingCostModel:
             if P >= 20.0e9:
                 m_fsdp_transient += 12.0e9
         else:
-            tp_pp = max(tp * pp, 1)
+            tp_pp = max(tp * ep * pp, 1)
             m_weight = 2.0 * P / tp_pp
             if config.zero_level >= 1:
-                m_opt = 12.0 * P / max(tp * pp * dp, 1)
+                m_opt = 12.0 * P / max(tp * ep * pp * dp, 1)
             else:
                 m_opt = 12.0 * P / tp_pp
             m_grad = 2.0 * P / tp_pp
@@ -520,21 +547,37 @@ class TrainingCostModel:
 
     def compute_dp_comm(self, config: TrainParallelConfig) -> float:
         """Compute dp comm."""
-        if config.dp <= 1:
+        data_parallel_degree = config.ep * config.dp
+        if data_parallel_degree <= 1:
             return 0.0
 
-        grad_per_rank = 2.0 * self.P / (config.tp * config.pp)
+        grad_per_rank = 2.0 * self.P / (config.tp * config.ep * config.pp)
         s_grad_chunk = grad_per_rank
 
 
-        tp_pp_per_node = config.tp * config.pp
+        tp_pp_per_node = config.tp * config.ep * config.pp
         if tp_pp_per_node <= self.gpus_per_node:
 
             bw = self.bw_inter
         else:
             bw = self.bw_intra
 
-        return (config.dp - 1) / config.dp * s_grad_chunk / bw
+        return (
+            (data_parallel_degree - 1)
+            / data_parallel_degree
+            * s_grad_chunk
+            / bw
+        )
+
+    def compute_ep_comm(self, config: TrainParallelConfig, L: int) -> float:
+        """Approximate one MoE dispatch/combine All-to-All for a micro-batch."""
+        if not self.is_moe or config.ep <= 1:
+            return 0.0
+        token_bytes = config.b_micro * max(1, L) * self.d_model * self.dtype_bytes
+        active_fraction = min(1.0, self.num_activated_experts / self.num_experts)
+        volume = 2.0 * (config.ep - 1) / config.ep * token_bytes
+        bandwidth = self.bw_intra if config.tp * config.ep <= self.gpus_per_node else self.bw_inter
+        return volume * max(active_fraction, 1.0 / config.ep) / bandwidth
 
 
 
@@ -588,7 +631,8 @@ class TrainingCostModel:
 
         t_tp_per_layer = self.compute_tp_comm(tp, b_micro, L)
 
-        t_per_layer = t_attn_actual + t_mlp_actual + t_tp_per_layer
+        t_ep_per_layer = self.compute_ep_comm(config, L)
+        t_per_layer = t_attn_actual + t_mlp_actual + t_tp_per_layer + t_ep_per_layer
         return layers_per_pp * t_per_layer
 
     def compute_stage_bwd_time(self, L: int, config: TrainParallelConfig) -> float:
@@ -620,7 +664,14 @@ class TrainingCostModel:
 
         t_tp_per_layer = self.compute_tp_comm(tp, b_micro, L)
 
-        t_per_layer = t_attn_recomp_actual + t_attn_bwd_actual + t_mlp_bwd_actual + t_tp_per_layer
+        t_ep_per_layer = self.compute_ep_comm(config, L)
+        t_per_layer = (
+            t_attn_recomp_actual
+            + t_attn_bwd_actual
+            + t_mlp_bwd_actual
+            + t_tp_per_layer
+            + t_ep_per_layer
+        )
         return layers_per_pp * t_per_layer
 
 
@@ -638,31 +689,139 @@ class TrainingCostModel:
         t_cooldown = (pp - 1) * T_bwd
         return t_warmup + t_steady + t_cooldown
 
+    @staticmethod
+    def _representative_lengths(lengths: int | list[int], count: int) -> list[int]:
+        if isinstance(lengths, (int, float)):
+            return [max(1, int(lengths))] * max(1, count)
+        clean = [max(1, int(value)) for value in lengths]
+        if not clean:
+            return [1024] * max(1, count)
+        if len(clean) == count:
+            return clean
+        # Deterministic quantile sampling preserves the observed distribution
+        # without making planner output depend on random state.
+        ordered = sorted(clean)
+        if count == 1:
+            return [ordered[len(ordered) // 2]]
+        return [
+            ordered[round(index * (len(ordered) - 1) / (count - 1))]
+            for index in range(count)
+        ]
+
+    @staticmethod
+    def _one_f_one_b_order(stage: int, pp: int, n_micro: int) -> list[tuple[str, int]]:
+        warmup = min(max(pp - stage - 1, 0), n_micro)
+        order: list[tuple[str, int]] = [("f", micro) for micro in range(warmup)]
+        remaining = n_micro - warmup
+        for offset in range(remaining):
+            order.append(("f", warmup + offset))
+            order.append(("b", offset))
+        order.extend(("b", micro) for micro in range(remaining, n_micro))
+        return order
+
+    def _simulate_variable_1f1b(
+        self,
+        config: TrainParallelConfig,
+        micro_lengths: list[int],
+    ) -> tuple[float, dict]:
+        """Schedule non-uniform micro-batches on an explicit 1F1B DAG."""
+        pp = max(1, config.pp)
+        n_micro = len(micro_lengths)
+        orders = [self._one_f_one_b_order(stage, pp, n_micro) for stage in range(pp)]
+        cursor = [0] * pp
+        available = [0.0] * pp
+        finish: dict[tuple[str, int, int], float] = {}
+        stage_busy = [0.0] * pp
+        pipeline_comm = 0.0
+
+        while sum(cursor) < sum(len(order) for order in orders):
+            progressed = False
+            for stage in range(pp):
+                if cursor[stage] >= len(orders[stage]):
+                    continue
+                kind, micro = orders[stage][cursor[stage]]
+                deps: list[tuple[str, int, int]] = []
+                if kind == "f" and stage > 0:
+                    deps.append(("f", stage - 1, micro))
+                if kind == "b":
+                    deps.append(("f", stage, micro))
+                    if stage < pp - 1:
+                        deps.append(("b", stage + 1, micro))
+                if any(dep not in finish for dep in deps):
+                    continue
+
+                length = micro_lengths[micro]
+                duration = (
+                    self.compute_stage_fwd_time(length, config)
+                    if kind == "f"
+                    else self.compute_stage_bwd_time(length, config)
+                )
+                dependency_ready = []
+                for dep in deps:
+                    ready = finish[dep]
+                    if dep[1] != stage:
+                        comm = self.compute_pp_comm(config, length)
+                        ready += comm
+                        pipeline_comm += comm
+                    dependency_ready.append(ready)
+                start = max([available[stage], *dependency_ready])
+                end = start + duration
+                finish[(kind, stage, micro)] = end
+                available[stage] = end
+                stage_busy[stage] += duration
+                cursor[stage] += 1
+                progressed = True
+            if not progressed:
+                raise RuntimeError("invalid 1F1B dependency graph")
+
+        makespan = max(available, default=0.0)
+        idle = [max(0.0, makespan - busy) for busy in stage_busy]
+        return makespan, {
+            "micro_lengths": list(micro_lengths),
+            "stage_busy_times": stage_busy,
+            "stage_idle_times": idle,
+            "dynamic_micro_bubble_s": max(idle, default=0.0),
+            "pipeline_comm_s": pipeline_comm,
+        }
+
 
 
     def compute_iteration_time(
-        self, config: TrainParallelConfig, B_global: int, L: int,
+        self,
+        config: TrainParallelConfig,
+        B_global: int,
+        L: int | list[int],
     ) -> tuple[float, dict]:
         """Compute iteration time."""
-        tp, pp, dp = config.tp, config.pp, config.dp
+        tp, ep, pp, dp = config.tp, config.ep, config.pp, config.dp
+        data_parallel_degree = ep * dp
         b_micro = config.b_micro
 
-
-
-        b_per_dp = max(1, B_global // dp)
+        representative = self._representative_lengths(L, max(1, B_global))
+        b_per_dp = max(1, B_global // data_parallel_degree)
         n_micro = max(1, b_per_dp // b_micro)
+        replica_times: list[float] = []
+        replica_details: list[dict] = []
+        for replica in range(data_parallel_degree):
+            samples = representative[replica * b_per_dp : (replica + 1) * b_per_dp]
+            if not samples:
+                samples = representative
+            micro_lengths = [
+                max(samples[start : start + b_micro])
+                for start in range(0, len(samples), b_micro)
+            ][:n_micro]
+            while len(micro_lengths) < n_micro:
+                micro_lengths.append(micro_lengths[-1])
+            replica_time, dynamic = self._simulate_variable_1f1b(config, micro_lengths)
+            replica_times.append(replica_time)
+            replica_details.append(dynamic)
+        t_pipeline = max(replica_times)
 
 
-        t_fwd = self.compute_stage_fwd_time(L, config)
-        t_bwd = self.compute_stage_bwd_time(L, config)
-
-
-        t_pipeline = self.compute_pipeline_time(t_fwd, t_bwd, n_micro, pp)
-
-
-        t_pp = self.compute_pp_comm(config, L)
-
-        t_pp_total = (pp - 1) * t_pp if pp > 1 else 0.0
+        t_pp_total = max(
+            (schedule["pipeline_comm_s"] for schedule in replica_details),
+            default=0.0,
+        )
 
 
         t_dp = self.compute_dp_comm(config)
@@ -671,11 +830,9 @@ class TrainingCostModel:
         t_dp_exposed = t_dp * (1.0 - overlap_factor)
 
 
-        t_iter = t_pipeline + t_pp_total + t_dp_exposed
+        t_iter = t_pipeline + t_dp_exposed
 
         details = {
-            "t_fwd_per_micro": t_fwd,
-            "t_bwd_per_micro": t_bwd,
             "t_pipeline": t_pipeline,
             "t_pp_comm": t_pp_total,
             "t_dp_comm": t_dp,
@@ -683,6 +840,9 @@ class TrainingCostModel:
             "n_micro": n_micro,
             "b_per_dp": b_per_dp,
             "layers_per_pp": self.n_layers // max(pp, 1),
+            "ep": ep,
+            "replica_pipeline_times": replica_times,
+            "replica_schedules": replica_details,
         }
         return t_iter, details
 
@@ -769,6 +929,9 @@ class CostModel:
             recompute_logits_dtype_bytes=recompute_logits_dtype_bytes,
             recompute_workspace_factor=recompute_workspace_factor,
             memory_safety_margin_bytes=memory_safety_margin_bytes,
+            is_moe=ma.is_moe,
+            num_experts=ma.num_experts,
+            num_activated_experts=ma.num_activated_experts,
         )
 
         self.hw = hw
@@ -783,11 +946,65 @@ class CostModel:
         """Evaluate rollout."""
         return self.rollout_model.evaluate_cluster(cluster, requests)
 
+    def evaluate_rollout_instance(
+        self,
+        tp: int,
+        requests: list[RequestInfo],
+    ) -> tuple[float, dict]:
+        """Cost(tp, a, b) interface used by the rollout dynamic program."""
+        if not requests:
+            return 0.0, {"tp": int(tp), "num_requests": 0}
+        max_seq = max(request.total_length for request in requests)
+        if self.rollout_model.check_oom(max_seq, int(tp)):
+            return float("inf"), {
+                "oom": True,
+                "tp": int(tp),
+                "max_seq": max_seq,
+                "token_capacity": self.rollout_model.compute_token_capacity(int(tp)),
+            }
+        seconds = self.rollout_model.compute_instance_makespan(requests, int(tp))
+        return seconds, {
+            "tp": int(tp),
+            "num_requests": len(requests),
+            "max_seq": max_seq,
+        }
+
+    def evaluate_rollout_segment(
+        self,
+        tp: int,
+        *,
+        num_requests: int,
+        total_prompt_tokens: int,
+        total_gen_tokens: int,
+        max_seq: int,
+    ) -> tuple[float, dict]:
+        """O(1) analytic Cost(tp, a, b) from prefix-sum aggregates."""
+        if num_requests <= 0:
+            return 0.0, {"tp": int(tp), "num_requests": 0}
+        if self.rollout_model.check_oom(max_seq, int(tp)):
+            return float("inf"), {
+                "oom": True,
+                "tp": int(tp),
+                "max_seq": int(max_seq),
+                "token_capacity": self.rollout_model.compute_token_capacity(int(tp)),
+            }
+        seconds = self.rollout_model.compute_instance_makespan_from_totals(
+            num_requests=num_requests,
+            total_prompt_tokens=total_prompt_tokens,
+            total_gen_tokens=total_gen_tokens,
+            tp=int(tp),
+        )
+        return seconds, {
+            "tp": int(tp),
+            "num_requests": int(num_requests),
+            "max_seq": int(max_seq),
+        }
+
     def evaluate_training(
         self,
         config: TrainParallelConfig,
         B_global: int,
-        L: int,
+        L: int | list[int],
     ) -> tuple[float, dict]:
         """Evaluate training."""
         return self.training_model.compute_iteration_time(config, B_global, L)
@@ -850,7 +1067,7 @@ class CostModel:
         result.details["t_train"] = result.t_train
         result.details["t_rollout"] = result.t_rollout
         result.details["train_config"] = {
-            "tp": train_config.tp, "pp": train_config.pp,
+            "tp": train_config.tp, "ep": train_config.ep, "pp": train_config.pp,
             "dp": train_config.dp, "b_micro": train_config.b_micro,
         }
         result.details["rollout_config"] = rollout_cluster.tp_list

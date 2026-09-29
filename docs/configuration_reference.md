@@ -57,6 +57,10 @@ phase names allow the same converter to compare baseline runs.
 | `initial_allocation_strategy` | `grp` runs planning before launch; `configured` preserves an explicitly pinned legacy split |
 | `allocation_granularity_gpus` | Initial train/rollout split granularity (normally one node or one DP replica) |
 | `min_train_gpus` / `min_rollout_gpus` | Minimum viable capacity retained for each stage during startup planning |
+| `allowed_train_tp` / `allowed_train_ep` / `allowed_train_pp` | Candidate training parallel degrees; EP is used only for MoE models and must divide the expert count |
+| `train_comm_compute_ratio_threshold` | Prune TP branches whose estimated communication/compute ratio exceeds this value |
+| `train_ep_comm_compute_ratio_threshold` | Prune EP branches whose estimated All-to-All/compute ratio exceeds this value |
+| `train_pipeline_bubble_ratio_threshold` | Prune PP branches whose analytical bubble ratio exceeds this value |
 | `runtime_online_replanning` | Use online metrics in planner decisions |
 | `runtime_manage_rollout_processes` | Let Libra start, stop, and adopt rollout processes |
 | `runtime_rollout_reconfigure_strategy` | `diff`, `restart_all`, `blue_green`, `prewarm`, or `cluster_swap` |
@@ -64,7 +68,7 @@ phase names allow the same converter to compare baseline runs.
 | `runtime_reconfigure_training` | Enable training-side pool changes |
 | `runtime_training_pool_plan_only` | Record training-pool changes without attaching workers |
 | `decouple_communication_domains` | Keep elastic gradient traffic off the core training DP process group |
-| `elastic_hybrid_replica_size_gpus` | Physical ranks in one complete TP×PP×CP DP replica; zero derives it from training topology |
+| `elastic_hybrid_replica_size_gpus` | Physical ranks in one complete TP×EP×PP×CP planner replica; zero derives it from training topology |
 | `elastic_hybrid_min_rollout_gpus` | Rollout capacity that EHP may never borrow |
 | `elastic_hybrid_max_workers` | Deprecated and ignored; EHP has no policy maximum |
 | `runtime_batch_collection_timeout_s` | Timeout for collecting a training batch |

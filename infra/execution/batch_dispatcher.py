@@ -147,6 +147,16 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
 
                 with self._reconfigure_lock:
+                    # pause() can race the small window between dequeue and
+                    # submit. Recheck under the same lock used by
+                    # cancel_queued() so an unsent request never crosses the
+                    # weight-sync boundary.
+                    if self.runner.paused.is_set():
+                        self.staleness_manager.on_rollouts_cancelled(enqueued=1)
+                        with self._result_cv:
+                            self._active_task_ids.discard(task_input.task_id)
+                            self._result_cv.notify_all()
+                        continue
                     task_fn = self.task_factory(task_input)
 
                     try:
@@ -372,6 +382,31 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         if not self.is_paused():
             raise RuntimeError("pause() must be called before wait_until_idle()")
         self.runner.wait_until_idle(timeout=timeout)
+
+    def cancel_queued(self) -> dict[str, Any]:
+        """Discard rollout work that has not started executing on vLLM."""
+        if not self.is_paused():
+            raise RuntimeError("pause() must be called before cancel_queued()")
+        with self._reconfigure_lock:
+            with self._input_cv:
+                dispatcher_ids = [item.task_id for item in self._pending_inputs]
+                self._pending_inputs.clear()
+                self._input_cv.notify_all()
+            runner_ids = self.runner.cancel_queued()
+            cancelled_ids = sorted(set(dispatcher_ids + runner_ids))
+            with self._result_cv:
+                for task_id in cancelled_ids:
+                    self._active_task_ids.discard(task_id)
+                self._result_cv.notify_all()
+            self.staleness_manager.on_rollouts_cancelled(
+                enqueued=len(dispatcher_ids),
+                running=len(runner_ids),
+            )
+        return {
+            "dispatcher_queue": len(dispatcher_ids),
+            "runner_queue": len(runner_ids),
+            "task_ids": cancelled_ids,
+        }
 
     def reset_after_reconfigure(self) -> None:
         """Drop dispatcher-side state that belongs to the old rollout pool."""

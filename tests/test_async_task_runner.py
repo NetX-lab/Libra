@@ -1,4 +1,5 @@
 import asyncio
+import threading
 
 from RL_Framework.infra.execution.async_runner import AsyncTaskRunner
 
@@ -55,11 +56,22 @@ def test_reset_runtime_state_cancels_old_tasks_and_accepts_new_work():
 
 
 def test_pause_drains_already_accepted_tasks():
+    started = threading.Event()
+    release = threading.Event()
+
+    async def active_task():
+        started.set()
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+        return "done"
+
     runner = AsyncTaskRunner()
     runner.initialize()
     try:
-        runner.submit(_return_value, "done", task_id=3)
+        runner.submit(active_task, task_id=3)
+        assert started.wait(1.0)
         runner.pause()
+        release.set()
 
         runner.wait_until_idle(timeout=2.0)
         result = runner.wait(count=1, timeout=2.0)[0]
@@ -82,5 +94,28 @@ def test_wait_until_idle_times_out_for_running_task():
             assert "draining rollout tasks" in str(exc)
         else:
             raise AssertionError("wait_until_idle should time out")
+    finally:
+        runner.destroy()
+
+
+def test_cancel_queued_tasks_never_starts_them_after_pause():
+    started = threading.Event()
+
+    async def mark_started():
+        started.set()
+        return "unexpected"
+
+    runner = AsyncTaskRunner()
+    runner.initialize()
+    try:
+        runner.pause()
+        runner.submit(mark_started, task_id=10)
+
+        cancelled = runner.cancel_queued()
+
+        assert cancelled == [10]
+        assert not started.wait(0.1)
+        assert runner.get_queue_sizes() == (0, 0)
+        runner.wait_until_idle(timeout=1.0)
     finally:
         runner.destroy()
