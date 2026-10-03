@@ -7,9 +7,11 @@ from collections import defaultdict
 from typing import Any, Optional
 
 from RL_Framework.infra.scheduling.base import (
+    DEFAULT_LOAD_METRIC,
     BaseScheduler,
     InstanceHandle,
     LoadBalanceStrategy,
+    MetricsFeedbackConfig,
     SchedulingResult,
 )
 
@@ -24,8 +26,20 @@ class LoadBalanceScheduler(BaseScheduler):
         load_balance_strategy: str = "least_connections",
         max_queue_length: int = 100,
         weights: dict[int, float] | None = None,
+        load_metric: str = DEFAULT_LOAD_METRIC,
+        kv_capacity_tokens_by_tp: dict[int, int] | None = None,
+        feedback: MetricsFeedbackConfig | None = None,
+        prefix_affinity: bool = False,
+        prefix_affinity_max_entries: int = 8192,
     ):
-        super().__init__(name="LoadBalance")
+        super().__init__(
+            name="LoadBalance",
+            load_metric=load_metric,
+            kv_capacity_tokens_by_tp=kv_capacity_tokens_by_tp,
+            feedback=feedback,
+            prefix_affinity=prefix_affinity,
+            prefix_affinity_max_entries=prefix_affinity_max_entries,
+        )
 
         if load_balance_strategy == "round_robin":
             self._strategy = LoadBalanceStrategy.ROUND_ROBIN
@@ -53,15 +67,17 @@ class LoadBalanceScheduler(BaseScheduler):
         prompt_id: str = "",
         n_samples: int = 1,
         epoch: int = -1,
+        max_new_tokens: int = 0,
     ) -> SchedulingResult:
         """Schedule."""
         with self._lock:
             self._stats.total_requests += 1
 
 
+            ready = self._selectable([h for h in self._instances if h.is_ready])
             candidates = [
-                h for h in self._instances
-                if h.is_ready and (
+                h for h in ready
+                if (
                     self._max_queue_length <= 0
                     or h.active_requests < self._max_queue_length
                 )
@@ -69,7 +85,7 @@ class LoadBalanceScheduler(BaseScheduler):
 
             if not candidates:
 
-                candidates = [h for h in self._instances if h.is_ready]
+                candidates = ready
 
             if not candidates:
                 self._stats.failed_routes += 1
@@ -83,17 +99,26 @@ class LoadBalanceScheduler(BaseScheduler):
                 )
 
 
-            selected = self._select(candidates)
+            selected = self._affinity_pick(prompt_id, candidates)
+            if selected is not None:
+                self._stats.category_counts["any"] += 1
+                self._stats.category_tp_counts["any"][selected.tp_degree] += 1
+                reason = "prefix_affinity"
+            else:
+                selected = self._select(candidates)
+                self._stats.category_counts["any"] += 1
+                self._stats.category_tp_counts["any"][selected.tp_degree] += 1
+                reason = ""
             self._stats.preferred_routes += 1
-            self._stats.category_counts["any"] += 1
-            self._stats.category_tp_counts["any"][selected.tp_degree] += 1
-            selected.inc_active()
+            reserved = self._record_route(selected, input_tokens, category="any", prompt_id=prompt_id, max_new_tokens=max_new_tokens)
 
             return SchedulingResult(
                 instance_index=selected.index,
+                reserved_tokens=reserved,
                 tp_degree=selected.tp_degree,
                 category="any",
                 is_fallback=False,
+                reason=reason,
                 prompt_id=prompt_id,
             )
 
@@ -108,33 +133,11 @@ class LoadBalanceScheduler(BaseScheduler):
 
             def weighted_load(h: InstanceHandle) -> float:
                 w = self._weights.get(h.tp_degree, 1.0)
-                return h.active_requests / max(w, 0.01)
+                return self.load_of(h) / max(w, 0.01)
             return min(candidates, key=weighted_load)
 
         else:
-            min_active = min(h.active_requests for h in candidates)
-            least_loaded = [
-                h for h in candidates if h.active_requests == min_active
-            ]
-            # A plain ``min`` always picks the first registered endpoint when
-            # requests complete between scheduling calls.  That starves later
-            # endpoints (and can leave an entire rollout node idle) for
-            # low-concurrency, multi-turn workloads such as R2E-Gym.  Rotate
-            # among equal-load endpoints while preserving least-connections
-            # as the primary selection criterion.
-            least_loaded_ids = {id(h) for h in least_loaded}
-            start = self._rr_counter % len(self._instances)
-            for offset in range(len(self._instances)):
-                position = (start + offset) % len(self._instances)
-                handle = self._instances[position]
-                if id(handle) in least_loaded_ids:
-                    # Store the position after the selected handle.  Unlike
-                    # taking counter modulo the changing tie-set size, this
-                    # cannot permanently skip endpoints when active requests
-                    # enter and leave the candidate set.
-                    self._rr_counter = (position + 1) % len(self._instances)
-                    return handle
-            raise RuntimeError("least-connections tie set is inconsistent")
+            return self._min_load_rotating(candidates)
 
     def on_request_done(
         self,
@@ -142,12 +145,16 @@ class LoadBalanceScheduler(BaseScheduler):
         prompt_id: str = "",
         final_bucket: str = "",
         output_tokens: int = 0,
+        reserved_tokens: int | None = None,
     ):
         """On request done."""
-        handle = self.get_instance_handle(instance_index)
-        if handle:
-            with self._lock:
-                handle.dec_active()
+        with self._lock:
+            self._complete_route(
+                instance_index,
+                output_tokens=output_tokens,
+                category=final_bucket or "any",
+                reserved_tokens=reserved_tokens,
+            )
 
     # ----------------------------------------------------------------
 
@@ -160,4 +167,11 @@ class LoadBalanceScheduler(BaseScheduler):
         return cls(
             load_balance_strategy=sched.load_balance_strategy,
             max_queue_length=sched.max_queue_length,
+            load_metric=getattr(sched, "load_metric", DEFAULT_LOAD_METRIC),
+            kv_capacity_tokens_by_tp=getattr(sched, "kv_capacity_tokens_by_tp", None),
+            feedback=MetricsFeedbackConfig.from_scheduling(sched),
+            prefix_affinity=bool(getattr(sched, "prefix_affinity", False)),
+            prefix_affinity_max_entries=int(
+                getattr(sched, "prefix_affinity_max_entries", 8192)
+            ),
         )

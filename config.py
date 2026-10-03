@@ -301,6 +301,56 @@ class SchedulingConfig:
 
     max_queue_length: int = 100
 
+    # Load metric for least-connections style selection: "requests" (legacy
+    # request-count based), "tokens" (estimated in-flight token load,
+    # prompt + EMA-expected output), or "kv_tokens" (the same token load
+    # normalized by each TP bucket's estimated KV-cache capacity in tokens).
+    # Applies to load_balance / length_aware / la_mlfq schedulers; cmlfq
+    # keeps its own workload-aware routing.
+    load_metric: str = "requests"
+
+    # Explicit KV capacity override (tokens) per TP degree, e.g. {1: 120000,
+    # 2: 230000, 4: 450000}. When empty and load_metric is "kv_tokens",
+    # capacities are auto-estimated at config-load time from the hardware /
+    # model-arch configs and the rollout gpu_memory_utilization.
+    kv_capacity_tokens_by_tp: dict = field(default_factory=dict)
+
+    # Per-GPU bytes reserved for activations / workspace / fragmentation when
+    # auto-estimating KV capacity.
+    kv_activation_reserve_gib: float = 4.0
+
+    # Closed-loop /metrics feedback (engine-layer poller feeding the
+    # schedulers). Disabled by default; when enabled, observed vLLM gauges
+    # (running/waiting, gpu cache occupancy, preemptions) drive an additive
+    # bias correction of the local load estimate plus occupancy admission
+    # with hysteresis. Preemption counters are cumulative: events penalize
+    # an instance for the TTL window instead of blacklisting forever.
+    enable_metrics_feedback: bool = False
+    metrics_poll_interval_s: float = 3.0
+    metrics_request_timeout_s: float = 1.0
+    metrics_staleness_ttl_s: float = 10.0
+    metrics_admission_enter: float = 0.90
+    metrics_admission_exit: float = 0.75
+    metrics_preemption_penalty_ttl_s: float = 60.0
+    metrics_bias_alpha: float = 0.3
+
+    # Cross-rank load aggregation: every training rank publishes its
+    # per-instance in-flight accounting to this shared directory (atomic
+    # renames + heartbeat TTL); schedulers rank instances by the summed
+    # cluster load instead of their own partial view. Empty disables.
+    shared_load_dir: str = ""
+    shared_load_ttl_s: float = 30.0
+    shared_load_heartbeat_s: float = 10.0
+    shared_load_cache_ttl_s: float = 1.0
+
+    # Prefix affinity: bind prompt_id -> instance (bounded LRU) so repeated
+    # prompts (n_samples, multi-turn replays, shared system prompts) land
+    # on the instance whose prefix cache already holds them. Affinity only
+    # reorders preference among candidates that survived readiness / queue /
+    # capacity / admission filters; it never overrides them.
+    prefix_affinity: bool = False
+    prefix_affinity_max_entries: int = 8192
+
     enable_fallback: bool = True
 
     adaptive_routing: bool = True
@@ -949,6 +999,57 @@ class AsyncRLConfig:
                     self.master_addr = "localhost"
             else:
                 self.master_addr = "localhost"
+
+
+        self._maybe_estimate_kv_capacities()
+
+
+    def _maybe_estimate_kv_capacities(self) -> None:
+        """Auto-fill scheduling.kv_capacity_tokens_by_tp when needed.
+
+        Only runs for heterogeneous rollouts using the capacity-normalized
+        ``kv_tokens`` load metric without an explicit capacity table. The
+        estimate follows vLLM's budget rule: per GPU, the utilization
+        fraction of HBM minus sharded weights and an activation reserve,
+        divided by the per-token KV bytes of the bucket's TP layout.
+        """
+        sched = self.heterogeneous_rollout.scheduling
+        if not self.heterogeneous_rollout.enabled:
+            return
+        if getattr(sched, "load_metric", "") != "kv_tokens":
+            return
+        if sched.kv_capacity_tokens_by_tp:
+            return
+
+        from RL_Framework.infra.scheduling.base import estimate_kv_capacity_tokens
+
+        arch = self.model_arch
+        weights_bytes = float(arch.num_params) * max(1, int(arch.dtype_bytes))
+        reserve = max(0.0, float(sched.kv_activation_reserve_gib)) * 1024**3
+        tp_degrees = sorted({int(i.tp) for i in self.heterogeneous_rollout.instances if int(i.tp) > 0})
+        if not tp_degrees:
+            return
+
+        capacities: dict[int, int] = {}
+        for tp in tp_degrees:
+            capacity = estimate_kv_capacity_tokens(
+                tp_degree=tp,
+                mem_capacity_bytes=self.hardware.mem_capacity,
+                gpu_memory_utilization=self.heterogeneous_rollout.gpu_memory_utilization,
+                weights_bytes=weights_bytes,
+                n_layers=arch.n_layers,
+                n_kv_heads=arch.n_kv_heads,
+                n_heads=arch.n_heads,
+                d_model=arch.d_model,
+                head_dim=arch.head_dim,
+                dtype_bytes=arch.dtype_bytes,
+                activation_reserve_bytes=reserve,
+            )
+            if capacity > 0:
+                capacities[tp] = capacity
+
+        if capacities:
+            sched.kv_capacity_tokens_by_tp = capacities
 
     # ----------------------------------------------------------------
 

@@ -2571,7 +2571,25 @@ class AsyncRLTrainer:
                     "[RuntimeElasticExecutor] warning: failed to close old "
                     f"rollout clients during rebind: {exc}"
                 )
-            self.rollout_engine = HeterogeneousRolloutEngine.from_config(self.config)
+            # Stop the old engine's /metrics poller thread so rebinding
+            # every sync step does not leak one poller per step.
+            stop_poller = getattr(old_engine, "_stop_metrics_poller", None)
+            if callable(stop_poller):
+                stop_poller()
+            # Same for the old cross-rank shared load state: two writers
+            # with the same writer_id would overwrite each other's files.
+            close_shared = getattr(old_engine, "_close_shared_state", None)
+            if callable(close_shared):
+                close_shared()
+            # Preserve learned scheduler state (output-length EMA, history
+            # tables) across the rebind: weight sync rebuilds the engine
+            # every sync step and an unconditional reset would zero the
+            # EMA back to its prior each time.
+            old_scheduler = getattr(old_engine, "scheduler", None)
+            self.rollout_engine = HeterogeneousRolloutEngine.from_config(
+                self.config,
+                carry_scheduler_state_from=old_scheduler,
+            )
         else:
             self.rollout_engine.reconfigure_from_plan(None, self.config)
         if hasattr(self.rollout_engine, "wait_for_ready"):

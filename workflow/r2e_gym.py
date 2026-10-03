@@ -208,11 +208,14 @@ class R2EGymWorkflow:
                     reserve_feedback_tokens=128 if turn < self.max_turns - 1 else 0,
                 )
                 generate_kwargs = {
+                    "prompt_id": prompt_id,
                     "prompt": generation_prompt,
                     "max_new_tokens": max_tokens_this_turn,
                     "temperature": self.temperature,
                     "top_p": self.top_p,
                     "n": 1,
+                    # Exact count from the fitter; skips engine estimation.
+                    "input_tokens": generation_prompt_tokens,
                     # Issue generation has an explicit closing delimiter.
                     "stop": [] if self.patch_harness else ["[/ISSUE]"],
                     "include_stop_str_in_output": True,
@@ -281,7 +284,10 @@ class R2EGymWorkflow:
                     route_tool_return(cmlfq_request_id, tool_event, generated_tokens)
 
                 current_text += output_text + "\n" + feedback + "\n"
-        except Exception:
+        except BaseException:
+            # BaseException: CancelledError (task cancellation) must also
+            # release the C-MLFQ request state, otherwise the leaked entry
+            # wedges wait_until_idle until timeout.
             cancel_cmlfq = getattr(engine, "cancel_cmlfq_request", None)
             if cmlfq_request_id and callable(cancel_cmlfq):
                 cancel_cmlfq(cmlfq_request_id)
@@ -413,6 +419,7 @@ class R2EGymWorkflow:
                             "top_p": 1.0,
                             "n": 1,
                             "prompt_id": prompt_id,
+                            "input_tokens": prompt_len,
                             "stop": [] if self.patch_harness else ["[/ISSUE]"],
                             "include_stop_str_in_output": True,
                         }
@@ -470,6 +477,13 @@ class R2EGymWorkflow:
                         "metrics": metrics,
                         "turn_metrics": turn_metrics,
                     }
+                except asyncio.CancelledError:
+                    # Task cancellation must propagate, not be converted
+                    # into a (false) evaluation result row.
+                    cancel_cmlfq = getattr(engine, "cancel_cmlfq_request", None)
+                    if request_id and callable(cancel_cmlfq):
+                        cancel_cmlfq(request_id)
+                    raise
                 except Exception as exc:
                     cancel_cmlfq = getattr(engine, "cancel_cmlfq_request", None)
                     if request_id and callable(cancel_cmlfq):

@@ -145,11 +145,15 @@ class DAPOMathWorkflow:
                 generation_prompt, prompt_len = self._fit_generation_prompt(current_text)
                 max_tokens = self._generation_budget(prompt_len, used, turn)
                 kwargs = {
+                    "prompt_id": prompt_id,
                     "prompt": generation_prompt,
                     "max_new_tokens": max_tokens,
                     "temperature": self.temperature,
                     "top_p": self.top_p,
                     "n": 1,
+                    # Exact token count already computed by the fitter;
+                    # passing it skips the engine-side estimation encode.
+                    "input_tokens": prompt_len,
                 }
                 if cmlfq_request_id:
                     kwargs.update({"request_id": cmlfq_request_id, "prompt_id": prompt_id})
@@ -195,7 +199,10 @@ class DAPOMathWorkflow:
                 if cmlfq_request_id and callable(route_tool_return):
                     route_tool_return(cmlfq_request_id, tool_event, generated_tokens)
                 current_text += output_text + "\n" + feedback + "\n"
-        except Exception:
+        except BaseException:
+            # BaseException: CancelledError (task cancellation) must also
+            # release the C-MLFQ request state, otherwise the leaked entry
+            # wedges wait_until_idle until timeout.
             cancel_cmlfq = getattr(engine, "cancel_cmlfq_request", None)
             if cmlfq_request_id and callable(cancel_cmlfq):
                 cancel_cmlfq(cmlfq_request_id)
@@ -266,6 +273,7 @@ class DAPOMathWorkflow:
                         top_p=1.0,
                         n=1,
                         prompt_id=self._prompt_id(row),
+                        input_tokens=prompt_len,
                     )
                     metrics = evaluate_math_completion(response.get("text", ""), self._extract_answer(row))
                     return {"ok": True, "reward": float(metrics["reward"]), "accurate": float(metrics["accuracy"])}

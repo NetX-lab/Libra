@@ -1,4 +1,6 @@
 IMPLEMENTATION_SUMMARY.md
+docs/project_structure.md
+docs/rollout_scheduling_improvements.md
 
 # Python and test caches
 __pycache__/

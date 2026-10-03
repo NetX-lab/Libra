@@ -78,6 +78,66 @@ phase names allow the same converter to compare baseline runs.
 See the [cluster manual](manual.md) for recommended combinations and launch
 examples.
 
+## Rollout Scheduling Options
+
+These options live under `heterogeneous_rollout.scheduling` and control how
+requests are routed across the heterogeneous TP buckets.
+
+### Load metric
+
+| Option | Meaning |
+| --- | --- |
+| `load_metric` | Selection signal for least-connections routing: `requests` (legacy request-count, default), `tokens` (estimated in-flight token load = prompt + EMA-expected output), or `kv_tokens` (that load normalized by each TP bucket's KV-cache capacity, i.e. occupancy ratio) |
+| `kv_capacity_tokens_by_tp` | Explicit KV capacity per TP degree, e.g. `{1: 120000, 4: 450000}`. When empty and `load_metric: kv_tokens`, capacities are auto-estimated from the hardware / model-arch configs and the rollout `gpu_memory_utilization`; at engine startup they are additionally calibrated against vLLM's own profiled `kv_cache_size_tokens` from `/metrics` |
+| `kv_activation_reserve_gib` | Per-GPU reserve subtracted when auto-estimating KV capacity (default 4) |
+| `load_balance_strategy` | `least_connections` (default), `round_robin`, or `weighted` |
+
+Under `kv_tokens`, instances whose TP degree has no configured capacity are
+excluded from selection (with a warning) rather than comparing raw token
+counts against ratios. All strategies rotate among equal-load endpoints to
+avoid starving later-registered instances.
+
+The expected-output component of the estimate is a per-category EMA learned
+from observed completion lengths; it survives weight-sync rebinding, and is
+clamped by each request's `max_new_tokens` (callers that pass exact
+`input_tokens` — all bundled workflows do — skip the chars-based fallback).
+
+### Closed-loop /metrics feedback
+
+| Option | Meaning |
+| --- | --- |
+| `enable_metrics_feedback` | Master switch (default false). An engine-layer poller scrapes each instance's `/metrics`; observed gauges drive an additive bias correction of the local load estimate plus occupancy admission |
+| `metrics_poll_interval_s` | Scrape interval per instance (default 3; measured interference is <1% at 5Hz) |
+| `metrics_request_timeout_s` | Per-scrape HTTP timeout (default 1) |
+| `metrics_staleness_ttl_s` | Snapshots older than this are ignored (default 10) |
+| `metrics_admission_enter` / `metrics_admission_exit` | Occupancy hysteresis band: block new routes above `enter` (default 0.90), unblock below `exit` (default 0.75) |
+| `metrics_preemption_penalty_ttl_s` | Preemption counters are cumulative; a detected increase penalizes the instance for this window (default 60) instead of blacklisting forever |
+| `metrics_bias_alpha` | EMA weight for the additive bias `bias = EMA(observed - local)` (default 0.3) |
+
+The poller runs at the engine layer (it survives scheduler rebinding during
+weight sync), staggers endpoints with random phases (multi-rank safety), and
+any feed outage degrades transparently back to the open-loop estimate.
+
+### Cross-rank load aggregation
+
+| Option | Meaning |
+| --- | --- |
+| `shared_load_dir` | Shared directory where every training rank publishes its per-instance in-flight accounting (atomic renames + heartbeat TTL). Schedulers then rank instances by the summed cluster load instead of their own partial view, eliminating multi-rank herd. Empty disables |
+| `shared_load_ttl_s` / `shared_load_heartbeat_s` | Liveness window / refresh rate for rank files (defaults 30 / 10) |
+| `shared_load_cache_ttl_s` | Aggregate-read cache window (default 1); a rank's own writes invalidate immediately |
+
+### Prefix affinity
+
+| Option | Meaning |
+| --- | --- |
+| `prefix_affinity` | Bind `prompt_id` -> instance (bounded LRU) so repeated prompts (GRPO `n_samples`, multi-turn replays, shared system prompts) land on the instance whose prefix cache already holds them (default false) |
+| `prefix_affinity_max_entries` | LRU bound (default 8192) |
+
+Affinity only reorders preference among candidates that survived the
+readiness / queue / capacity / admission filters — a sticky instance at its
+queue cap or blocked by occupancy admission is bypassed and the mapping
+remaps. The affinity table survives weight-sync rebinding.
+
 ## Rollout Weight Reloads
 
 When `rollout_weight_sync_mode` is `restart`, the trainer publishes one reload
