@@ -60,4 +60,5 @@ packages = [
 dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.package-data]
+"RL_Framework" = ["configs/model_arch_config/deepseek_v4_mindspeed_args.json"]
 "RL_Framework.infra.elastic" = ["*.c"]

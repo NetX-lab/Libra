@@ -80,9 +80,16 @@ def _initialize_megatron_worker(args):
     from RL_Framework.engine.train_factory import create_train_engine
 
     config = AsyncRLConfig.from_yaml(args.config)
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA worker requested but CUDA is unavailable")
-    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    else:
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError("hybrid worker requires CUDA or torch_npu") from exc
+        if not torch.npu.is_available():
+            raise RuntimeError("hybrid worker cannot access an NPU")
+        torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     if config.train_backend != "megatron_core":
         raise ValueError("elastic hybrid workers currently require Megatron-Core")
     engine = create_train_engine(config)
@@ -97,8 +104,20 @@ def _endpoint_for_lane(args, engine):
     endpoint_dir = Path(args.gradient_endpoint_dir)
     if not endpoint_dir.exists():
         raise FileNotFoundError(f"gradient endpoint directory is missing: {endpoint_dir}")
-    target_dp = int(args.target_core_id.removeprefix("dp"))
     lane = engine.get_elastic_lane_state()
+    if args.target_core_id == "model":
+        local_rank = int(lane.get("elastic_replica_rank", lane["global_rank"]))
+        matches = []
+        for path in endpoint_dir.glob("rank_*.json"):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if int(data.get("elastic_replica_rank", data.get("global_rank", -1))) == local_rank:
+                matches.append(data)
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"expected one model-rank endpoint for replica rank {local_rank}, found {len(matches)}"
+            )
+        return matches[0]
+    target_dp = int(args.target_core_id.removeprefix("dp"))
     for path in endpoint_dir.glob("rank_*.json"):
         data = json.loads(path.read_text(encoding="utf-8"))
         if int(data.get("data_parallel_rank", -1)) == target_dp and all(

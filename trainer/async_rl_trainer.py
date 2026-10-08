@@ -786,7 +786,7 @@ class AsyncRLTrainer:
             if domain is not None:
                 active_hybrid_ids = list(
                     domain.active_hybrid_ids_for_core(
-                        f"dp{self.train_engine.get_data_parallel_rank()}"
+                        getattr(self.train_engine, "get_elastic_local_core_id", lambda: f"dp{self.train_engine.get_data_parallel_rank()}")()
                     )
                 )
             set_step = getattr(self.train_engine, "set_elastic_training_step", None)
@@ -1891,7 +1891,8 @@ class AsyncRLTrainer:
         if not callable(configure):
             raise RuntimeError("EHP requires train-engine elastic gradient hooks")
         core_ids = list(getattr(self.train_engine, "get_elastic_core_replica_ids", lambda: ["dp0"])())
-        replica_width = (
+        width_fn = getattr(self.train_engine, "get_elastic_replica_size_gpus", None)
+        replica_width = int(width_fn()) if callable(width_fn) else (
             max(1, int(getattr(self.config, "train_tp_size", 1) or 1))
             * max(1, int(getattr(self.config, "train_pp_size", 1) or 1))
             * max(1, int(getattr(self.config, "train_cp_size", 1) or 1))
@@ -2377,8 +2378,12 @@ class AsyncRLTrainer:
 
         core_ids = [str(item) for item in state.get("core_replica_ids") or []]
         if not core_ids:
-            dp = max(1, int(getattr(self.config, "train_dp_size", 1) or 1))
-            core_ids = [f"dp{i}" for i in range(dp)]
+            ids_fn = getattr(self.train_engine, "get_elastic_core_replica_ids", None)
+            if callable(ids_fn):
+                core_ids = list(ids_fn())
+            else:
+                dp = max(1, int(getattr(self.config, "train_dp_size", 1) or 1))
+                core_ids = [f"dp{i}" for i in range(dp)]
 
         decoupled = bool(
             getattr(

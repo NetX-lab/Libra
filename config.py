@@ -549,6 +549,9 @@ class GlobalResourcePlannerConfig:
     hybrid_training_prewarm_count: int = 0
     hybrid_training_prewarm_worker_ids: list[str] = field(default_factory=list)
     hybrid_worker_python: str = "python"
+    # Multi-node EHP templates are formatted once per host. Available fields
+    # include host, gpus, nnodes, node_rank, master_addr and master_port; the
+    # template must execute each rank launcher on that assigned host.
     hybrid_worker_command_template: str = ""
     hybrid_worker_task_dir: str = "./logs/elastic_training_tasks"
     hybrid_worker_ready_timeout_s: float = 60.0
@@ -605,6 +608,8 @@ class AsyncRLConfig:
     tp_size: int = 1
     vllm_tp_size: int = 1
     train_backend: str = "megatron_core"
+    megatron_model_provider: str = "bridge"  # bridge | mindspeed
+    mindspeed_args_path: str = ""
     train_tp_size: int = 0
     train_pp_size: int = 1
     train_dp_size: int = 0
@@ -827,6 +832,17 @@ class AsyncRLConfig:
             raise ValueError(
                 "The legacy Megatron backend supports only weight_sync_mode='disk'"
             )
+        if self.megatron_model_provider not in {"bridge", "mindspeed"}:
+            raise ValueError("megatron_model_provider must be bridge or mindspeed")
+        if self.megatron_model_provider == "mindspeed":
+            if self.train_backend != "megatron_core":
+                raise ValueError("MindSpeed requires train_backend=megatron_core")
+            if self.train_pp_size != 2 or self.train_cp_size != 1:
+                raise ValueError("DeepSeek V4 MindSpeed requires PP=2 and CP=1")
+            if self.weight_sync_mode == "nccl" or self.rollout_weight_sync_mode == "nccl":
+                raise ValueError("MindSpeed direct rollout sync needs an HCCL transport; use disk until validated")
+            if self.megatron_use_precision_aware_optimizer:
+                raise ValueError("MindSpeed V4 requires precision-aware optimizer disabled")
         if self.train_backend == "megatron_core":
             if self.weight_sync_mode not in {"disk", "nccl"}:
                 raise ValueError(
@@ -848,7 +864,7 @@ class AsyncRLConfig:
                     "megatron_optimizer_offload_fraction requires "
                     "megatron_optimizer_cpu_offload=true"
                 )
-            if self.train_pp_size != 1:
+            if self.megatron_model_provider == "bridge" and self.train_pp_size != 1:
                 raise ValueError(
                     "MegatronCoreTrainEngine currently requires train_pp_size=1"
                 )
@@ -863,9 +879,12 @@ class AsyncRLConfig:
                     "expert_tensor_parallel_size must divide train_tp_size: "
                     f"{self.expert_tensor_parallel_size} vs {self.train_tp_size}"
                 )
-            if self.train_dp_size % self.train_ep_size != 0:
+            expert_world = self.train_dp_size
+            if self.megatron_model_provider == "mindspeed":
+                expert_world = self.train_gpus // (self.train_pp_size * self.expert_tensor_parallel_size)
+            if expert_world % self.train_ep_size != 0:
                 raise ValueError(
-                    "train_ep_size must divide train_dp_size: "
+                    "train_ep_size must divide the expert parallel world (train_dp_size for bridge): "
                     f"{self.train_ep_size} vs {self.train_dp_size}"
                 )
             if self.model_arch.num_experts > 1:

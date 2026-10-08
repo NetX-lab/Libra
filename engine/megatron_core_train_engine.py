@@ -1100,7 +1100,8 @@ class MegatronCoreTrainEngine:
                 self._pending_hybrid_gradients.clear()
             return
 
-        core_id = f"dp{self.get_data_parallel_rank()}"
+        core_id_fn = getattr(self, "get_elastic_local_core_id", None)
+        core_id = core_id_fn() if callable(core_id_fn) else f"dp{self.get_data_parallel_rank()}"
         reduced = self.elastic_gradient_domain.reduce_core_gradients(
             core_gradients={
                 core_id: tuple(grad.detach() for _, grad in params_and_grads),

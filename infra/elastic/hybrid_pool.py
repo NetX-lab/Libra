@@ -467,7 +467,7 @@ class InterReplicaGradientDomain:
                 continue
             if payload.replica_id in joining or payload.zero_placeholder:
                 continue
-            if payload.membership_epoch != epochs.get(payload.replica_id, 0):
+            if payload.membership_epoch > 0 and payload.membership_epoch != epochs.get(payload.replica_id, 0):
                 continue
             if payload.step >= 0 and step >= 0 and payload.step != step:
                 continue
@@ -497,6 +497,8 @@ class InterReplicaGradientDomain:
         *,
         core_gradients: Mapping[str, Iterable[torch.Tensor]],
         hybrid_payloads: Iterable[GradientPayload] = (),
+        step: int = -1,
+        state_version: int = -1,
     ) -> dict[str, tuple[torch.Tensor, ...]]:
         """Return synchronized gradients for each core replica.
 
@@ -527,6 +529,7 @@ class InterReplicaGradientDomain:
         with self._lock:
             targets = dict(self._hybrid_targets)
             joining = set(self._joining)
+            epochs = dict(self._membership_epochs)
 
         for payload in hybrid_payloads:
             if payload.replica_id not in targets:
@@ -540,6 +543,12 @@ class InterReplicaGradientDomain:
                     f"{payload.target_core_id} != {target}"
                 )
             if payload.replica_id in joining or payload.zero_placeholder:
+                continue
+            if payload.membership_epoch > 0 and payload.membership_epoch != epochs.get(payload.replica_id, 0):
+                continue
+            if payload.step >= 0 and step >= 0 and payload.step != step:
+                continue
+            if payload.state_version >= 0 and state_version >= 0 and payload.state_version != state_version:
                 continue
             if payload.replica_world_size != self.replica_world_size:
                 raise ValueError(
