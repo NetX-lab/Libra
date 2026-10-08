@@ -1,6 +1,7 @@
 """Validate the official R2E-Gym V1 shards and build a compact task index."""
 
 import argparse
+import hashlib
 import json
 from collections import Counter
 from pathlib import Path
@@ -54,6 +55,14 @@ def parse_args():
         help="Output validation manifest; defaults to dataset_dir/manifest.json",
     )
     return parser.parse_args()
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def main():
@@ -126,6 +135,7 @@ def main():
                     "file": shard.name,
                     "rows": shard_rows,
                     "bytes": shard.stat().st_size,
+                    "sha256": sha256(shard),
                 }
             )
 

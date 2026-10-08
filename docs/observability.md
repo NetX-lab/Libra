@@ -1,6 +1,6 @@
 # Observability
 
-Each NPU launcher writes a job directory under `logs/`. The files below
+Each Slurm launcher writes a job directory under `logs/`. The files below
 capture training progress, rollout state, planner decisions, and runtime
 reconfiguration activity.
 

@@ -428,23 +428,22 @@ class HybridSimulatorCostModel:
             hardware=config.hardware,
             model_arch=config.model_arch,
             profiling=config.profiling,
-            training_backend=config.train_backend,
-            use_distributed_optimizer=config.use_distributed_optimizer,
-            grad_reduce_in_fp32=config.megatron_grad_reduce_in_fp32,
-            precision_aware_optimizer=config.megatron_use_precision_aware_optimizer,
             max_seq_length=config.max_seq_length,
-            recompute_logprobs=bool(config.recompute_logprobs),
+            recompute_logprobs=(
+                bool(config.recompute_logprobs)
+                and bool(getattr(self.planner_config, "memory_budget_check_enabled", True))
+            ),
             recompute_micro_batch_size=int(
                 getattr(config, "recompute_micro_batch_size", 1)
-            ),
-            memory_safety_margin_bytes=float(
-                getattr(self.planner_config, "memory_budget_safety_margin_bytes", 0.0)
             ),
             recompute_logits_dtype_bytes=int(
                 getattr(self.planner_config, "memory_budget_logits_dtype_bytes", 4)
             ),
             recompute_workspace_factor=float(
                 getattr(self.planner_config, "memory_budget_workspace_factor", 1.5)
+            ),
+            memory_safety_margin_bytes=float(
+                getattr(self.planner_config, "memory_budget_safety_margin_bytes", 0.0)
             ),
         )
         self.train_backend = (self.planner_config.train_backend or "analytic").lower()
@@ -469,12 +468,6 @@ class HybridSimulatorCostModel:
         B_global: int,
         L: int,
     ) -> tuple[float, dict]:
-        if self.config.train_backend == "megatron_core" and config.pp != 1:
-            return float("inf"), {
-                "backend": "capability_check",
-                "supported": False,
-                "reason": "MegatronCoreTrainEngine currently supports PP=1",
-            }
         if self.train_backend == "analytic":
             seconds, details = self.analytic.evaluate_training(config, B_global, L)
             details = dict(details)

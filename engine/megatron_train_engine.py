@@ -621,6 +621,8 @@ class Megatron3DTrainEngine:
         return self._broadcast_stats(stats)
 
     def _apply_elastic_inter_replica_gradients(self):
+        if not getattr(self, "_pending_hybrid_gradients", []):
+            return
         if self.elastic_gradient_domain is None or self.runtime is None:
             self._pending_hybrid_gradients.clear()
             return

@@ -52,8 +52,8 @@ def main():
     if not is_distributed and world_size > 1:
 
 
-        device = set_device(local_rank, getattr(config, "device_backend", "auto"))
-        backend = distributed_backend(getattr(config, "distributed_backend", "auto"))
+        device = set_device(local_rank)
+        backend = distributed_backend()
         try:
             dist.init_process_group(backend=backend, device_id=device)
         except TypeError:
@@ -64,7 +64,7 @@ def main():
         world_size = dist.get_world_size()
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
-        set_device(local_rank, getattr(config, "device_backend", "auto"))
+        set_device(local_rank)
 
     is_main_process = rank == 0
 

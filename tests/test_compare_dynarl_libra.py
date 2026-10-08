@@ -43,7 +43,9 @@ def test_parse_rlinf_log_supports_scientific_notation(tmp_path: Path) -> None:
     assert result["migrations"][0]["bandwidth_gbps"] == 12.9
 
 
-def test_parse_libra_result_uses_last_round_as_steady_state(tmp_path: Path) -> None:
+def test_parse_libra_result_uses_last_round_as_steady_state(
+    tmp_path: Path,
+) -> None:
     result_path = tmp_path / "result.json"
     result_path.write_text(
         json.dumps(

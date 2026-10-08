@@ -339,47 +339,6 @@ class TestCMLFQScheduler(unittest.TestCase):
 
         self.assertFalse(decision.should_migrate)
 
-    def test_cold_start_quantum_exhaustion_advances_buckets(self):
-        scheduler = CMLFQScheduler(
-            buckets={
-                "short": {"tp_degrees": [1], "max_tokens": 4000},
-                "medium": {"tp_degrees": [2], "max_tokens": 12000},
-                "long": {"tp_degrees": [4], "max_tokens": 30000},
-            }
-        )
-        scheduler.register_instance(0, "short", 1)
-        scheduler.register_instance(1, "medium", 2)
-        scheduler.register_instance(2, "long", 4)
-        route = scheduler.schedule(input_tokens=100, prompt_id="cold")
-        self.assertEqual(
-            scheduler.get_request_remaining_quantum(route.request_id), 4000
-        )
-
-        short_decision = scheduler.on_tool_return(
-            route.request_id,
-            {"tool_type": "validator", "output": "retry"},
-            generated_tokens=4000,
-        )
-        self.assertTrue(short_decision.should_migrate)
-        self.assertEqual(short_decision.reason, "cold_start_quantum_exhausted")
-        self.assertEqual(short_decision.target_bucket, "medium")
-        scheduler.execute_migration(route.request_id, short_decision)
-        self.assertEqual(
-            scheduler.get_request_remaining_quantum(route.request_id), 8000
-        )
-
-        medium_decision = scheduler.on_tool_return(
-            route.request_id,
-            {"tool_type": "validator", "output": "retry"},
-            generated_tokens=16000,
-        )
-        self.assertTrue(medium_decision.should_migrate)
-        self.assertEqual(medium_decision.target_bucket, "long")
-        scheduler.execute_migration(route.request_id, medium_decision)
-        self.assertEqual(
-            scheduler.get_request_remaining_quantum(route.request_id), 14000
-        )
-
     def test_on_request_done_tree_update(self):
         """Test on request done tree update."""
         result = self.scheduler.schedule(input_tokens=1000, prompt_id="p1")
@@ -453,66 +412,6 @@ class TestCMLFQScheduler(unittest.TestCase):
                 scheduler.cancel_request(result.request_id)
                 scheduler._shared_load.close()
                 remote.close()
-
-    def test_medium_overflow_prefers_larger_tp(self):
-        scheduler = CMLFQScheduler(
-            buckets={
-                "short": {"tp_degrees": [1], "max_tokens": 4000},
-                "medium": {"tp_degrees": [2], "max_tokens": 12000},
-                "long": {"tp_degrees": [4], "max_tokens": 30000},
-            },
-            max_queue_length=1,
-        )
-        scheduler.register_instance(0, "short", 1)
-        scheduler.register_instance(1, "medium", 2)
-        scheduler.register_instance(2, "long", 4)
-        scheduler._instances[1].inc_active()
-
-        routed = scheduler._route_to_bucket("medium", input_tokens=100)
-
-        self.assertTrue(routed.is_fallback)
-        self.assertEqual(routed.tp_degree, 4)
-
-    def test_local_queue_cap_spreads_one_rank_across_instances(self):
-        scheduler = CMLFQScheduler(
-            buckets={
-                "short": {"tp_degrees": [1], "max_tokens": 4000},
-                "medium": {"tp_degrees": [2], "max_tokens": 12000},
-                "long": {"tp_degrees": [4], "max_tokens": 30000},
-            },
-            max_queue_length=3,
-            max_local_queue_length=1,
-        )
-        scheduler.register_instance(0, "short0", 1)
-        scheduler.register_instance(1, "short1", 1)
-        scheduler.register_instance(2, "medium", 2)
-        scheduler.register_instance(3, "long", 4)
-
-        routes = [
-            scheduler.schedule(input_tokens=100, prompt_id=f"local-{index}")
-            for index in range(3)
-        ]
-
-        self.assertEqual(len({route.instance_index for route in routes}), 3)
-
-    def test_global_fallback_still_respects_local_diversity(self):
-        scheduler = CMLFQScheduler(
-            buckets={
-                "short": {"tp_degrees": [1], "max_tokens": 4000},
-                "long": {"tp_degrees": [4], "max_tokens": 30000},
-            },
-            max_queue_length=1,
-            max_local_queue_length=1,
-        )
-        scheduler.register_instance(0, "short", 1)
-        scheduler.register_instance(1, "long", 4)
-        first = scheduler.schedule(input_tokens=100, prompt_id="first")
-        self.assertEqual(first.instance_index, 0)
-        # Simulate global pressure on the unused endpoint. The final fallback
-        # must prefer local diversity over duplicating this rank on short.
-        scheduler._get_global_active_counts = lambda: {"short": 1, "long": 1}
-        second = scheduler.schedule(input_tokens=100, prompt_id="second")
-        self.assertEqual(second.instance_index, 1)
 
 
 # ---------------------------------------------------------------------------

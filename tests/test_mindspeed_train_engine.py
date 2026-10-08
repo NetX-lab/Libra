@@ -115,10 +115,27 @@ def test_bridge_adapter_consumes_collective_export_on_each_rank():
     assert seen == [['stage']]
 
 
-def test_unimplemented_ehp_cannot_silently_run_as_dense_replica():
+def test_ehp_uses_complete_v4_dp_ep_replica():
     from RL_Framework.config import GlobalResourcePlannerConfig
-    with pytest.raises(ValueError, match="EP-sharded EHP"):
-        config(global_resource_planner=GlobalResourcePlannerConfig(elastic_hybrid_planning_enabled=True))
+    e = MindSpeedTrainEngine(model_path='/model/v4', train_tp_size=4,
+                            train_pp_size=2, train_dp_size=8, train_ep_size=32,
+                            expert_tensor_parallel_size=1, micro_batch_size=1)
+    assert e.get_elastic_replica_size_gpus() == 64
+    assert e.get_elastic_core_replica_ids() == ['model']
+    assert e.get_elastic_local_core_id() == 'model'
+    e.get_elastic_core_process_group = lambda: None
+    domain = e.configure_elastic_training(['model'], decouple_communication_domains=False,
+                                          replica_world_size=64)
+    assert domain.replica_world_size == 64
+    with pytest.raises(ValueError, match=r'complete TP\*PP\*DP replica'):
+        e.configure_elastic_training(['model'], decouple_communication_domains=False,
+                                      replica_world_size=8)
+
+
+def test_mindspeed_config_allows_ep_sharded_ehp():
+    from RL_Framework.config import GlobalResourcePlannerConfig
+    planner = GlobalResourcePlannerConfig(elastic_hybrid_planning_enabled=True)
+    assert config(global_resource_planner=planner).global_resource_planner.elastic_hybrid_planning_enabled
 
 
 def test_mindspeed_rejects_cuda_only_weight_transport():

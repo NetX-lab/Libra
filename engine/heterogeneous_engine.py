@@ -25,10 +25,8 @@ class HeterogeneousRolloutEngine:
         self,
         model_path: str = "",
         scheduler: BaseScheduler | None = None,
-        request_timeout: float = 600.0,
     ):
         self.model_path = model_path
-        self.request_timeout = max(1.0, float(request_timeout))
 
         if scheduler is None:
             from RL_Framework.infra.scheduling.length_aware import LengthAwareScheduler
@@ -45,17 +43,6 @@ class HeterogeneousRolloutEngine:
 
 
         self._pending_futures: dict[str, list[asyncio.Future]] = {}
-
-    def reset_after_reconfigure(self) -> None:
-        """Clear stale request state after dispatcher cancellation."""
-        with self._lock:
-            for futures in self._pending_futures.values():
-                for future in futures:
-                    if not future.done():
-                        future.cancel()
-            self._pending_futures.clear()
-            for handle in getattr(self.scheduler, "_instances", []):
-                handle.active_requests = 0
 
     # ----------------------------------------------------------------
 
@@ -74,7 +61,6 @@ class HeterogeneousRolloutEngine:
             host=host,
             port=port,
             model_path=self.model_path,
-            request_timeout=self.request_timeout,
         )
         idx = len(self.engines)
         self.engines.append(engine)
@@ -197,6 +183,23 @@ class HeterogeneousRolloutEngine:
                 )
             time.sleep(max(0.05, poll_interval))
 
+    def reset_after_reconfigure(self) -> None:
+        """Discard request accounting invalidated by a runtime reconfiguration.
+
+        The dispatcher may cancel in-flight work while changing the rollout
+        topology.  Those cancelled futures must not keep the next topology in
+        a permanent draining state, and scheduler load counters must start
+        from the same empty state.
+        """
+        with self._lock:
+            for futures in self._pending_futures.values():
+                for future in futures:
+                    if not future.done():
+                        future.cancel()
+            self._pending_futures.clear()
+            for handle in getattr(self.scheduler, "_instances", []):
+                handle.active_requests = 0
+
     async def close(self):
         """Close."""
         for engine in self.engines:
@@ -279,35 +282,9 @@ class HeterogeneousRolloutEngine:
         output_tokens = 0
 
         try:
-            effective_max_new_tokens = int(max_new_tokens)
-            bucket_limit = getattr(
-                self.scheduler,
-                "get_bucket_max_tokens",
-                lambda _bucket: 0,
-            )(result.category)
-            if cmlfq_managed and bucket_limit > 0:
-                # Treat the bucket limit as an MLFQ time quantum.  A 30K
-                # episode may start on TP1, but one short turn cannot occupy
-                # that worker for the entire episode before a tool-return
-                # migration opportunity becomes available.
-                effective_max_new_tokens = min(
-                    effective_max_new_tokens,
-                    int(bucket_limit),
-                )
-                remaining_quantum = getattr(
-                    self.scheduler,
-                    "get_request_remaining_quantum",
-                    lambda _request_id: 0,
-                )(request_id)
-                if remaining_quantum > 0:
-                    effective_max_new_tokens = min(
-                        effective_max_new_tokens,
-                        int(remaining_quantum),
-                    )
-
             gen_result = await engine.generate(
                 prompt=prompt,
-                max_new_tokens=effective_max_new_tokens,
+                max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 n=n,
@@ -325,8 +302,6 @@ class HeterogeneousRolloutEngine:
                 "reason": result.reason,
                 "prompt_id": prompt_id,
                 "request_id": request_id or result.request_id,
-                "requested_max_new_tokens": int(max_new_tokens),
-                "effective_max_new_tokens": effective_max_new_tokens,
             }
 
             return gen_result
@@ -584,9 +559,6 @@ class HeterogeneousRolloutEngine:
         engine = cls(
             model_path=config.model_path,
             scheduler=scheduler,
-            request_timeout=float(
-                getattr(hetero.scheduling, "request_timeout", 600.0)
-            ),
         )
 
 
@@ -642,7 +614,7 @@ class HeterogeneousRolloutEngine:
         )
 
     def __del__(self):
-        for engine in self.engines:
+        for engine in getattr(self, "engines", []):
             try:
                 engine.__del__()
             except Exception:

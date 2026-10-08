@@ -62,13 +62,23 @@ training nodes and refuses busy devices or an existing gate container.
 
 Not yet validated: full-model gradient/update correctness, complete HF export
 and reload, vLLM-Ascend EP rollout integration, end-to-end policy version
-consistency, production workloads and performance ablations.
+consistency, production workloads and performance ablations. MindSpeed EHP now
+models TP*PP*DP as a complete V4 replica and reduces dense and expert gradients
+over their matching DP groups. The 64-rank endpoint mapping, multi-node worker
+launch and hardware gradient/update gate still require validation before EHP
+can be reported as running.
+
+Remote EHP checks on 2026-10-08 passed 60 relevant pytest cases and a two-NPU
+910B3 HCCL gradient gate (`dense=12`, `expert=122`). The gate exercises the new
+per-parameter dense/expert reduction on hardware with synthetic gradients; it
+does not load V4 weights. A complete V4 EHP experiment needs 64 core ranks plus
+a separate 64-rank EHP replica (128 NPUs before rollout capacity), exceeding
+the requested 96-NPU pool.
 
 Direct CUDA/NCCL rollout transport is rejected for this provider until a real
-HCCL transport is connected and validated. EP-sharded EHP is also explicitly
-rejected: TP*PP ranks are not a complete expert-sharded model, and dense/expert
-parameters require different gradient domains. A 64-training/32-rollout layout
-alone cannot demonstrate adding another identical 64-rank training copy.
+HCCL transport is connected and validated. EP-sharded EHP requires a complete
+expert-sharded training replica. A 64-training/32-rollout layout alone cannot
+demonstrate adding another identical 64-rank training copy.
 GRP must respect legal expert and rollout topologies before enabling online
 resource changes. These limitations must not be reported as zero speedup or
 as successful EHP/GRP execution.

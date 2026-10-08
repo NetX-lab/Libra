@@ -42,10 +42,10 @@ class TrainParallelConfig:
     """Train parallel config implementation."""
     tp: int = 1
     pp: int = 1
-    cp: int = 1
     dp: int = 1
     b_micro: int = 4       # micro batch size
     zero_level: int = 2
+    cp: int = 1
 
     @property
     def n_gpus(self) -> int:
@@ -390,10 +390,6 @@ class TrainingCostModel:
         train_mem_frag_rate: float = 0.08,
         train_workspace_bytes: float = 0.5e9,
         effective_num_params: float | None = None,
-        training_backend: str = "fsdp",
-        use_distributed_optimizer: bool = False,
-        grad_reduce_in_fp32: bool = False,
-        precision_aware_optimizer: bool = False,
         vocab_size: int = 151936,
         max_seq_length: int = 2048,
         recompute_logprobs: bool = True,
@@ -434,10 +430,6 @@ class TrainingCostModel:
 
         self.mem_frag_rate = train_mem_frag_rate
         self.workspace = train_workspace_bytes
-        self.training_backend = training_backend
-        self.use_distributed_optimizer = use_distributed_optimizer
-        self.grad_reduce_in_fp32 = grad_reduce_in_fp32
-        self.precision_aware_optimizer = precision_aware_optimizer
         self.vocab_size = max(1, int(vocab_size))
         self.max_seq_length = max(1, int(max_seq_length))
         self.recompute_logprobs = bool(recompute_logprobs)
@@ -452,31 +444,10 @@ class TrainingCostModel:
         self, config: TrainParallelConfig, b_micro: int, L: int,
     ) -> float:
         """Estimate memory per gpu."""
-        tp, pp, cp, dp = config.tp, config.pp, config.cp, config.dp
+        tp, pp, dp = config.tp, config.pp, config.dp
         P = self.P
 
-        if self.training_backend == "megatron_core":
-            # Tensor/pipeline parallelism shards a Megatron model replica. Data
-            # parallelism does not shard its BF16 parameters or DDP gradient
-            # buffer. The distributed optimizer shards only its FP32 main
-            # parameters and Adam states across the DP group.
-            tp_pp = max(tp * pp, 1)
-            model_params = P / tp_pp
-            m_weight = self.dtype_bytes * model_params
-            grad_bytes = 4.0 if self.grad_reduce_in_fp32 else self.dtype_bytes
-            m_grad = grad_bytes * model_params
-            # This term covers the master parameter and Adam moments. The DDP
-            # gradient buffer is accounted for separately above.
-            optimizer_bytes = 6.0 if self.precision_aware_optimizer else 12.0
-            optimizer_shard = dp if self.use_distributed_optimizer else 1
-            m_opt = optimizer_bytes * model_params / max(optimizer_shard, 1)
-
-            # Megatron Bridge constructs the distributed model while the
-            # converted BF16 source weights are still resident. This peak was
-            # observed directly on the Qwen3-14B Ascend initialization path.
-            m_model_build_transient = self.dtype_bytes * model_params
-            m_fsdp_transient = 0.0
-        elif config.zero_level >= 2:
+        if config.zero_level >= 2:
             shard = max(tp * pp * dp, 1)
             tp_pp = max(tp * pp, 1)
             m_weight = 2.0 * P / shard
@@ -487,7 +458,6 @@ class TrainingCostModel:
             m_fsdp_transient = 0.3 * 2.0 * P / tp_pp
             if P >= 20.0e9:
                 m_fsdp_transient += 12.0e9
-            m_model_build_transient = 0.0
         else:
             tp_pp = max(tp * pp, 1)
             m_weight = 2.0 * P / tp_pp
@@ -497,29 +467,13 @@ class TrainingCostModel:
                 m_opt = 12.0 * P / tp_pp
             m_grad = 2.0 * P / tp_pp
             m_fsdp_transient = 0.0
-            m_model_build_transient = 0.0
 
 
         # M_act = b_micro * L * d / TP * (n_layers / PP) * bytes_per_element
         layers_per_pp = self.n_layers / max(pp, 1)
-        m_act = (
-            b_micro
-            * L
-            * self.d_model
-            * self.dtype_bytes
-            * layers_per_pp
-            / max(tp * cp, 1)
-        )
+        m_act = b_micro * L * self.d_model * self.dtype_bytes * layers_per_pp / tp
 
-        if self.training_backend == "megatron_core":
-            persistent = m_weight + m_grad
-            model_build_peak = persistent + m_model_build_transient
-            optimizer_peak = persistent + m_opt
-            parameter_state = max(model_build_peak, optimizer_peak)
-        else:
-            parameter_state = m_weight + m_opt + m_grad + m_fsdp_transient
-
-        total = parameter_state + m_act + self.workspace
+        total = m_weight + m_opt + m_grad + m_fsdp_transient + m_act + self.workspace
         if self.recompute_logprobs:
             recompute = estimate_recompute_logprobs_memory(
                 batch_size=min(b_micro, self.recompute_micro_batch_size),
@@ -745,10 +699,7 @@ class CostModel:
         hardware=None,
         model_arch=None,
         profiling=None,
-        training_backend: str = "fsdp",
-        use_distributed_optimizer: bool = False,
-        grad_reduce_in_fp32: bool = False,
-        precision_aware_optimizer: bool = False,
+        *,
         max_seq_length: int = 2048,
         recompute_logprobs: bool = True,
         recompute_micro_batch_size: int = 1,
@@ -811,10 +762,6 @@ class CostModel:
             train_mem_frag_rate=prof.train_mem_frag_rate,
             train_workspace_bytes=prof.train_workspace_bytes,
             effective_num_params=ma.effective_num_params,
-            training_backend=training_backend,
-            use_distributed_optimizer=use_distributed_optimizer,
-            grad_reduce_in_fp32=grad_reduce_in_fp32,
-            precision_aware_optimizer=precision_aware_optimizer,
             vocab_size=ma.vocab_size,
             max_seq_length=max_seq_length,
             recompute_logprobs=recompute_logprobs,

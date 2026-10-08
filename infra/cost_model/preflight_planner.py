@@ -14,6 +14,7 @@ from RL_Framework.infra.cost_model.global_resource_planner import (
     GlobalResourcePlanner,
     PlannerDecision,
 )
+from RL_Framework.infra.cost_model.startup_profile import summarize_length_profile
 
 
 @dataclass
@@ -64,6 +65,8 @@ class PreflightPlanner:
             "min_history_size": self.planner.min_history_size,
             "reconfiguration_cost_s": self.planner.reconfiguration_cost_s,
             "min_gain_ratio": self.planner.min_gain_ratio,
+            "fixed_train_gpus": self.planner.fixed_train_gpus,
+            "online_replanning": self.planner.online_replanning,
         }
         try:
             self.planner.plan_interval = 1
@@ -72,6 +75,11 @@ class PreflightPlanner:
             if self.apply_best_candidate:
                 self.planner.reconfiguration_cost_s = 0.0
                 self.planner.min_gain_ratio = 0.0
+            if self.planner.initial_allocation_strategy == "grp":
+                self.planner.fixed_train_gpus = 0
+            # Preflight is the one authorized planning pass for a control arm
+            # whose runtime_online_replanning setting is false.
+            self.planner.online_replanning = True
             decision = self.planner.plan_if_needed(
                 step=0,
                 config=self.config,
@@ -83,11 +91,16 @@ class PreflightPlanner:
             self.planner.min_history_size = original["min_history_size"]
             self.planner.reconfiguration_cost_s = original["reconfiguration_cost_s"]
             self.planner.min_gain_ratio = original["min_gain_ratio"]
+            self.planner.fixed_train_gpus = original["fixed_train_gpus"]
+            self.planner.online_replanning = original["online_replanning"]
 
         applied_plan = self._select_plan(decision)
         applied = applied_plan is not None
         if applied_plan is not None:
             self.planner.apply_plan_to_config(applied_plan, self.config)
+            # Persist the proof that startup allocation was decided by GRP.
+            # The trainer checks this before constructing any training engine.
+            self.config.global_resource_planner.initial_allocation_applied = True
 
         return PreflightPlannerResult(
             decision=decision,
@@ -97,6 +110,8 @@ class PreflightPlanner:
             metadata={
                 "num_history_records": len(batch),
                 "apply_best_candidate": self.apply_best_candidate,
+                "initial_allocation_strategy": self.planner.initial_allocation_strategy,
+                "length_profile": summarize_length_profile(batch),
             },
         )
 
@@ -105,6 +120,11 @@ class PreflightPlanner:
         current = decision.current_plan
         if candidate is None:
             return None
+        if self.planner.initial_allocation_strategy == "grp":
+            # Startup has no reconfiguration cost and no already-running stage
+            # to preserve.  The optimizer's feasible candidate is therefore
+            # authoritative even when it happens to equal the YAML seed split.
+            return candidate
         if decision.should_reconfigure:
             return candidate
         if not self.apply_best_candidate or current is None:

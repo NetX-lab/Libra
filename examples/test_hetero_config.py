@@ -294,12 +294,12 @@ def test_async_rl_config_multi_node():
         batch_size=64,
         num_nodes=4,
         gpus_per_node_override=8,
-        master_addr="10.0.0.1",
+        master_addr="192.0.2.50",
         master_port=29500,
     )
     check("num_nodes=4", cfg.num_nodes == 4)
     check("gpus_per_node_override=8", cfg.gpus_per_node_override == 8)
-    check("master_addr='10.0.0.1'", cfg.master_addr == "10.0.0.1")
+    check("master_addr='192.0.2.50'", cfg.master_addr == "192.0.2.50")
     check("master_port=29500", cfg.master_port == 29500)
     check("train_gpus=16", cfg.train_gpus == 16)
     check("rollout_gpus=16", cfg.rollout_gpus == 16)

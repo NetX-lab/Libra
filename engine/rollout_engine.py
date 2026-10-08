@@ -65,12 +65,10 @@ class VLLMRolloutEngine:
         host: str = "127.0.0.1",
         port: int = 8000,
         model_path: str = "",
-        request_timeout: float = 600.0,
     ):
         self.host = host
         self.port = port
         self.model_path = model_path
-        self.request_timeout = max(1.0, float(request_timeout))
 
         # URL
         self.base_url = f"http://{self.host}:{self.port}"
@@ -127,12 +125,7 @@ class VLLMRolloutEngine:
             self.http_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(
                     connect=float(os.environ.get("VLLM_CONNECT_TIMEOUT", "30")),
-                    read=float(
-                        os.environ.get(
-                            "VLLM_READ_TIMEOUT",
-                            str(self.request_timeout),
-                        )
-                    ),
+                    read=float(os.environ.get("VLLM_READ_TIMEOUT", "600")),
                     write=float(os.environ.get("VLLM_WRITE_TIMEOUT", "30")),
                     pool=float(os.environ.get("VLLM_POOL_TIMEOUT", "30")),
                 )
@@ -181,8 +174,6 @@ class VLLMRolloutEngine:
         n: int = 1,
         input_tokens: int = 0,
         seed: int | None = None,
-        stop: str | list[str] | None = None,
-        include_stop_str_in_output: bool = False,
     ) -> dict[str, Any]:
         """Generate."""
         await self._ensure_client()
@@ -198,58 +189,33 @@ class VLLMRolloutEngine:
         }
         if seed is not None:
             payload["seed"] = int(seed)
-        if stop:
-            payload["stop"] = stop
-            # vLLM supports this extension on the OpenAI-compatible endpoint.
-            # Keeping a task delimiter in the returned text is important for
-            # format-aware rewards such as R2E-Gym's [ISSUE]...[/ISSUE].
-            payload["include_stop_str_in_output"] = bool(
-                include_stop_str_in_output
+
+        try:
+            response = await self.http_client.post(
+                self.completions_url,
+                json=payload,
             )
 
-        retries = max(0, int(os.environ.get("VLLM_REQUEST_RETRIES", "2")))
-        for attempt in range(retries + 1):
-            try:
-                response = await self.http_client.post(
-                    self.completions_url,
-                    json=payload,
+            if response.status_code != 200:
+                error_text = response.text
+                raise RuntimeError(
+                    f"Generation failed: status={response.status_code}, {error_text}"
                 )
 
-                if response.status_code != 200:
-                    error_text = response.text
-                    raise RuntimeError(
-                        f"Generation failed: status={response.status_code}, {error_text}"
-                    )
+            result = response.json()
+            return self._parse_response(result)
 
-                result = response.json()
-                return self._parse_response(result)
-            except Exception as e:
-                if attempt >= retries:
-                    logger.error(
-                        "Generation request failed: %s: %r "
-                        "(prompt_chars=%d, max_new_tokens=%d, url=%s)",
-                        type(e).__name__,
-                        e,
-                        len(prompt or ""),
-                        max_new_tokens,
-                        self.completions_url,
-                    )
-                    raise
-                logger.warning(
-                    "Generation request retry=%d/%d after %s: %r url=%s",
-                    attempt + 1,
-                    retries,
-                    type(e).__name__,
-                    e,
-                    self.completions_url,
-                )
-                await self.close()
-                try:
-                    self.wait_for_ready(timeout=30.0)
-                except Exception:
-                    pass
-                await asyncio.sleep(min(5.0, 1.0 + attempt))
-                await self._ensure_client()
+        except Exception as e:
+            logger.error(
+                "Generation request failed: %s: %r "
+                "(prompt_chars=%d, max_new_tokens=%d, url=%s)",
+                type(e).__name__,
+                e,
+                len(prompt or ""),
+                max_new_tokens,
+                self.completions_url,
+            )
+            raise
 
     async def generate_batch(
         self,

@@ -36,14 +36,8 @@ When `phase_trace_enabled` is true, each rank writes append-only
 Chrome Trace with `scripts/phase_trace_to_chrome.py`; the stable schema and
 phase names allow the same converter to compare baseline runs.
 | `sync_interval` | Training steps between weight sync attempts |
-| `rollout_weight_sync_mode` | `none`, checkpoint-based `restart`, or official Ascend `hccl` refresh |
-| `rollout_weight_reload_method` | For checkpoint refreshes, `restart` replaces vLLM or `inplace` keeps the resident server |
-| `rollout_weight_reload_strategy` | `parallel` reloads workers concurrently; `serial` uses a per-node lock |
-| `rollout_weight_sync_poll_interval_s` | Poll interval for rollout reload ACKs |
-| `rollout_hccl_host` | Trainer address used by the stateless HCCL rendezvous |
-| `rollout_hccl_port` | Trainer rendezvous port for the persistent HCCL communicator |
-| `rollout_hccl_packed_buffer_mb` | Minimum packed transfer-buffer size; enlarged for the largest tensor |
-| `rollout_hccl_num_buffers` | Number of official packed-transfer buffers |
+| `rollout_weight_reload_method` | Use `restart` for process replacement or `inplace` to refresh resident vLLM workers |
+| `rollout_weight_reload_strategy` | Reload rollout instances concurrently with `parallel` (default), or use the node-serialized `serial` fallback |
 
 ## Megatron-Core Options
 
@@ -60,6 +54,9 @@ phase names allow the same converter to compare baseline runs.
 | Option | Meaning |
 | --- | --- |
 | `global_resource_planner.runtime_dynamic_reconfiguration_enabled` | Master switch for runtime reconfiguration |
+| `initial_allocation_strategy` | `grp` runs planning before launch; `configured` preserves an explicitly pinned legacy split |
+| `allocation_granularity_gpus` | Initial train/rollout split granularity (normally one node or one DP replica) |
+| `min_train_gpus` / `min_rollout_gpus` | Minimum viable capacity retained for each stage during startup planning |
 | `runtime_online_replanning` | Use online metrics in planner decisions |
 | `runtime_manage_rollout_processes` | Let Libra start, stop, and adopt rollout processes |
 | `runtime_rollout_reconfigure_strategy` | `diff`, `restart_all`, `blue_green`, `prewarm`, or `cluster_swap` |
@@ -67,6 +64,9 @@ phase names allow the same converter to compare baseline runs.
 | `runtime_reconfigure_training` | Enable training-side pool changes |
 | `runtime_training_pool_plan_only` | Record training-pool changes without attaching workers |
 | `decouple_communication_domains` | Keep elastic gradient traffic off the core training DP process group |
+| `elastic_hybrid_replica_size_gpus` | Physical ranks in one complete TP×PP×CP DP replica; zero derives it from training topology |
+| `elastic_hybrid_min_rollout_gpus` | Rollout capacity that EHP may never borrow |
+| `elastic_hybrid_max_workers` | Deprecated and ignored; EHP has no policy maximum |
 | `runtime_batch_collection_timeout_s` | Timeout for collecting a training batch |
 | `runtime_batch_collection_max_retries` | Retries after a batch collection timeout |
 | `runtime_drain_before_reconfigure` | Drain in-flight rollout work before a runtime change |
@@ -74,19 +74,17 @@ phase names allow the same converter to compare baseline runs.
 See the [cluster manual](manual.md) for recommended combinations and launch
 examples.
 
-## NPU Rollout Weight Refresh
+## Rollout Weight Reloads
 
-The NPU path supports both disk-checkpoint reloads and a resident in-place
-reload. Each refresh publishes one request for the complete rollout instance
-set; workers write ACKs atomically with version, checkpoint, method, strategy,
-and timing metadata. Set `rollout_weight_reload_method: inplace` only when the
-Ascend vLLM server exposes `/reload_weights`; otherwise use the default
-`restart`. `parallel` is the default for independent workers. Set
-`rollout_weight_reload_strategy: serial` when several workers share a node and
-concurrent model loading is undesirable.
+When `rollout_weight_sync_mode` is `restart`, the trainer publishes one reload
+request for the complete rollout instance set and waits for the whole ACK batch.
+`rollout_weight_reload_method` controls how each vLLM instance applies the
+checkpoint: `restart` replaces the server process, while `inplace` calls the
+guarded reload endpoint and keeps the server resident. The default
+`rollout_weight_reload_strategy: parallel` applies the selected method to all
+instances concurrently. Use `serial` only as an operational fallback on nodes
+that cannot tolerate concurrent model loads.
 
-With `weight_sync_mode: hccl` and `rollout_weight_sync_mode: hccl`, Libra uses
-vLLM Ascend's official weight-transfer engine. The trainer is rank zero and all
-vLLM TP workers receive contiguous ranks across rollout instances. The
-communicator is initialized once and reused; a runtime rollout-topology change
-therefore requires restarting the HCCL-enabled rollout group.
+Each ACK records method, strategy, lock wait, process stop, model load, and total
+reload time. The trainer validates every ACK and reports the slowest instance
+for each refresh.

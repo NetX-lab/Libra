@@ -932,6 +932,8 @@ class FSDPTrainEngine:
         return self.model.state_dict()
 
     def _apply_elastic_inter_replica_gradients(self):
+        if not getattr(self, "_pending_hybrid_gradients", []):
+            return
         if self.elastic_gradient_domain is None:
             self._pending_hybrid_gradients.clear()
             return

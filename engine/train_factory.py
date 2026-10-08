@@ -44,7 +44,11 @@ def create_train_engine(config: AsyncRLConfig) -> TrainEngine:
         if config.megatron_model_provider == "mindspeed":
             from RL_Framework.engine.mindspeed_train_engine import MindSpeedTrainEngine
             engine_class = MindSpeedTrainEngine
-            extra = {"mindspeed_args_path": config.mindspeed_args_path, "global_batch_size": config.batch_size}
+            extra = {
+                "mindspeed_args_path": config.mindspeed_args_path,
+                "global_batch_size": config.batch_size,
+                "train_dp_size": config.train_dp_size,
+            }
         return engine_class(
             **extra,
             model_path=config.model_path,

@@ -23,6 +23,7 @@
 </p>
 
 <p align="center">
+  <a href="#latest-news">Latest News</a> ·
   <a href="#features">Features</a> ·
   <a href="#system-overview">Architecture</a> ·
   <a href="#installation">Installation</a> ·
@@ -37,6 +38,10 @@ changes during training.
 This repository accompanies the paper **"Libra: Efficient Resource Management
 for Agentic RL Post-Training"**. Read the [paper](https://arxiv.org/abs/2606.03077) for the full design.
 
+## Latest News
+
+- **2026-08-11** -- A new NPU_support branch has been added, enabling NPU support for all core functionalities.
+- **2026-08-03** -- Libra was officially open sourced.
 
 ## System Overview
 
@@ -68,7 +73,7 @@ RL_Framework/
 ├── env/                              # Tools, prompts, graders, and rewards
 ├── configs/                          # Hardware, model, and experiment configs
 ├── examples/                         # Training entrypoints and validation examples
-├── scripts/                          # NPU launchers and utilities
+├── scripts/                          # Local and Slurm launchers
 ├── data/                             # Dataset preparation utilities
 └── tests/                            # Unit and integration tests
 ```
@@ -114,12 +119,14 @@ RL_Framework/
 | [Data preparation](docs/data_preparation.md) | R2E-Gym, Search-R1, and DAPO-Math datasets |
 | [Configuration reference](docs/configuration_reference.md) | Core, Megatron-Core, planner, and elastic options |
 | [Observability](docs/observability.md) | Logs, manifests, planner decisions, and runtime history |
-| [NPU environment setup](docs/npu_environment.md) | Ascend CANN, PyTorch, and vLLM-Ascend environment |
+| [Environment setup](docs/env_creation.md) | Base software environment and dependencies |
+| [Compute-node setup](docs/env_creation_compute_node.md) | Environment preparation on cluster compute nodes |
+| [Multi-node Slurm guide](docs/slurm_multi_node_guide.md) | Distributed launch configuration and operational notes |
 | [Megatron-Core backend](docs/megatron_core_backend.md) | Backend architecture, configuration, and stability guidance |
 | [Runtime history collection](docs/history_data_collection.md) | Metrics and history data used by the online planner |
-
-> The NPU branch uses SSH, `torchrun`, and HCCL. The old Slurm examples for a
-> separate GPU cluster are intentionally not part of this branch.
+> Libra is a research artifact. The supplied launchers target multi-node NVIDIA
+> GPU clusters. Paths, partitions, node names, network devices, container
+> runtimes, and model locations should be adapted to your own cluster.
 
 ## Installation
 
@@ -127,25 +134,12 @@ RL_Framework/
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
-
-# Libra is imported as RL_Framework from the parent directory.
-export PYTHONPATH="$(dirname "$PWD"):${PYTHONPATH:-}"
+python -m pip install -e .
 ```
-
-For Ascend NPU hosts, use the NPU dependency split instead:
-
-```bash
-bash scripts/setup_npu_env.sh
-```
-
-See [Ascend NPU Environment](docs/npu_environment.md) for the current CANN
-8.5.x baseline, optional Megatron/vLLM Ascend installs, and the first
-CUDA-to-NPU adaptation points.
 
 If your platform has a compatible vLLM wheel, you can simplify installation by
 using that wheel instead of a source build. On clusters, install inside the same
-environment that the NPU launcher will activate.
+environment that Slurm jobs will activate.
 
 ## Testing
 
@@ -161,8 +155,8 @@ pytest -q \
 ```
 
 GPU, distributed, native-RDMA, and end-to-end tests are environment dependent.
-See the NPU launchers under `scripts/` and the distributed or elastic test
-suites under `tests/`.
+See the production Slurm launchers under `scripts/` and the distributed or
+elastic test suites under `tests/`.
 
 
 ## Citation
@@ -180,8 +174,13 @@ If Libra is useful in your research, please cite:
       url={https://arxiv.org/abs/2606.03077},
 }
 ```
+## Contact
+If you have any questions or feedback, please email Kaiwen Chen (kwchen@link.cuhk.edu.hk).
 
 ## Acknowledgements
+
+We gratefully acknowledge Huawei's 2012 Laboratories for their collaboration
+and support.
 
 Libra builds on ideas and components from the broader open-source RL and
 distributed-systems ecosystem, including verl, vLLM, Megatron-LM, AReaL, Sailor,

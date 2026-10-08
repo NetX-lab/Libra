@@ -13,14 +13,64 @@ __pycache__/
 .DS_Store
 ._*
 
-# Runtime outputs
+# Runtime outputs and experiment artifacts
 logs/
+**/logs/
+results/
+**/results/
+reports/
+**/reports/
+output/
+outputs/
+**/output/
+**/outputs/
+runs/
+**/runs/
+checkpoints/
+**/checkpoints/
+tensorboard/
+ray_results/
+mlruns/
 wandb/
 wandb_*/
 tmp/
-output/
+*.log
 *.out
 *.err
+*.ckpt
+*.pth
+*.pt
+*.npy
+*.npz
+*.safetensors
+
+# Per-run state that may be generated outside a top-level runs/ directory
+weights/
+**/weights/
+history/
+**/history/
+rollout_logs/
+**/rollout_logs/
+rollout_pids/
+**/rollout_pids/
+rollout_weight_sync/
+**/rollout_weight_sync/
+elastic_training_state/
+**/elastic_training_state/
+elastic_training_tasks/
+**/elastic_training_tasks/
+runtime_reconfiguration_events.jsonl
+effective_config.yaml
+grp_initial_config.yaml
+grp_initial_placement.json
+FINAL_VALIDATION_REPORT.md
+
+# Generated profiling and local publishing data
+examples/profile/
+.codex_publish/
+.remote_compare/
+ssh_askpass*
+.tmp_paramiko/
 
 # Local environments and offline packages
 rl_framework_env
@@ -39,4 +89,3 @@ data/r2e_gym_v1/manifest.json
 data/search_r1_train.jsonl
 search_r1_raw
 *.parquet
-./docs/cluster_collaborator_runbook_zh.md

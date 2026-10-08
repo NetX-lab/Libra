@@ -116,10 +116,18 @@ class MBridgeAdapter:
 
 
 class MindSpeedTrainEngine(MegatronCoreTrainEngine):
-    def __init__(self, *, mindspeed_args_path="", global_batch_size=32, **kwargs):
+    def __init__(self, *, mindspeed_args_path="", global_batch_size=32,
+                 train_dp_size=0, **kwargs):
         super().__init__(**kwargs)
         self.mindspeed_args_path = mindspeed_args_path
         self.global_batch_size = global_batch_size
+        self.train_dp_size = int(train_dp_size or 0)
+        if self.train_dp_size <= 0:
+            model_parallel = max(1, self.train_tp_size * self.train_pp_size)
+            if self.world_size % model_parallel == 0:
+                self.train_dp_size = self.world_size // model_parallel
+            else:
+                self.train_dp_size = 1
 
     def _prepare_accelerator(self):
         import torch_npu  # noqa: F401; register NPU and HCCL
@@ -129,6 +137,114 @@ class MindSpeedTrainEngine(MegatronCoreTrainEngine):
 
     def _device(self):
         return torch.device(f"npu:{self.local_rank}")
+
+    def get_elastic_core_replica_ids(self) -> list[str]:
+        # A DeepSeek-V4 replica includes all dense DP and expert-parallel
+        # shards.  The generic Megatron hook models each dense-DP lane as a
+        # separate replica, which would silently discard most EHP gradients.
+        return ["model"]
+
+    def get_elastic_local_core_id(self) -> str:
+        return "model"
+
+    def get_elastic_replica_size_gpus(self) -> int:
+        # EP is distributed over the DP dimension; it must not be multiplied
+        # into TP*PP*DP a second time. This is the complete V4 training mesh.
+        return max(1, self.train_tp_size * self.train_pp_size * self.train_dp_size)
+
+    def get_elastic_lane_state(self) -> dict[str, int]:
+        state = super().get_elastic_lane_state()
+        state["elastic_replica_rank"] = int(self.rank % self.get_elastic_replica_size_gpus())
+        return state
+
+    def configure_elastic_training(self, core_replica_ids=None,
+                                   decouple_communication_domains=True,
+                                   replica_world_size=None):
+        width = self.get_elastic_replica_size_gpus()
+        if replica_world_size is not None and int(replica_world_size) != width:
+            raise ValueError(
+                f"DeepSeek-V4 EHP requires a complete TP*PP*DP replica ({width} ranks); "
+                f"got {replica_world_size}"
+            )
+        return super().configure_elastic_training(
+            core_replica_ids=core_replica_ids or ["model"],
+            decouple_communication_domains=decouple_communication_domains,
+            replica_world_size=width,
+        )
+
+    def _apply_elastic_inter_replica_gradients(self):
+        """Merge EHP gradients with the matching dense or expert DP lane.
+
+        Megatron's finalizer has already reduced the core gradients. EHP's
+        gradient must then be added and synchronized over the parameter's own
+        DP group: expert parameters use expert-DP, while ordinary parameters
+        use dense-DP. A single flat DP reduction corrupts EP-sharded weights.
+        """
+        pending = getattr(self, "_pending_hybrid_gradients", [])
+        expected = set(getattr(self, "_elastic_step_hybrid_workers", ()))
+        if not pending and not expected:
+            return
+        if self.elastic_gradient_domain is None:
+            with self._hybrid_gradient_condition:
+                self._pending_hybrid_gradients.clear()
+            return
+        deadline = __import__("time").monotonic() + self._elastic_active_gradient_timeout_s
+        with self._hybrid_gradient_condition:
+            while expected:
+                present = {p.replica_id for p in self._pending_hybrid_gradients
+                           if p.replica_id in expected and (p.step < 0 or p.step == self._elastic_training_step)}
+                missing = expected - present
+                if not missing:
+                    break
+                remaining = deadline - __import__("time").monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"timed out waiting for active EHP gradients: {sorted(missing)}")
+                self._hybrid_gradient_condition.wait(timeout=min(remaining, 0.1))
+            pending = list(self._pending_hybrid_gradients)
+
+        params_and_grads = []
+        for chunk in self.model:
+            for param in chunk.parameters():
+                grad = getattr(param, "main_grad", None)
+                if grad is not None:
+                    params_and_grads.append((param, grad))
+        if not params_and_grads:
+            with self._hybrid_gradient_condition:
+                self._pending_hybrid_gradients.clear()
+            return
+        core_id = self.get_elastic_local_core_id()
+        reduced = self.elastic_gradient_domain.reduce_core_gradients(
+            core_gradients={core_id: tuple(g.detach() for _, g in params_and_grads)},
+            hybrid_payloads=pending,
+            step=self._elastic_training_step,
+            state_version=self.current_version,
+        )[core_id]
+        mpu = self._parallel_state()
+        for (param, grad), value in zip(params_and_grads, reduced):
+            grad.copy_(value.to(device=grad.device, dtype=grad.dtype))
+            is_expert = bool(getattr(param, "is_expert_parallel", False)) or getattr(param, "allreduce", True) is False
+            try:
+                group = mpu.get_data_parallel_group(with_context_parallel=True, is_expert=is_expert)
+            except TypeError as exc:
+                if is_expert and self.train_ep_size > 1:
+                    raise RuntimeError("MindSpeed EHP needs Megatron's expert-DP group accessor") from exc
+                group = mpu.get_data_parallel_group(with_context_parallel=True)
+            if dist.is_initialized() and dist.get_world_size(group=group) > 1:
+                dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=group)
+                grad.div_(dist.get_world_size(group=group))
+
+        if self._elastic_gradient_update_callback is not None:
+            from RL_Framework.infra.elastic import GradientUpdate
+            for payload in pending:
+                if payload.replica_id in expected and payload.replica_rank == self.rank % self.get_elastic_replica_size_gpus():
+                    self._elastic_gradient_update_callback(GradientUpdate(
+                        replica_id=payload.replica_id,
+                        tensors=tuple(g.detach().cpu() for _, g in params_and_grads),
+                        step=payload.step, state_version=self.current_version,
+                        membership_epoch=payload.membership_epoch,
+                    ))
+        with self._hybrid_gradient_condition:
+            self._pending_hybrid_gradients.clear()
 
     def build_mindspeed_args(self, max_seq_length):
         path = Path(self.mindspeed_args_path) if self.mindspeed_args_path else (
@@ -344,12 +460,6 @@ class MindSpeedTrainEngine(MegatronCoreTrainEngine):
         result["version"] = self.current_version
         return result
 
-    def configure_elastic_training(self, *args, **kwargs):
-        raise NotImplementedError(
-            "MindSpeed EHP requires separate dense and expert replica domains; "
-            "the TP*PP dense replica is not a complete EP-sharded model"
-        )
-
     def compute_elastic_gradient_payload(self, trajectories, *, worker_id, target_core_id,
                                          step, state_version, membership_epoch):
         self._zero_grad()
@@ -358,6 +468,7 @@ class MindSpeedTrainEngine(MegatronCoreTrainEngine):
         return GradientPayload(
             replica_id=worker_id, target_core_id=target_core_id,
             tensors=tuple(g.detach().cpu() for g in self._model_main_gradients()),
-            replica_rank=self.rank, replica_world_size=self.world_size,
+            replica_rank=int(self.rank % self.get_elastic_replica_size_gpus()),
+            replica_world_size=self.get_elastic_replica_size_gpus(),
             step=step, state_version=state_version, membership_epoch=membership_epoch,
         )

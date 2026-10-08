@@ -88,6 +88,8 @@ def test_megatron_core_optimizer_offload_defaults_to_disabled():
 
     assert config.megatron_optimizer_cpu_offload is False
     assert config.megatron_optimizer_offload_fraction == 0.0
+    assert config.rollout_weight_reload_method == "restart"
+    assert config.rollout_weight_reload_strategy == "parallel"
 
 
 def test_megatron_core_rejects_offload_fraction_without_cpu_offload():
@@ -95,40 +97,46 @@ def test_megatron_core_rejects_offload_fraction_without_cpu_offload():
         make_config(megatron_optimizer_offload_fraction=1.0)
 
 
-def test_megatron_core_accepts_official_hccl_rollout_sync_on_npu():
+@pytest.mark.parametrize("method", ["restart", "inplace"])
+def test_rollout_weight_reload_methods_are_valid(method):
+    config = make_config(rollout_weight_reload_method=method)
+
+    assert config.rollout_weight_reload_method == method
+
+
+def test_rejects_unknown_rollout_weight_reload_method():
+    with pytest.raises(ValueError, match="rollout_weight_reload_method"):
+        make_config(rollout_weight_reload_method="unknown")
+
+
+def test_rejects_unknown_rollout_weight_reload_strategy():
+    with pytest.raises(ValueError, match="rollout_weight_reload_strategy"):
+        make_config(rollout_weight_reload_strategy="unknown")
+
+
+def test_direct_nccl_rollout_sync_is_valid_for_megatron_core():
     config = make_config(
-        device_backend="npu",
-        weight_sync_mode="hccl",
-        rollout_weight_sync_mode="hccl",
+        weight_sync_mode="nccl",
+        rollout_weight_sync_mode="nccl",
+        rollout_weight_sync_control_dir="/tmp/libra-rollout-sync",
     )
 
-    assert config.weight_sync_mode == "hccl"
-    assert config.rollout_weight_sync_mode == "hccl"
+    assert config.weight_sync_mode == "nccl"
+    assert config.rollout_weight_sync_mode == "nccl"
 
 
-def test_hccl_weight_sync_requires_matching_rollout_mode():
-    with pytest.raises(ValueError, match="requires rollout_weight_sync_mode"):
+def test_direct_nccl_rollout_sync_rejects_serial_reload():
+    with pytest.raises(ValueError, match="parallel strategy"):
         make_config(
-            device_backend="npu",
-            weight_sync_mode="hccl",
-            rollout_weight_sync_mode="restart",
+            weight_sync_mode="nccl",
+            rollout_weight_sync_mode="nccl",
+            rollout_weight_reload_strategy="serial",
         )
 
 
-def test_npu_reload_method_accepts_inplace():
-    config = make_config(
-        device_backend="npu",
-        rollout_weight_reload_method="inplace",
-    )
-
-    assert config.rollout_weight_reload_method == "inplace"
-
-
-def test_reload_method_rejects_unknown_value():
-    with pytest.raises(ValueError, match="rollout_weight_reload_method"):
-        make_config(rollout_weight_reload_method="hot_swap")
-
-
-def test_rollout_sync_mode_rejects_unknown_value():
-    with pytest.raises(ValueError, match="rollout_weight_sync_mode"):
-        make_config(rollout_weight_sync_mode="nccl")
+def test_direct_nccl_rollout_sync_rejects_disk_transport():
+    with pytest.raises(ValueError, match="weight_sync_mode='nccl'"):
+        make_config(
+            weight_sync_mode="disk",
+            rollout_weight_sync_mode="nccl",
+        )

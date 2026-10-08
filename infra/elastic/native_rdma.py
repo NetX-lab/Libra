@@ -254,6 +254,11 @@ class NativeRDMAGradientClient:
                     "target_core_id": payload.target_core_id,
                     "tensors": tuple(t.detach().cpu() for t in payload.tensors),
                     "zero_placeholder": payload.zero_placeholder,
+                    "replica_rank": payload.replica_rank,
+                    "replica_world_size": payload.replica_world_size,
+                    "step": payload.step,
+                    "state_version": payload.state_version,
+                    "membership_epoch": payload.membership_epoch,
                 },
                 path,
             )
@@ -348,6 +353,11 @@ class NativeRDMAGradientServer:
                     target_core_id=str(data["target_core_id"]),
                     tensors=tuple(data["tensors"]),
                     zero_placeholder=bool(data.get("zero_placeholder", False)),
+                    replica_rank=int(data.get("replica_rank", 0)),
+                    replica_world_size=int(data.get("replica_world_size", 1)),
+                    step=int(data.get("step", -1)),
+                    state_version=int(data.get("state_version", -1)),
+                    membership_epoch=int(data.get("membership_epoch", 0)),
                 )
                 self.on_payload(payload)
                 self._received += 1

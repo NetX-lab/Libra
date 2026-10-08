@@ -1,5 +1,6 @@
-import asyncio
+import pytest
 
+from RL_Framework.config import AsyncRLConfig
 from RL_Framework.workflow.r2e_gym import R2EGymWorkflow
 
 
@@ -29,28 +30,8 @@ class _Engine:
         return {"text": "[ISSUE] sampled [/ISSUE]", "logprobs": []}
 
 
-class _CMLFQEvalEngine(_Engine):
-    def __init__(self):
-        super().__init__()
-        self.tool_returns = []
-        self.finished = []
-
-    def begin_cmlfq_request(self, prompt_id, input_tokens):
-        assert prompt_id == "eval-1"
-        assert input_tokens > 0
-        return "request-1"
-
-    def route_cmlfq_tool_return(self, request_id, event, generated_tokens):
-        self.tool_returns.append((request_id, event, generated_tokens))
-
-    def finish_cmlfq_request(self, request_id, generated_tokens):
-        self.finished.append((request_id, generated_tokens))
-
-    def cancel_cmlfq_request(self, request_id):
-        raise AssertionError(f"unexpected cancellation: {request_id}")
-
-
-def test_r2e_rollout_index_produces_distinct_reproducible_sampling_seeds():
+@pytest.mark.asyncio
+async def test_r2e_rollout_index_produces_distinct_reproducible_sampling_seeds():
     workflow = R2EGymWorkflow(
         reward_fn=lambda **_: 0.5,
         tokenizer=_Tokenizer(),
@@ -63,45 +44,43 @@ def test_r2e_rollout_index_produces_distinct_reproducible_sampling_seeds():
     data = {"prompt_id": "sample-42", "task_text": "Describe the failure."}
     engine = _Engine()
 
-    asyncio.run(workflow.run_episode(engine, data, version=3, rollout_index=0))
-    asyncio.run(workflow.run_episode(engine, data, version=3, rollout_index=1))
-    asyncio.run(workflow.run_episode(engine, data, version=3, rollout_index=0))
+    await workflow.run_episode(engine, data, version=3, rollout_index=0)
+    await workflow.run_episode(engine, data, version=3, rollout_index=1)
+    await workflow.run_episode(engine, data, version=3, rollout_index=0)
 
     first, second, repeated = [request["seed"] for request in engine.requests]
     assert first != second
     assert first == repeated
-    assert all(request["stop"] == ["[/ISSUE]"] for request in engine.requests)
-    assert all(
-        request["include_stop_str_in_output"] is True
-        for request in engine.requests
+
+
+def test_r2e_stop_reward_loads_from_production_config():
+    config = AsyncRLConfig.from_yaml(
+        "configs/r2e_gym_qwen3_14b_mcore_gpu_6node48_production_ehp.yaml"
     )
 
+    assert config.r2e_stop_reward == pytest.approx(0.5)
 
-def test_r2e_eval_shares_episode_budget_and_uses_cmlfq_lifecycle():
+
+@pytest.mark.asyncio
+async def test_r2e_stop_reward_ends_multiturn_rollout(monkeypatch):
+    monkeypatch.setattr(
+        "RL_Framework.workflow.r2e_gym.evaluate_issue",
+        lambda **_: {"reward": 0.6},
+    )
     workflow = R2EGymWorkflow(
-        reward_fn=lambda **_: 0.0,
+        reward_fn=lambda **_: 0.6,
         tokenizer=_Tokenizer(),
         max_turns=3,
-        max_new_tokens=90,
+        max_new_tokens=32,
         max_seq_length=512,
-        stop_reward=1.0,
+        stop_reward=0.5,
     )
-    engine = _CMLFQEvalEngine()
-    dataset = [{"prompt_id": "eval-1", "task_text": "Describe the failure."}]
+    engine = _Engine()
 
-    stats = asyncio.run(
-        workflow.evaluate(
-            engine,
-            dataset,
-            max_samples=1,
-            concurrency=1,
-            max_new_tokens=90,
-        )
+    trajectory = await workflow.run_episode(
+        engine,
+        {"prompt_id": "stop-threshold", "task_text": "Describe the failure."},
     )
 
-    assert stats["eval_samples"] == 1
-    assert engine.requests
-    assert engine.requests[0]["max_new_tokens"] <= 30
-    assert engine.requests[0]["request_id"] == "request-1"
-    assert engine.tool_returns
-    assert engine.finished and engine.finished[0][0] == "request-1"
+    assert len(engine.requests) == 1
+    assert trajectory["n_turns"] == 1

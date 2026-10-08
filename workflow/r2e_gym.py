@@ -40,10 +40,10 @@ class R2EGymWorkflow:
         max_new_tokens: int = 2048,
         max_seq_length: int = 8192,
         max_prompt_tokens: int | None = None,
+        stop_reward: float = 0.5,
         temperature: float = 1.0,
         top_p: float = 1.0,
         n_samples: int = 1,
-        stop_reward: float = 0.92,
     ):
         self.reward_fn = reward_fn
         self.tokenizer = tokenizer
@@ -53,10 +53,12 @@ class R2EGymWorkflow:
         if max_prompt_tokens is None:
             max_prompt_tokens = min(8192, max(512, self.max_seq_length // 2))
         self.max_prompt_tokens = max(128, min(max_prompt_tokens, self.max_seq_length - 128))
+        if not 0.0 <= stop_reward <= 1.0:
+            raise ValueError("stop_reward must be between 0 and 1")
+        self.stop_reward = float(stop_reward)
         self.temperature = temperature
         self.top_p = top_p
         self.n_samples = n_samples
-        self.stop_reward = min(1.0, max(0.0, float(stop_reward)))
 
     def _encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text or "", add_special_tokens=False)
@@ -174,16 +176,15 @@ class R2EGymWorkflow:
                     "temperature": self.temperature,
                     "top_p": self.top_p,
                     "n": 1,
-                    # The model is explicitly asked to emit this delimiter.
-                    # Stop as soon as the issue is complete instead of letting
-                    # malformed/repetitive tails consume the whole 30K budget.
+                    # The output contract has an explicit closing delimiter.
+                    # Stopping there prevents repetitive tails from consuming
+                    # the remaining 30K generation budget.
                     "stop": ["[/ISSUE]"],
                     "include_stop_str_in_output": True,
                     "seed": int.from_bytes(
-                        hashlib.blake2b(
-                            f"{prompt_id}:{version}:{rollout_index}:{turn}".encode(),
-                            digest_size=8,
-                        ).digest(),
+                        hashlib.sha256(
+                            f"{prompt_id}:{version}:{rollout_index}:{turn}".encode()
+                        ).digest()[:8],
                         "big",
                     ) % (2**31 - 1),
                 }
@@ -215,10 +216,7 @@ class R2EGymWorkflow:
                     expected_output_json=data.get("expected_output_json"),
                     modified_files=data.get("modified_files"),
                 )
-                if (
-                    turn >= self.max_turns - 1
-                    or metrics["reward"] >= self.stop_reward
-                ):
+                if turn >= self.max_turns - 1 or metrics["reward"] >= self.stop_reward:
                     break
 
                 feedback = format_validator_feedback(metrics)
@@ -237,7 +235,7 @@ class R2EGymWorkflow:
                 tool_event = {
                     "tool_type": "r2e_issue_validator",
                     "output": feedback,
-                    "status": "success" if metrics["reward"] >= 0.5 else "failure",
+                    "status": "success" if metrics["reward"] >= self.stop_reward else "failure",
                     "payload_tokens": len(feedback_tokens),
                     "token_position": generated_tokens,
                     "turn": turn,
@@ -404,10 +402,9 @@ class R2EGymWorkflow:
                         ):
                             break
                         feedback = format_validator_feedback(metrics)
-                        generated_tokens += len(self._encode(feedback))
-                        route_tool_return = getattr(
-                            engine, "route_cmlfq_tool_return", None
-                        )
+                        feedback_tokens = len(self._encode(feedback))
+                        generated_tokens += feedback_tokens
+                        route_tool_return = getattr(engine, "route_cmlfq_tool_return", None)
                         if request_id and callable(route_tool_return):
                             route_tool_return(
                                 request_id,
@@ -419,7 +416,7 @@ class R2EGymWorkflow:
                                         if metrics["reward"] >= self.stop_reward
                                         else "failure"
                                     ),
-                                    "payload_tokens": len(self._encode(feedback)),
+                                    "payload_tokens": feedback_tokens,
                                     "token_position": generated_tokens,
                                     "turn": turn,
                                     "reward": metrics["reward"],

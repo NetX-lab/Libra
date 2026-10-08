@@ -90,7 +90,6 @@ class CMLFQScheduler(BaseScheduler):
         shared_load_dir: str = "",
         shared_load_ttl_s: float = 60.0,
         shared_load_heartbeat_s: float = 10.0,
-        max_local_queue_length: int = 0,
     ):
         super().__init__(name="C-MLFQ")
 
@@ -111,19 +110,9 @@ class CMLFQScheduler(BaseScheduler):
         for bname, bcfg in self._buckets.items():
             tp_degrees = bcfg.get("tp_degrees", [1, 2])
             all_other_tps = []
-            bucket_index = self._sorted_bucket_names.index(bname)
-            # When a queue is full, advance toward larger/stronger TP pools
-            # before borrowing a smaller pool.  This keeps long-tail overflow
-            # from falling straight back onto TP1 merely because dict order
-            # listed the short bucket first.
-            fallback_buckets = (
-                self._sorted_bucket_names[bucket_index + 1 :]
-                + list(reversed(self._sorted_bucket_names[:bucket_index]))
-            )
-            for other_name in fallback_buckets:
-                all_other_tps.extend(
-                    self._buckets[other_name].get("tp_degrees", [])
-                )
+            for other_name, other_cfg in self._buckets.items():
+                if other_name != bname:
+                    all_other_tps.extend(other_cfg.get("tp_degrees", []))
             self._bucket_rules[bname] = {
                 "preferred_tp_degrees": tp_degrees,
                 "fallback_tp_degrees": all_other_tps,
@@ -135,7 +124,6 @@ class CMLFQScheduler(BaseScheduler):
         else:
             self._strategy = LoadBalanceStrategy.LEAST_CONNECTIONS
         self._max_queue_length = max_queue_length
-        self._max_local_queue_length = max(0, int(max_local_queue_length))
         self._enable_fallback = enable_fallback
         self._rebuild_interval = max(0, rebuild_interval)
         self._max_recent_trajectories = max(1, max_recent_trajectories)
@@ -218,23 +206,6 @@ class CMLFQScheduler(BaseScheduler):
 
         return result
 
-    def get_bucket_max_tokens(self, bucket: str) -> int:
-        """Return the configured per-turn MLFQ quantum for a bucket."""
-        threshold = int(self._bucket_thresholds.get(bucket, 0) or 0)
-        return max(0, threshold)
-
-    def get_request_remaining_quantum(self, request_id: str) -> int:
-        """Return tokens left before this request reaches its bucket boundary."""
-        state = self._request_states.get(request_id)
-        if state is None:
-            return 0
-        threshold = int(
-            self._bucket_thresholds.get(state.current_bucket, 0) or 0
-        )
-        if threshold <= 0:
-            return 0
-        return max(1, threshold - max(0, int(state.generated_tokens)))
-
     # ----------------------------------------------------------------
 
     # ----------------------------------------------------------------
@@ -271,42 +242,6 @@ class CMLFQScheduler(BaseScheduler):
         )
 
         if node is None or node.visit_count == 0:
-            # A fresh run has no prefix-tree evidence yet. Falling back to
-            # "never migrate" pins every cold-start request to TP1, including
-            # a 30K request which has already consumed the short-queue quantum.
-            # Preserve the causal-tree policy once evidence exists, but use
-            # classic MLFQ quantum exhaustion to advance one bucket meanwhile.
-            try:
-                current_index = self._sorted_bucket_names.index(
-                    req_state.current_bucket
-                )
-            except ValueError:
-                current_index = -1
-            current_limit = int(
-                self._bucket_thresholds.get(req_state.current_bucket, 0) or 0
-            )
-            if (
-                current_index >= 0
-                and current_index + 1 < len(self._sorted_bucket_names)
-                and current_limit > 0
-                and generated_tokens >= current_limit
-            ):
-                target_bucket = self._sorted_bucket_names[current_index + 1]
-                logger.info(
-                    "[CMLFQ] cold-start quantum exhausted: request=%s, "
-                    "%s -> %s, generated=%s, quantum=%s",
-                    request_id,
-                    req_state.current_bucket,
-                    target_bucket,
-                    generated_tokens,
-                    current_limit,
-                )
-                return CMLFQMigrationDecision(
-                    should_migrate=True,
-                    reason="cold_start_quantum_exhausted",
-                    current_bucket=req_state.current_bucket,
-                    target_bucket=target_bucket,
-                )
             return CMLFQMigrationDecision(
                 should_migrate=False,
                 reason="tree_node_not_found",
@@ -581,13 +516,6 @@ class CMLFQScheduler(BaseScheduler):
 
 
             all_ready = [h for h in self._instances if h.is_ready]
-            if self._max_local_queue_length > 0:
-                locally_available = [
-                    h for h in all_ready
-                    if h.active_requests < self._max_local_queue_length
-                ]
-                if locally_available:
-                    all_ready = locally_available
             if all_ready:
                 selected = min(
                     all_ready,
@@ -629,11 +557,6 @@ class CMLFQScheduler(BaseScheduler):
                 h for h in self._instances_by_tp.get(tp_degree, [])
                 if h.is_ready
             ]
-            if self._max_local_queue_length > 0:
-                candidates = [
-                    h for h in candidates
-                    if h.active_requests < self._max_local_queue_length
-                ]
             if not candidates:
                 continue
             if self._max_queue_length > 0:
@@ -804,8 +727,5 @@ class CMLFQScheduler(BaseScheduler):
             ),
             shared_load_heartbeat_s=getattr(
                 sched, "cmlfq_shared_load_heartbeat_s", 10.0
-            ),
-            max_local_queue_length=getattr(
-                sched, "cmlfq_max_local_queue_length", 0
             ),
         )

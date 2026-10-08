@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run vLLM and refresh checkpoints through a device-neutral file handshake."""
+"""Run vLLM and refresh checkpoints through restart or in-place reload."""
 
 from __future__ import annotations
 
@@ -27,13 +27,11 @@ def parse_args() -> argparse.Namespace:
         "--reload-strategy",
         choices=("parallel", "serial"),
         default="parallel",
-        help="Reload independently addressed workers concurrently or serialize per node",
     )
     parser.add_argument(
         "--reload-method",
         choices=("restart", "inplace"),
         default="restart",
-        help="Replace weights by restarting vLLM or using its resident reload API",
     )
     parser.add_argument("--poll-interval", type=float, default=0.25)
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -61,7 +59,7 @@ def wait_until_ready(process: subprocess.Popen, url: str, timeout: float) -> Non
 
 
 def reload_inplace(health_url: str, checkpoint_path: str, timeout: float) -> dict:
-    """Ask a resident vLLM server to replace weights without restarting."""
+    """Ask a running vLLM server to replace its resident model weights."""
     endpoint = health_url.rsplit("/", 1)[0] + "/reload_weights"
     payload = json.dumps(
         {"checkpoint_path": checkpoint_path, "timeout_seconds": timeout}
@@ -74,9 +72,27 @@ def reload_inplace(health_url: str, checkpoint_path: str, timeout: float) -> dic
     )
     with urllib.request.urlopen(request, timeout=timeout + 10) as response:
         if response.status != 200:
-            raise RuntimeError(f"vLLM in-place reload returned HTTP {response.status}")
-        body = response.read()
-    return json.loads(body.decode("utf-8")) if body else {}
+            raise RuntimeError(f"vLLM reload returned HTTP {response.status}")
+        return json.loads(response.read().decode("utf-8"))
+
+
+def reload_nccl(
+    health_url: str,
+    payload: dict,
+    timeout: float,
+) -> dict:
+    """Ask a resident vLLM server to receive weights over NCCL."""
+    endpoint = health_url.rsplit("/", 1)[0] + "/reload_weights_nccl"
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout + 10) as response:
+        if response.status != 200:
+            raise RuntimeError(f"vLLM NCCL reload returned HTTP {response.status}")
+        return json.loads(response.read().decode("utf-8"))
 
 
 def stop_process(process: subprocess.Popen | None) -> None:
@@ -105,13 +121,10 @@ def node_reload_lock(control_dir: Path):
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:
-    """Publish a complete ACK/error payload without exposing partial JSON."""
+    """Atomically publish a reload acknowledgement or error."""
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp_path.write_text(json.dumps(payload), encoding="utf-8")
-        tmp_path.replace(path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def main() -> int:
@@ -146,14 +159,17 @@ def main() -> int:
                 try:
                     request = json.loads(request_path.read_text(encoding="utf-8"))
                     requested_version = int(request["version"])
-                    checkpoint_path = str(request["checkpoint_path"])
+                    reload_mode = str(request.get("mode", "checkpoint")).lower()
+                    checkpoint_path = str(request.get("checkpoint_path", ""))
                     reload_method = str(
                         request.get("reload_method", args.reload_method)
                     ).lower()
                     reload_strategy = str(
                         request.get("reload_strategy", args.reload_strategy)
                     ).lower()
-                    if reload_method not in {"restart", "inplace"}:
+                    if reload_mode not in {"checkpoint", "nccl"}:
+                        raise ValueError(f"unsupported reload mode: {reload_mode}")
+                    if reload_mode == "checkpoint" and reload_method not in {"restart", "inplace"}:
                         raise ValueError(f"unsupported reload method: {reload_method}")
                     if reload_strategy not in {"parallel", "serial"}:
                         raise ValueError(
@@ -163,7 +179,7 @@ def main() -> int:
                     time.sleep(max(0.05, args.poll_interval))
                     continue
                 if requested_version > current_version:
-                    if not Path(checkpoint_path).is_dir():
+                    if reload_mode == "checkpoint" and not Path(checkpoint_path).is_dir():
                         raise FileNotFoundError(checkpoint_path)
                     current_version = requested_version
                     reload_started_at = time.time()
@@ -171,12 +187,28 @@ def main() -> int:
                     try:
                         reload_guard = (
                             node_reload_lock(control_dir)
-                            if reload_strategy == "serial"
+                            if reload_strategy == "serial" and reload_mode != "nccl"
                             else contextlib.nullcontext()
                         )
                         with reload_guard:
                             guard_acquired_at = time.time()
-                            if reload_method == "restart":
+                            if reload_mode == "nccl":
+                                stopped_at = guard_acquired_at
+                                response = reload_nccl(
+                                    args.health_url,
+                                    {
+                                        "host": str(request["nccl_host"]),
+                                        "port": int(request["nccl_port"]),
+                                        "world_size": int(request["nccl_world_size"]),
+                                        "rank_offset": int(
+                                            request["nccl_rank_offsets"][args.instance_id]
+                                        ),
+                                        "timeout_seconds": float(args.ready_timeout),
+                                        "chunk_bytes": int(request["nccl_chunk_bytes"]),
+                                    },
+                                    args.ready_timeout,
+                                )
+                            elif reload_method == "restart":
                                 stop_process(process)
                                 stopped_at = time.time()
                                 process = launch(checkpoint_path)
@@ -195,8 +227,8 @@ def main() -> int:
                                 "instance_id": args.instance_id,
                                 "version": current_version,
                                 "checkpoint_path": checkpoint_path,
-                                "reload_method": reload_method,
                                 "reload_strategy": reload_strategy,
+                                "reload_method": reload_method,
                                 "error": str(exc),
                                 "failed_at": time.time(),
                             },
@@ -210,13 +242,14 @@ def main() -> int:
                             "instance_id": args.instance_id,
                             "version": current_version,
                             "checkpoint_path": checkpoint_path,
-                            "reload_method": reload_method,
                             "reload_strategy": reload_strategy,
+                            "reload_method": reload_method,
                             "reload_started_at": reload_started_at,
                             "guard_acquired_at": guard_acquired_at,
                             "stopped_at": stopped_at,
                             "ready_at": ready_at,
-                            "lock_wait_seconds": guard_acquired_at - reload_started_at,
+                            "lock_wait_seconds": guard_acquired_at
+                            - reload_started_at,
                             "stop_seconds": stopped_at - guard_acquired_at,
                             "load_seconds": ready_at - stopped_at,
                             "total_seconds": ready_at - reload_started_at,

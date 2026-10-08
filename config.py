@@ -341,8 +341,6 @@ class SchedulingConfig:
 
     cmlfq_shared_load_heartbeat_s: float = 10.0
 
-    cmlfq_max_local_queue_length: int = 0
-
     cmlfq_payload_small_threshold: int = 500
     cmlfq_payload_large_threshold: int = 5000
 
@@ -451,11 +449,34 @@ class GlobalResourcePlannerConfig:
     reconfiguration_cost_s: float = 15.0
     max_history_size: int = 4096
     allowed_rollout_tp: list[int] = field(default_factory=lambda: [1, 2, 4, 8])
+    rollout_node_tp_pattern: list[int] = field(default_factory=list)
     require_heterogeneous_rollout_tp: bool = False
     allowed_train_tp: list[int] = field(default_factory=list)
     allowed_train_pp: list[int] = field(default_factory=list)
     fixed_train_gpus: int = 0
+    # Startup placement is a GRP decision.  ``fixed_train_gpus`` is retained
+    # only for backwards-compatible, explicitly configured deployments and is
+    # ignored when this strategy is ``grp``.
+    initial_allocation_strategy: str = "grp"  # grp | configured
+    # Set only by the preflight planner after it has applied a concrete GRP plan.
+    # A live trainer refuses to start with a fixed seed split when GRP is required.
+    initial_allocation_applied: bool = False
+    allocation_granularity_gpus: int = 1
+    min_train_gpus: int = 1
+    min_rollout_gpus: int = 1
     micro_batch_sizes: list[int] = field(default_factory=list)
+    startup_profile_enabled: bool = True
+    startup_profile_sample_size: int = 64
+    startup_profile_strategy: str = "spread"  # spread | random | first
+    startup_profile_seed: int = 0
+    startup_profile_samples_per_prompt: int = 1
+    startup_profile_dataset_jsonl: str = ""
+    startup_profile_history_jsonl: str = ""
+    startup_profile_summary_json: str = ""
+    startup_profile_reuse_existing: bool = True
+    startup_profile_allow_synthetic_fallback: bool = False
+    # Training-side memory safety. The estimate is used during GRP candidate
+    # pruning; the runtime dry-run validates one complete recompute path.
     memory_budget_check_enabled: bool = True
     memory_budget_dry_run_enabled: bool = True
     memory_budget_safety_margin_bytes: float = 2.0e9
@@ -463,6 +484,8 @@ class GlobalResourcePlannerConfig:
     memory_budget_workspace_factor: float = 1.5
     apply_to_runtime: bool = True
     verbose: bool = False
+    runtime_length_profile_enabled: bool = True
+    runtime_length_profile_jsonl: str = ""
     runtime_async_planning: bool = True
     runtime_max_pending_plans: int = 1
     runtime_dynamic_reconfiguration_enabled: bool = True
@@ -526,9 +549,27 @@ class GlobalResourcePlannerConfig:
     hybrid_training_prewarm_count: int = 0
     hybrid_training_prewarm_worker_ids: list[str] = field(default_factory=list)
     hybrid_worker_python: str = "python"
+    # Multi-node EHP templates are formatted once per host. Available fields
+    # include host, gpus, nnodes, node_rank, master_addr and master_port; the
+    # template must execute each rank launcher on that assigned host.
     hybrid_worker_command_template: str = ""
     hybrid_worker_task_dir: str = "./logs/elastic_training_tasks"
     hybrid_worker_ready_timeout_s: float = 60.0
+    hybrid_worker_remote_control_enabled: bool = False
+    hybrid_worker_remote_control_dir: str = ""
+    elastic_hybrid_planning_enabled: bool = False
+    elastic_hybrid_require_planner_signal: bool = False
+    # Deprecated and ignored. EHP capacity is always derived from the currently
+    # available rollout GPUs and complete-replica width.
+    elastic_hybrid_max_workers: int = 0
+    elastic_hybrid_replica_size_gpus: int = 0
+    elastic_hybrid_min_rollout_gpus: int = 0
+    elastic_hybrid_borrow_train_rollout_ratio: float = 1.15
+    elastic_hybrid_release_train_rollout_ratio: float = 0.90
+    elastic_hybrid_max_rollout_pressure: float = 0.80
+    elastic_hybrid_join_timeout_s: float = 180.0
+    elastic_hybrid_signal_ttl_steps: int = 20
+    elastic_hybrid_require_isolated_ccl: bool = False
     gradient_transport_backend: str = "tcp"  # tcp | native_rdma
     decouple_communication_domains: bool = True
     gradient_server_host: str = "127.0.0.1"
@@ -539,6 +580,12 @@ class GlobalResourcePlannerConfig:
     native_rdma_gid_index: int = 0
     native_rdma_ib_port: int = 1
     native_rdma_max_bytes: int = 67108864
+    hybrid_worker_mode: str = "megatron_core"
+    hybrid_worker_config_path: str = ""
+    hybrid_worker_endpoint_dir: str = ""
+    hybrid_lockstep_gradient_sync: bool = True
+    hybrid_active_gradient_timeout_s: float = 300.0
+    hybrid_update_timeout_s: float = 300.0
 
     @classmethod
     def from_dict(cls, d: dict) -> "GlobalResourcePlannerConfig":
@@ -552,8 +599,6 @@ class AsyncRLConfig:
     model_path: str
     tokenizer_path: str = ""
 
-    device_backend: str = "auto"  # auto | cuda | npu | cpu
-    distributed_backend: str = "auto"  # auto | nccl | hccl | gloo
     rollout_backend: str = "vllm"  # vllm | mock
 
 
@@ -605,25 +650,19 @@ class AsyncRLConfig:
     phase_trace_dir: str = ""
 
 
-    weight_sync_mode: str = "disk"  # disk | nccl | hccl
+    weight_sync_mode: str = "disk"
     sync_path: str = "./logs/async_rl_weights"
-    rollout_weight_sync_mode: str = "none"  # none | restart | hccl
+    rollout_weight_sync_mode: str = "none"  # none | restart | nccl
     rollout_weight_sync_control_dir: str = ""
     rollout_weight_sync_timeout_s: float = 1200.0
     rollout_weight_sync_export_only: bool = True
     rollout_weight_reload_method: str = "restart"  # restart | inplace
-    # Rollout workers use the device-native vLLM restart path on NPU.  The
-    # strategy is transport-agnostic and controls whether independent worker
-    # processes reload concurrently or serialize behind a node lock.
     rollout_weight_reload_strategy: str = "parallel"  # parallel | serial
+    rollout_nccl_host: str = ""
+    rollout_nccl_port: int = 29620
+    rollout_nccl_chunk_mb: int = 256
+    rollout_nccl_rate_limit_gbps: float = 0.0
     rollout_weight_sync_poll_interval_s: float = 0.05
-    rollout_hccl_host: str = ""
-    rollout_hccl_port: int = 29620
-    rollout_hccl_packed: bool = True
-    rollout_hccl_packed_buffer_mb: int = 1024
-    rollout_hccl_buffer_headroom_mb: int = 128
-    rollout_hccl_num_buffers: int = 2
-    rollout_hccl_checkpoint_format: bool = True
     require_rollout_weight_sync: bool = False
 
 
@@ -642,7 +681,7 @@ class AsyncRLConfig:
     # environment variables.
     r2e_max_turns: int = 3
     r2e_max_prompt_tokens: int = 0
-    r2e_stop_reward: float = 0.92
+    r2e_stop_reward: float = 0.5
     n_samples: int = 4
     temperature: float = 1.0
     top_p: float = 1.0
@@ -737,49 +776,39 @@ class AsyncRLConfig:
             raise ValueError("train_gpus must be greater than zero")
 
 
-        if self.weight_sync_mode not in ["disk", "nccl", "hccl"]:
-            raise ValueError("weight_sync_mode must be 'disk', 'nccl', or 'hccl'")
-        if self.rollout_weight_sync_mode not in {"none", "restart", "hccl"}:
+        if self.weight_sync_mode not in ["disk", "nccl"]:
+            raise ValueError("weight_sync_mode must be 'disk' or 'nccl'")
+        if self.rollout_weight_sync_mode not in ["none", "restart", "nccl"]:
             raise ValueError(
-                "rollout_weight_sync_mode must be 'none', 'restart', or 'hccl'"
+                "rollout_weight_sync_mode must be 'none', 'restart', or 'nccl'"
             )
-        if self.rollout_weight_reload_strategy not in {"parallel", "serial"}:
-            raise ValueError(
-                "rollout_weight_reload_strategy must be 'parallel' or 'serial'"
-            )
-        if self.rollout_weight_reload_method not in {"restart", "inplace"}:
+        if self.rollout_weight_reload_method not in ["restart", "inplace"]:
             raise ValueError(
                 "rollout_weight_reload_method must be 'restart' or 'inplace'"
             )
-        if self.rollout_weight_sync_poll_interval_s <= 0:
+        if self.rollout_weight_reload_strategy not in ["parallel", "serial"]:
             raise ValueError(
-                "rollout_weight_sync_poll_interval_s must be greater than zero"
+                "rollout_weight_reload_strategy must be 'parallel' or 'serial'"
             )
-        if self.rollout_weight_sync_mode == "hccl":
-            if self.weight_sync_mode != "hccl":
-                raise ValueError(
-                    "rollout_weight_sync_mode='hccl' requires weight_sync_mode='hccl'"
-                )
+        if self.rollout_weight_sync_mode == "nccl":
             if self.train_backend != "megatron_core":
                 raise ValueError(
-                    "official HCCL rollout sync requires train_backend='megatron_core'"
+                    "NCCL rollout sync requires train_backend='megatron_core'"
                 )
-            if self.device_backend not in {"auto", "npu", "ascend", "hccl"}:
+            if self.weight_sync_mode != "nccl":
                 raise ValueError(
-                    "official HCCL rollout sync requires an Ascend NPU device backend"
+                    "NCCL rollout sync requires weight_sync_mode='nccl'"
                 )
-            if self.rollout_hccl_port <= 0:
-                raise ValueError("rollout_hccl_port must be greater than zero")
-            if self.rollout_hccl_packed_buffer_mb <= 0:
+            if self.rollout_weight_reload_strategy != "parallel":
+                raise ValueError("NCCL rollout reload requires parallel strategy")
+            if self.rollout_nccl_chunk_mb <= 0:
+                raise ValueError("rollout_nccl_chunk_mb must be greater than zero")
+            if self.rollout_nccl_rate_limit_gbps < 0:
+                raise ValueError("rollout_nccl_rate_limit_gbps cannot be negative")
+            if self.rollout_weight_sync_poll_interval_s <= 0:
                 raise ValueError(
-                    "rollout_hccl_packed_buffer_mb must be greater than zero"
+                    "rollout_weight_sync_poll_interval_s must be greater than zero"
                 )
-            if self.rollout_hccl_buffer_headroom_mb < 0:
-                raise ValueError(
-                    "rollout_hccl_buffer_headroom_mb cannot be negative"
-                )
-            if self.rollout_hccl_num_buffers <= 0:
-                raise ValueError("rollout_hccl_num_buffers must be greater than zero")
         if self.pipeline_schedule != "1f1b":
             raise ValueError("pipeline_schedule currently supports only '1f1b'")
         if self.virtual_pipeline_model_parallel_size != 0:
@@ -799,11 +828,10 @@ class AsyncRLConfig:
                 "batch_size must be divisible by train_dp_size * micro_batch_size: "
                 f"{self.batch_size} vs {self.train_dp_size}*{self.micro_batch_size}"
             )
-        if self.train_backend == "megatron3d":
-            if self.weight_sync_mode != "disk":
-                raise ValueError(
-                    "The legacy Megatron backend supports only weight_sync_mode='disk'"
-                )
+        if self.train_backend == "megatron3d" and self.weight_sync_mode != "disk":
+            raise ValueError(
+                "The legacy Megatron backend supports only weight_sync_mode='disk'"
+            )
         if self.megatron_model_provider not in {"bridge", "mindspeed"}:
             raise ValueError("megatron_model_provider must be bridge or mindspeed")
         if self.megatron_model_provider == "mindspeed":
@@ -813,19 +841,16 @@ class AsyncRLConfig:
                 raise ValueError("DeepSeek V4 MindSpeed requires PP=2 and CP=1")
             if self.weight_sync_mode == "nccl" or self.rollout_weight_sync_mode == "nccl":
                 raise ValueError("MindSpeed direct rollout sync needs an HCCL transport; use disk until validated")
-            planner = self.global_resource_planner
-            if planner.elastic_hybrid_planning_enabled or planner.hybrid_worker_launch_enabled:
-                raise ValueError("MindSpeed EP-sharded EHP membership is not yet supported")
             if self.megatron_use_precision_aware_optimizer:
                 raise ValueError("MindSpeed V4 requires precision-aware optimizer disabled")
         if self.train_backend == "megatron_core":
-            if self.weight_sync_mode not in {"disk", "hccl"}:
+            if self.weight_sync_mode not in {"disk", "nccl"}:
                 raise ValueError(
-                    "Megatron-Core weight_sync_mode must be 'disk' or 'hccl'"
+                    "Megatron-Core weight_sync_mode must be 'disk' or 'nccl'"
                 )
-            if self.weight_sync_mode == "hccl" and self.rollout_weight_sync_mode != "hccl":
+            if self.weight_sync_mode == "nccl" and self.rollout_weight_sync_mode != "nccl":
                 raise ValueError(
-                    "weight_sync_mode='hccl' requires rollout_weight_sync_mode='hccl'"
+                    "weight_sync_mode='nccl' requires rollout_weight_sync_mode='nccl'"
                 )
             if not 0.0 <= self.megatron_optimizer_offload_fraction <= 1.0:
                 raise ValueError(
@@ -859,8 +884,8 @@ class AsyncRLConfig:
                 expert_world = self.train_gpus // (self.train_pp_size * self.expert_tensor_parallel_size)
             if expert_world % self.train_ep_size != 0:
                 raise ValueError(
-                    "train_ep_size must divide the expert parallel world: "
-                    f"{self.train_ep_size} vs {expert_world}"
+                    "train_ep_size must divide the expert parallel world (train_dp_size for bridge): "
+                    f"{self.train_ep_size} vs {self.train_dp_size}"
                 )
             if self.model_arch.num_experts > 1:
                 if self.model_arch.num_experts % self.train_ep_size != 0:
@@ -892,8 +917,15 @@ class AsyncRLConfig:
 
 
         import os
-        os.makedirs(self.sync_path, exist_ok=True)
-        os.makedirs(self.log_dir, exist_ok=True)
+        for runtime_dir in (self.sync_path, self.log_dir):
+            try:
+                os.makedirs(runtime_dir, exist_ok=True)
+            except PermissionError:
+                # Production configs may target shared paths that are mounted
+                # only on compute nodes. Parsing and validation should remain
+                # side-effect tolerant; runtime components create their own
+                # directories when the target filesystem is available.
+                pass
 
 
         if self.n_total_gpus <= 0:

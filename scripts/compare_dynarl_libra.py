@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize RLinf/DynaRL logs and Libra rollout refresh results."""
+"""Summarize RLinf/DynaRL logs and Libra direct-NCCL probe results."""
 
 from __future__ import annotations
 
@@ -46,16 +46,18 @@ def parse_rlinf_log(path: Path) -> dict[str, Any]:
         if metrics:
             steps.append(metrics)
 
-    migrations = [
-        {
-            "nccl_build_ms": float(match.group("build")),
-            "transfer_ms": float(match.group("transfer")),
-            "update_model_ms": float(match.group("update")),
-            "transfer_gb": float(match.group("bytes")),
-            "bandwidth_gbps": float(match.group("bandwidth")),
-        }
-        for match in MIGRATION_RE.finditer(text)
-    ]
+    migrations = []
+    for match in MIGRATION_RE.finditer(text):
+        migrations.append(
+            {
+                "nccl_build_ms": float(match.group("build")),
+                "transfer_ms": float(match.group("transfer")),
+                "update_model_ms": float(match.group("update")),
+                "transfer_gb": float(match.group("bytes")),
+                "bandwidth_gbps": float(match.group("bandwidth")),
+            }
+        )
+
     warm_steps = steps[1:] if len(steps) > 1 else steps
     return {
         "path": str(path),
@@ -104,8 +106,10 @@ def main() -> int:
     if args.libra_result:
         result["libra"] = parse_libra_result(args.libra_result)
 
-    dynarl_step = result.get("dynarl", {}).get("warm_step_time_mean_s")
-    static_step = result.get("rlinf_static", {}).get("warm_step_time_mean_s")
+    dynarl = result.get("dynarl", {})
+    static = result.get("rlinf_static", {})
+    dynarl_step = dynarl.get("warm_step_time_mean_s")
+    static_step = static.get("warm_step_time_mean_s")
     if dynarl_step and static_step:
         result["pilot_dynarl_vs_static_step_speedup"] = static_step / dynarl_step
 

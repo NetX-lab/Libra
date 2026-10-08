@@ -435,11 +435,9 @@ class _FakeRolloutEngine:
         self.name = name
         self.base_url = f"fake://{name}"
         self.calls = 0
-        self.requests = []
 
     async def generate(self, **kwargs):
         self.calls += 1
-        self.requests.append(kwargs)
         return {
             "text": self.name,
             "tokens": [self.name],
@@ -448,27 +446,6 @@ class _FakeRolloutEngine:
 
 
 class TestHeterogeneousEngineCMLFQ(unittest.IsolatedAsyncioTestCase):
-    async def test_stop_sequence_is_forwarded_to_selected_engine(self):
-        scheduler = CMLFQScheduler(
-            buckets={"short": {"tp_degrees": [1], "max_tokens": 5000}}
-        )
-        engine = HeterogeneousRolloutEngine(
-            model_path="Qwen/Qwen3-14B",
-            scheduler=scheduler,
-        )
-        engine.add_instance("short", "127.0.0.1", 8000, 1)
-        selected = _FakeRolloutEngine("short")
-        engine.engines = [selected]
-
-        await engine.generate(
-            "prompt",
-            stop=["[/ISSUE]"],
-            include_stop_str_in_output=True,
-        )
-
-        self.assertEqual(selected.requests[0]["stop"], ["[/ISSUE]"])
-        self.assertTrue(selected.requests[0]["include_stop_str_in_output"])
-
     async def test_tool_return_changes_next_rollout_bucket(self):
         scheduler = CMLFQScheduler(
             buckets={

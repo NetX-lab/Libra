@@ -1,8 +1,9 @@
 # Libra Cluster Manual
 
 This manual describes the main switches used when running Libra on a cluster.
-Most options can be set in YAML files under `configs/`. NPU multi-node runs use
-the SSH/`torchrun` launchers described in the NPU runbook.
+Most options can be set either in YAML files under `configs/` or as environment
+variables consumed by the Slurm launchers. Commands below assume the repository
+root is the current directory.
 
 Libra defaults to the Megatron-Core training backend for cluster launches.
 Recommended stability settings for large Qwen-style models are:
@@ -107,7 +108,9 @@ Important planner options:
 | `reconfiguration_cost_s` | Cost charged to runtime transitions |
 | `allowed_rollout_tp` | Candidate TP bucket sizes |
 | `allowed_train_tp` | Candidate training TP sizes |
-| `fixed_train_gpus` | Pin training GPU count if nonzero |
+| `initial_allocation_strategy` | Use `grp` to make the initial split a planner decision before launch |
+| `allocation_granularity_gpus` | Constrain startup choices to complete nodes/replicas |
+| `fixed_train_gpus` | Legacy pin, ignored when `initial_allocation_strategy=grp` |
 
 ## 4. Enable the Elastic Hybrid Pool and Cluster Swap
 
@@ -129,6 +132,14 @@ payloads through the configured elastic side channel while leaving the core
 training backend's DP/TP/PP process groups untouched. Set
 `GRP_DECOUPLE_COMMUNICATION_DOMAINS=0` only when elastic gradient reduction
 must reuse the training DP group.
+
+EHP joins are issued in complete DP replicas (`TP × PP × CP` ranks). The join
+handle returns immediately; the replica fetches state and enters zero-sync on a
+background thread, and becomes active only after every member rank reaches the
+activation barrier. A cancellation, timeout, or single-rank failure rolls the
+whole replica back to rollout. Set `elastic_hybrid_max_workers: 0` to remove a
+policy cap; GRP then derives the number of borrowable replicas from live rollout
+capacity while retaining `elastic_hybrid_min_rollout_gpus`.
 
 To force a short cluster-swap run:
 
@@ -199,7 +210,8 @@ export GRP_FORCE_TRAIN_GPUS=8
 export GRP_FORCE_ROLLOUT_TP_LIST=4:2:2
 export GRP_INITIAL_ROLLOUT_TP_LIST=4:2:2
 
-MODE=cmlfq ARM=with bash scripts/run_npu_ablation.sh
+sbatch --export=ALL \
+  scripts/submit_r2e_gym_cmlfq_24gpu_qwen3_30b_a3b.slurm
 ```
 
 ### R2E-Gym with Dynamic Cluster Swap
@@ -235,7 +247,8 @@ export GRP_FORCE_ROLLOUT_TP_LIST=2:2
 export GRP_INITIAL_ROLLOUT_TP_LIST=4:2:2
 export GRP_TRAINING_POOL_TARGET_GPUS=12
 
-MODE=grp ARM=with bash scripts/run_npu_ablation.sh
+sbatch --export=ALL \
+  scripts/submit_r2e_gym_cmlfq_24gpu_qwen3_30b_a3b.slurm
 ```
 
 ### Search-R1 with C-MLFQ
@@ -243,7 +256,7 @@ MODE=grp ARM=with bash scripts/run_npu_ablation.sh
 ```bash
 export MODEL_PATH=/path/to/Qwen3-14B
 export SEARXNG_URL=http://searxng-host:8080
-python examples/search_r1_async_rl.py --config configs/search_r1_cmlfq_qwen3_14b.yaml
+sbatch --export=ALL scripts/submit_search_r1_searxng_train.slurm
 ```
 
 ### DAPO-Math-17K with C-MLFQ
@@ -251,12 +264,12 @@ python examples/search_r1_async_rl.py --config configs/search_r1_cmlfq_qwen3_14b
 ```bash
 export MODEL_PATH=/path/to/Qwen3-4B
 export DAPO_MATH_PATH=/path/to/train.parquet
-python examples/dapo_math_async_rl.py --config configs/dapo_math_cmlfq_qwen3_4b.yaml
+sbatch --export=ALL scripts/submit_dapo_math_cmlfq_train.slurm
 ```
 
-## 8. Run Directly
+## 8. Run Without Slurm
 
-For a manually managed NPU rollout cluster, start the configured OpenAI-compatible
+For a manually managed rollout cluster, start the configured OpenAI-compatible
 vLLM endpoints first, then run an entrypoint directly:
 
 ```bash

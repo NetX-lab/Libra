@@ -2,7 +2,6 @@
 
 __all__ = [
     "DiskWeightSync",
-    "OfficialHCCLWeightTransfer",
     "NCCLWeightSync",
     "WeightSyncFactory",
     "StalenessManager",
