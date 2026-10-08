@@ -1,0 +1,49 @@
+# Integration/pilot configuration, not a completed C-MLFQ/EHP/GRP benchmark.
+model_path: /data/l00619320/models/DeepSeek-V4-Flash-DSpark-BF16
+train_backend: megatron_core
+megatron_model_provider: mindspeed
+train_gpus: 64
+rollout_gpus: 32
+n_total_gpus: 96
+train_tp_size: 4
+train_pp_size: 2
+train_cp_size: 1
+train_dp_size: 8
+train_ep_size: 32
+expert_tensor_parallel_size: 1
+sequence_parallel: true
+use_distributed_optimizer: true
+megatron_use_transformer_engine: false
+megatron_use_precision_aware_optimizer: false
+megatron_optimizer_cpu_offload: true
+megatron_optimizer_offload_fraction: 1.0
+batch_size: 32
+micro_batch_size: 1
+recompute_micro_batch_size: 1
+learning_rate: 0.000001
+weight_sync_mode: disk
+rollout_weight_sync_mode: restart
+rollout_weight_reload_method: restart
+sync_path: /libra-work/checkpoints
+log_dir: /libra-work/logs
+model_arch:
+  num_params: 304180418494
+  active_num_params: 14330441815
+  d_model: 4096
+  n_layers: 43
+  n_heads: 64
+  n_kv_heads: 1
+  vocab_size: 129280
+  intermediate_size: 2048
+  head_dim: 512
+  is_moe: true
+  num_experts: 256
+  num_shared_experts: 1
+  num_activated_experts: 6
+  expert_intermediate_size: 2048
+  shared_expert_intermediate_size: 2048
+global_resource_planner:
+  enabled: false
+  initial_allocation_strategy: configured
+  allowed_train_tp: [4]
+  allowed_train_pp: [2]

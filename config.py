@@ -563,6 +563,8 @@ class AsyncRLConfig:
     tp_size: int = 1
     vllm_tp_size: int = 1
     train_backend: str = "megatron_core"
+    megatron_model_provider: str = "bridge"  # bridge | mindspeed
+    mindspeed_args_path: str = ""
     train_tp_size: int = 0
     train_pp_size: int = 1
     train_dp_size: int = 0
@@ -802,6 +804,20 @@ class AsyncRLConfig:
                 raise ValueError(
                     "The legacy Megatron backend supports only weight_sync_mode='disk'"
                 )
+        if self.megatron_model_provider not in {"bridge", "mindspeed"}:
+            raise ValueError("megatron_model_provider must be bridge or mindspeed")
+        if self.megatron_model_provider == "mindspeed":
+            if self.train_backend != "megatron_core":
+                raise ValueError("MindSpeed requires train_backend=megatron_core")
+            if self.train_pp_size != 2 or self.train_cp_size != 1:
+                raise ValueError("DeepSeek V4 MindSpeed requires PP=2 and CP=1")
+            if self.weight_sync_mode == "nccl" or self.rollout_weight_sync_mode == "nccl":
+                raise ValueError("MindSpeed direct rollout sync needs an HCCL transport; use disk until validated")
+            planner = self.global_resource_planner
+            if planner.elastic_hybrid_planning_enabled or planner.hybrid_worker_launch_enabled:
+                raise ValueError("MindSpeed EP-sharded EHP membership is not yet supported")
+            if self.megatron_use_precision_aware_optimizer:
+                raise ValueError("MindSpeed V4 requires precision-aware optimizer disabled")
         if self.train_backend == "megatron_core":
             if self.weight_sync_mode not in {"disk", "hccl"}:
                 raise ValueError(
@@ -823,7 +839,7 @@ class AsyncRLConfig:
                     "megatron_optimizer_offload_fraction requires "
                     "megatron_optimizer_cpu_offload=true"
                 )
-            if self.train_pp_size != 1:
+            if self.megatron_model_provider == "bridge" and self.train_pp_size != 1:
                 raise ValueError(
                     "MegatronCoreTrainEngine currently requires train_pp_size=1"
                 )
@@ -838,10 +854,13 @@ class AsyncRLConfig:
                     "expert_tensor_parallel_size must divide train_tp_size: "
                     f"{self.expert_tensor_parallel_size} vs {self.train_tp_size}"
                 )
-            if self.train_dp_size % self.train_ep_size != 0:
+            expert_world = self.train_dp_size
+            if self.megatron_model_provider == "mindspeed":
+                expert_world = self.train_gpus // (self.train_pp_size * self.expert_tensor_parallel_size)
+            if expert_world % self.train_ep_size != 0:
                 raise ValueError(
-                    "train_ep_size must divide train_dp_size: "
-                    f"{self.train_ep_size} vs {self.train_dp_size}"
+                    "train_ep_size must divide the expert parallel world: "
+                    f"{self.train_ep_size} vs {expert_world}"
                 )
             if self.model_arch.num_experts > 1:
                 if self.model_arch.num_experts % self.train_ep_size != 0:

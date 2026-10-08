@@ -1,0 +1,19 @@
+# Paper-faithful treatment.  The launcher selects an initial placement through
+# the topology-aware training decision tree and length-sorted rollout DP.
+base_config: r2e_gym_qwen3_14b_mcore_npu_6node48_grp_ab_equal_common.yaml
+
+wandb_run_name: "r2e-gym-qwen3-14b-mcore-npu-6node48-paper-tree-dp"
+history_experiment_name: "r2e_gym_qwen3_14b_6node48_paper_tree_dp"
+
+global_resource_planner:
+  enabled: true
+  initial_allocation_strategy: "paper_tree_dp"
+  fixed_train_gpus: 0
+  # Empty lists activate paper defaults: TP={1,2,4,8}; PP is expanded at each
+  # root and then pruned by divisibility, bubbles, memory, and capability.
+  allowed_train_tp: []
+  allowed_train_pp: []
+  micro_batch_sizes: []
+  allowed_rollout_tp: [1, 2, 4, 8]
+  apply_to_runtime: false
+  runtime_dynamic_reconfiguration_enabled: false
