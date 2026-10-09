@@ -557,7 +557,7 @@ class HeterogeneousRolloutEngine:
 
 
         engine = cls(
-            model_path=config.model_path,
+            model_path=getattr(config, "vllm_served_model_name", "") or config.model_path,
             scheduler=scheduler,
         )
 

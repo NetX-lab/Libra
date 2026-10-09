@@ -4,6 +4,7 @@ tokenizer_path: /data/l00619320/models/DeepSeek-V4-Flash-DSpark-BF16
 train_backend: megatron_core
 megatron_model_provider: mindspeed
 rollout_backend: vllm
+vllm_served_model_name: DeepSeek-V4-Flash
 train_gpus: 64
 rollout_gpus: 64
 n_total_gpus: 128

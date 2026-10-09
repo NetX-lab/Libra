@@ -377,7 +377,7 @@ class AsyncRLTrainer:
         if vllm_endpoints_str:
             endpoints = [ep.strip() for ep in vllm_endpoints_str.split(",") if ep.strip()]
             self.rollout_engine = MultiInstanceRolloutEngine(
-                model_path=self.config.model_path,
+                model_path=self.config.vllm_served_model_name or self.config.model_path,
                 endpoints=endpoints,
             )
             if self.is_main_process:
@@ -392,7 +392,7 @@ class AsyncRLTrainer:
                 host=self.config.vllm_host,
                 base_port=self.config.vllm_port,
                 num_instances=num_instances,
-                model_path=self.config.model_path,
+                model_path=self.config.vllm_served_model_name or self.config.model_path,
             )
 
     # ----------------------------------------------------------------

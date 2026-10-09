@@ -53,6 +53,20 @@ class TestSchedulerFactory(unittest.TestCase):
         types = SchedulerFactory.available_types()
         self.assertIn("cmlfq", types)
 
+    def test_vllm_served_name_can_differ_from_weight_path(self):
+        config = AsyncRLConfig(
+            model_path="/data/models/DeepSeek-V4-Flash",
+            vllm_served_model_name="DeepSeek-V4-Flash",
+            heterogeneous_rollout=HeterogeneousRolloutConfig(
+                enabled=True,
+                instances=[HeterogeneousInstanceConfig(instance_id="rollout", host="127.0.0.1", port=8010, tp=8)],
+                scheduling=SchedulingConfig(scheduler_type="load_balance"),
+            ),
+        )
+        engine = HeterogeneousRolloutEngine.from_config(config)
+        self.assertEqual(engine.model_path, "DeepSeek-V4-Flash")
+        self.assertEqual(engine.engines[0].model_path, "DeepSeek-V4-Flash")
+
 
 class TestGlobalResourcePlannerFlow(unittest.TestCase):
     """Test global resource planner flow implementation."""

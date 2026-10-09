@@ -703,6 +703,7 @@ class AsyncRLConfig:
     vllm_port: int = 8000
     vllm_num_instances: int = 0
     vllm_endpoints: str = ""
+    vllm_served_model_name: str = ""
 
 
     num_nodes: int = 1
