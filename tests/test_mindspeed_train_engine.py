@@ -156,6 +156,17 @@ def test_alignment_pads_across_microbatches_without_training_on_padding():
     assert result[1]['attention_mask'][0,-1] == 0
 
 
+def test_v4_alignment_keeps_configured_length_for_short_responses():
+    e = engine()
+    e.max_seq_length = 2048
+    data = trajectories()
+    for row in data:
+        row['attention_mask'] = torch.ones_like(row['input_ids'])
+    result = e.align_distributed_trajectories(data)
+    assert all(row['input_ids'].shape == (1, 2048) for row in result)
+    assert all(row['loss_mask'][0, 4:].count_nonzero() == 0 for row in result)
+
+
 def test_export_must_not_drop_trainable_weights():
     original = {'weight_map': {'layers.0.weight': 'a', 'mtp.0.weight': 'b'}}
     with pytest.raises(RuntimeError, match='non-MTP'):

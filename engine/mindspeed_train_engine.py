@@ -366,7 +366,11 @@ class MindSpeedTrainEngine(MegatronCoreTrainEngine):
         trajectories = super().align_distributed_trajectories(trajectories)
         if not trajectories:
             return trajectories
-        length = max(t["input_ids"].shape[-1] for t in trajectories)
+        # Sparse Flash MLA's index metadata requires a full 512-entry top-k
+        # even when the generated response is short. The validated V4 path
+        # uses a fixed sequence length, so keep each training microbatch at
+        # the configured length rather than shrinking it to the longest row.
+        length = max(self.max_seq_length, *(t["input_ids"].shape[-1] for t in trajectories))
         length = self._round_sequence_length(length, self._sequence_parallel_alignment())
         for trajectory in trajectories:
             width = length - trajectory["input_ids"].shape[-1]

@@ -1,0 +1,75 @@
+base_config: base.yaml
+model_path: /data/l00619320/models/DeepSeek-V4-Flash-DSpark-BF16
+tokenizer_path: /data/l00619320/models/DeepSeek-V4-Flash-DSpark-BF16
+train_backend: megatron_core
+megatron_model_provider: mindspeed
+rollout_backend: vllm
+train_gpus: 64
+rollout_gpus: 64
+n_total_gpus: 128
+num_nodes: 8
+train_gpus_per_node: 8
+master_addr: 192.168.0.50
+master_port: 29682
+train_tp_size: 4
+train_pp_size: 2
+train_cp_size: 1
+train_dp_size: 8
+train_ep_size: 32
+expert_tensor_parallel_size: 1
+sequence_parallel: true
+use_distributed_optimizer: true
+megatron_use_transformer_engine: false
+megatron_use_precision_aware_optimizer: false
+megatron_optimizer_cpu_offload: true
+megatron_optimizer_offload_fraction: 1.0
+batch_size: 16
+micro_batch_size: 1
+recompute_micro_batch_size: 1
+n_samples: 2
+total_steps: 1
+max_seq_length: 2048
+max_new_tokens: 64
+max_concurrent_rollouts: 16
+queue_size: 32
+temperature: 0.8
+top_p: 0.95
+learning_rate: 1.0e-6
+ppo_epochs: 1
+recompute_logprobs: true
+sync_interval: 0
+eval_interval: 0
+save_interval: 0
+weight_sync_mode: disk
+rollout_weight_sync_mode: none
+require_rollout_weight_sync: false
+sync_path: /libra-work/benchmark_128/checkpoints
+log_dir: /libra-work/benchmark_128/cmlfq/logs
+wandb_project: ''
+phase_trace_enabled: true
+phase_trace_dir: /libra-work/benchmark_128/cmlfq/phase_trace
+heterogeneous_rollout:
+  enabled: true
+  startup_timeout: 1800
+  total_gpus: 64
+  instances:
+    - {instance_id: rollout_a, host: 192.168.0.2, tp: 8, port: 8010, gpus: [0, 1, 2, 3, 4, 5, 6, 7]}
+    - {instance_id: rollout_b, host: 192.168.0.109, tp: 8, port: 8011, gpus: [8, 9, 10, 11, 12, 13, 14, 15]}
+  scheduling:
+    scheduler_type: cmlfq
+    load_balance_strategy: least_connections
+    request_timeout: 1800
+    max_queue_length: 16
+    enable_fallback: true
+    cmlfq_rebuild_interval: 4
+    cmlfq_tree_path: /libra-work/benchmark_128/cmlfq/tree.json
+    cmlfq_tree_persist_interval: 1
+    cmlfq_shared_load_dir: /libra-work/benchmark_128/cmlfq/shared_load
+    cmlfq_buckets:
+      short: {tp_degrees: [8], max_tokens: 512}
+      long: {tp_degrees: [8], max_tokens: 4096}
+global_resource_planner:
+  enabled: false
+  initial_allocation_strategy: configured
+  allowed_train_tp: [4]
+  allowed_train_pp: [2]

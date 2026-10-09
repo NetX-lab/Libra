@@ -271,7 +271,12 @@ class AsyncRLTrainer:
                 self._setup_homogeneous_engine()
 
         if self.is_main_process and self.train_engine.is_batch_source():
-            self.rollout_engine.wait_for_ready(timeout=300)
+            startup_timeout = (
+                self.config.heterogeneous_rollout.startup_timeout
+                if self._use_heterogeneous
+                else 300
+            )
+            self.rollout_engine.wait_for_ready(timeout=startup_timeout)
             n_inst = self.rollout_engine.num_instances
             print(f"vLLM inference services are ready ({n_inst} instances)")
             print(f"  Instance URLs: {self.rollout_engine.instance_urls}")
