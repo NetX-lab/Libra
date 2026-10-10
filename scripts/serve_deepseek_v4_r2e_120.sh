@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cluster="${1:?a or b}"
+cluster="${1:?a, b, or c}"
 case "$cluster" in
   a) head_ip=192.168.0.217; ray_port=6769; dp=4; api_port=8010; dp_nodes=192.168.0.217,192.168.0.2,192.168.0.89,192.168.0.71 ;;
-  b) head_ip=192.168.0.109; ray_port=6779; dp=3; api_port=8011; dp_nodes=192.168.0.109,192.168.0.51,192.168.0.192 ;;
+  b) head_ip=192.168.0.109; ray_port=6779; dp=2; api_port=8011; dp_nodes=192.168.0.109,192.168.0.51 ;;
+  c) head_ip=192.168.0.192; ray_port=6789; dp=1; api_port=8012; dp_nodes=192.168.0.192 ;;
   *) exit 2 ;;
 esac
 base=/data/qianzhirong/runtime_sources/Libra_Benchmark_20261009
