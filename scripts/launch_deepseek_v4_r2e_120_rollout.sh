@@ -16,7 +16,9 @@ name="libra-v4-r2e-120-ray-${cluster}-20261010"
 docker image inspect "$image" >/dev/null
 if docker container inspect "$name" >/dev/null 2>&1; then exit 4; fi
 mkdir -p "$base/benchmark_r2e_120_20261010/rollout/logs"
+mkdir -p "/tmp/libra-r2e-120-ray-${cluster}"
 docker run -d --name "$name" --privileged --network host --shm-size 64g \
+  -v "/tmp/libra-r2e-120-ray-${cluster}:/tmp/ray" \
   -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro -v /data:/data:ro \
   -v "$base":/libra-work -e LIBRA_SOURCE_PARENT=/libra-work \
   -e NODE_IP="$node_ip" -e VLLM_HOST_IP="$node_ip" -e HEAD_IP="$head_ip" \
