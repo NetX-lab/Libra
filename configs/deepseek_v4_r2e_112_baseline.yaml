@@ -9,5 +9,5 @@ sync_path: /libra-work/benchmark_r2e_112_20261010/baseline/checkpoints
 heterogeneous_rollout:
   total_gpus: 48
   instances:
-    - {instance_id: rollout_a, host: 192.168.0.217, tp: 8, port: 8010, gpus: [0, 1, 2, 3, 4, 5, 6, 7]}
+    - {instance_id: rollout_a, host: 192.168.0.2, tp: 8, port: 8010, gpus: [0, 1, 2, 3, 4, 5, 6, 7]}
     - {instance_id: rollout_b, host: 192.168.0.109, tp: 8, port: 8011, gpus: [0, 1, 2, 3, 4, 5, 6, 7]}
