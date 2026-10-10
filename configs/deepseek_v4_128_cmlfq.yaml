@@ -12,10 +12,10 @@ num_nodes: 8
 train_gpus_per_node: 8
 master_addr: 192.168.0.50
 master_port: 29682
-train_tp_size: 4
+train_tp_size: 8
 train_pp_size: 2
 train_cp_size: 1
-train_dp_size: 8
+train_dp_size: 4
 train_ep_size: 32
 expert_tensor_parallel_size: 1
 sequence_parallel: true
@@ -28,7 +28,7 @@ batch_size: 16
 micro_batch_size: 1
 recompute_micro_batch_size: 1
 n_samples: 2
-total_steps: 1
+total_steps: 8
 max_seq_length: 2048
 max_new_tokens: 64
 max_concurrent_rollouts: 16
@@ -44,11 +44,11 @@ save_interval: 0
 weight_sync_mode: disk
 rollout_weight_sync_mode: none
 require_rollout_weight_sync: false
-sync_path: /libra-work/benchmark_128/checkpoints
-log_dir: /libra-work/benchmark_128/cmlfq/logs
+sync_path: /libra-work/benchmark_128_tp8_20261009/checkpoints
+log_dir: /libra-work/benchmark_128_tp8_20261009/cmlfq/logs
 wandb_project: ''
 phase_trace_enabled: true
-phase_trace_dir: /libra-work/benchmark_128/cmlfq/phase_trace
+phase_trace_dir: /libra-work/benchmark_128_tp8_20261009/cmlfq/phase_trace
 heterogeneous_rollout:
   enabled: true
   startup_timeout: 1800
@@ -63,14 +63,14 @@ heterogeneous_rollout:
     max_queue_length: 16
     enable_fallback: true
     cmlfq_rebuild_interval: 4
-    cmlfq_tree_path: /libra-work/benchmark_128/cmlfq/tree.json
+    cmlfq_tree_path: /libra-work/benchmark_128_tp8_20261009/cmlfq/tree.json
     cmlfq_tree_persist_interval: 1
-    cmlfq_shared_load_dir: /libra-work/benchmark_128/cmlfq/shared_load
+    cmlfq_shared_load_dir: /libra-work/benchmark_128_tp8_20261009/cmlfq/shared_load
     cmlfq_buckets:
       short: {tp_degrees: [8], max_tokens: 512}
       long: {tp_degrees: [8], max_tokens: 4096}
 global_resource_planner:
   enabled: false
   initial_allocation_strategy: configured
-  allowed_train_tp: [4]
+  allowed_train_tp: [8]
   allowed_train_pp: [2]

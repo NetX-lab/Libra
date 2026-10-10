@@ -606,6 +606,7 @@ class AsyncRLTrainer:
         self,
         step: int,
         trajectories: list[dict[str, Any]],
+        step_started_monotonic: float | None = None,
     ) -> None:
         """Wait outside NCCL until all ranks finish long rollout collection."""
         if not dist.is_initialized() or self.world_size <= 1:
@@ -626,6 +627,7 @@ class AsyncRLTrainer:
             ready_path,
             {
                 "rank": int(self.rank),
+                "is_batch_source": bool(self.train_engine.is_batch_source()),
                 "local_rank": int(self.local_rank),
                 "world_size": int(self.world_size),
                 "batch_size": len(trajectories),
@@ -638,6 +640,20 @@ class AsyncRLTrainer:
                 "turn_counts": [
                     int(traj.get("n_turns", 0)) for traj in trajectories
                 ],
+                "first_token_latencies_s": [
+                    float(value)
+                    for traj in trajectories
+                    for value in traj.get("first_token_latencies_s", [])
+                ],
+                "request_e2e_latencies_s": [
+                    float(value)
+                    for traj in trajectories
+                    for value in traj.get("request_e2e_latencies_s", [])
+                ],
+                "step_latency_s": (
+                    time.monotonic() - step_started_monotonic
+                    if step_started_monotonic is not None else None
+                ),
                 "ready_at": time.time(),
             },
         )
@@ -803,6 +819,7 @@ class AsyncRLTrainer:
 
 
             batch = None
+            step_started_monotonic = time.monotonic()
             if self.train_engine.is_batch_source():
                 self._trace_train_phase(step, "collect_batch_start")
                 batch = self._collect_complete_grpo_batch(
@@ -822,7 +839,7 @@ class AsyncRLTrainer:
                 batch_size=len(batch) if batch is not None else 0,
             )
             self._trace_train_phase(step, "rollout_rank_wait_start")
-            self._wait_for_all_ranks_after_rollout(step, batch)
+            self._wait_for_all_ranks_after_rollout(step, batch, step_started_monotonic)
             self._trace_train_phase(step, "rollout_rank_wait_done")
 
             if not batch:
@@ -956,6 +973,13 @@ class AsyncRLTrainer:
                     )
 
             step_total_time = time.time() - step_start
+            if self.is_main_process:
+                step_path = Path(self.config.log_dir) / "step_timings" / f"step_{step}.json"
+                step_path.parent.mkdir(parents=True, exist_ok=True)
+                self._write_json_atomic(step_path, {
+                    "step": int(step), "step_latency_s": float(step_total_time),
+                    "finished_at": time.time(),
+                })
 
 
             stats["n_trajectories"] = len(batch)

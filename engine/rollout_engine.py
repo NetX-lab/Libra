@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -174,6 +175,9 @@ class VLLMRolloutEngine:
         n: int = 1,
         input_tokens: int = 0,
         seed: int | None = None,
+        stop: list[str] | None = None,
+        include_stop_str_in_output: bool = False,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         """Generate."""
         await self._ensure_client()
@@ -189,21 +193,62 @@ class VLLMRolloutEngine:
         }
         if seed is not None:
             payload["seed"] = int(seed)
+        if stop:
+            payload["stop"] = stop
+            payload["include_stop_str_in_output"] = include_stop_str_in_output
 
         try:
-            response = await self.http_client.post(
-                self.completions_url,
-                json=payload,
-            )
+            request_started = time.perf_counter()
+            # Streaming is required for a real time-to-first-token measurement.
+            # vLLM keeps the same completion contract while emitting SSE chunks.
+            payload["stream"] = True
+            text_parts: list[str] = []
+            token_parts: list[str] = []
+            logprob_parts: list[float | None] = []
+            first_token_latency_s: float | None = None
+            finish_reason: str | None = None
+            async with self.http_client.stream("POST", self.completions_url, json=payload) as response:
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    raise RuntimeError(
+                        f"Generation failed: status={response.status_code}, {error_text.decode(errors='replace')}"
+                    )
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except Exception:
+                        continue
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    delta = choice.get("text") or ""
+                    if delta and first_token_latency_s is None:
+                        first_token_latency_s = time.perf_counter() - request_started
+                    text_parts.append(delta)
+                    logprobs = choice.get("logprobs") or {}
+                    token_parts.extend(logprobs.get("tokens") or [])
+                    logprob_parts.extend(logprobs.get("token_logprobs") or [])
+                    finish_reason = choice.get("finish_reason") or finish_reason
+            request_e2e_latency_s = time.perf_counter() - request_started
+            result = {
+                "choices": [{"text": "".join(text_parts), "finish_reason": finish_reason,
+                             "logprobs": {"tokens": token_parts, "token_logprobs": logprob_parts}}],
+                "timing": {
+                    "request_started_monotonic": request_started,
+                    "first_token_latency_s": first_token_latency_s,
+                    "request_e2e_latency_s": request_e2e_latency_s,
+                },
+            }
 
-            if response.status_code != 200:
-                error_text = response.text
-                raise RuntimeError(
-                    f"Generation failed: status={response.status_code}, {error_text}"
-                )
-
-            result = response.json()
-            return self._parse_response(result)
+            parsed = self._parse_response(result)
+            parsed.update(result["timing"])
+            return parsed
 
         except Exception as e:
             logger.error(

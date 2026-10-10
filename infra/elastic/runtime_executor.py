@@ -2214,7 +2214,7 @@ class RuntimeElasticExecutor:
             env_prefix = f"{device_visible_name}={values['cuda_visible_devices']} "
         worker_script = f"{values['rl_framework_path']}/scripts/elastic_hybrid_worker.py"
         launcher = ""
-        if values["worker_mode"] == "'megatron_core'" and values["replica_gpus"] > 1:
+        if str(getattr(cfg, "hybrid_worker_mode", "megatron_core")) == "megatron_core" and values["replica_gpus"] > 1:
             if nnodes > 1:
                 launcher = (f"{values['python']} -m torch.distributed.run --nnodes={nnodes} "
                             f"--nproc_per_node={values['replica_gpus']} --node_rank={node_rank} "

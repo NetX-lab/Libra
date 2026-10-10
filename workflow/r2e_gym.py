@@ -141,6 +141,8 @@ class R2EGymWorkflow:
             (prompt_tokens, [0.0] * len(prompt_tokens), 0)
         ]
         tool_returns: list[dict[str, Any]] = []
+        first_token_latencies: list[float] = []
+        request_e2e_latencies: list[float] = []
 
         prompt_id = str(
             data.get(
@@ -194,6 +196,10 @@ class R2EGymWorkflow:
                         "prompt_id": prompt_id,
                     })
                 response = await engine.generate(**generate_kwargs)
+                if response.get("first_token_latency_s") is not None:
+                    first_token_latencies.append(float(response["first_token_latency_s"]))
+                if response.get("request_e2e_latency_s") is not None:
+                    request_e2e_latencies.append(float(response["request_e2e_latency_s"]))
 
                 output_text = response["text"]
                 output_tokens = self._encode(output_text)
@@ -301,6 +307,8 @@ class R2EGymWorkflow:
             "tool_returns": tool_returns,
             "cmlfq_request_id": cmlfq_request_id,
             "n_turns": final_turn + 1,
+            "first_token_latencies_s": first_token_latencies,
+            "request_e2e_latencies_s": request_e2e_latencies,
         }
 
     async def evaluate(
