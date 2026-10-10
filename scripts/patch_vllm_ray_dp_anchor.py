@@ -13,6 +13,7 @@ TARGET = Path(
     "/usr/local/python3.12.13/lib/python3.12/site-packages/"
     "vllm/v1/executor/ray_executor_v2.py"
 )
+RAY_UTILS = TARGET.with_name("ray_utils.py")
 ORIGINAL = "initialize_ray_cluster(self.parallel_config, require_gpu_on_driver=False)"
 PATCHED = (
     "initialize_ray_cluster(\n"
@@ -24,14 +25,35 @@ PATCHED = (
 
 def main() -> None:
     source = TARGET.read_text()
-    if PATCHED in source:
-        print("VLLM_RAY_DP_ANCHOR_ALREADY_PATCHED")
-        return
-    if source.count(ORIGINAL) != 1:
+    if PATCHED not in source and source.count(ORIGINAL) != 1:
         raise RuntimeError(
             f"expected one vLLM Ray placement call, found {source.count(ORIGINAL)}"
         )
-    TARGET.write_text(source.replace(ORIGINAL, PATCHED))
+    if PATCHED not in source:
+        TARGET.write_text(source.replace(ORIGINAL, PATCHED))
+
+    # DP engines start concurrently. Reserve a distinct node for each rank so
+    # another placement group cannot consume the API node before DP0 starts.
+    utils = RAY_UTILS.read_text()
+    marker = "        current_node_resource = available_resources_per_node()[current_node_id]\n"
+    anchor = (
+        marker
+        + "        dp_node_ips = [ip for ip in os.environ.get('LIBRA_RAY_DP_NODE_IPS', '').split(',') if ip]\n"
+        + "        if dp_node_ips:\n"
+        + "            desired_ip = dp_node_ips[parallel_config.data_parallel_rank]\n"
+        + "            placement_group_specs[0][f'node:{desired_ip}'] = 0.001\n"
+    )
+    if anchor not in utils:
+        if utils.count(marker) != 1:
+            raise RuntimeError("cannot locate Ray placement anchor")
+        utils = utils.replace(marker, anchor)
+    original_check = "        if require_gpu_on_driver:\n            if current_node_resource.get(device_str, 0) < 1:"
+    patched_check = "        if require_gpu_on_driver and not dp_node_ips:\n            if current_node_resource.get(device_str, 0) < 1:"
+    if patched_check not in utils:
+        if utils.count(original_check) != 1:
+            raise RuntimeError("cannot locate Ray driver resource check")
+        utils = utils.replace(original_check, patched_check)
+    RAY_UTILS.write_text(utils)
     print("VLLM_RAY_DP_ANCHOR_PATCHED")
 
 
