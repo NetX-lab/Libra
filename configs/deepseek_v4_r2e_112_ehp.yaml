@@ -1,0 +1,29 @@
+# DeepSeek-V4-Flash 112-card EHP treatment: GRP planner plus elastic hybrid
+# training-pool participation, with rollout endpoints held constant.
+base_config: deepseek_v4_r2e_112_baseline.yaml
+log_dir: /libra-work/benchmark_r2e_112_20261010/ehp/logs
+phase_trace_dir: /libra-work/benchmark_r2e_112_20261010/ehp/phase_trace
+sync_path: /libra-work/benchmark_r2e_112_20261010/ehp/checkpoints
+global_resource_planner:
+  enabled: true
+  elastic_hybrid_planning_enabled: true
+  initial_allocation_strategy: grp
+  plan_interval: 5
+  min_history_size: 1
+  min_gain_ratio: 0.0
+  allocation_granularity_gpus: 8
+  min_train_gpus: 64
+  min_rollout_gpus: 48
+  allowed_train_tp: [8]
+  allowed_train_pp: [2]
+  allowed_rollout_tp: [8]
+  apply_to_runtime: false
+  runtime_async_planning: true
+  runtime_online_replanning: true
+  runtime_dynamic_reconfiguration_enabled: true
+  runtime_reconfigure_training: true
+  runtime_training_pool_only: true
+  hybrid_worker_launch_enabled: true
+  hybrid_worker_remote_control_enabled: true
+  hybrid_worker_ready_timeout_s: 120
+  elastic_hybrid_require_isolated_ccl: true
