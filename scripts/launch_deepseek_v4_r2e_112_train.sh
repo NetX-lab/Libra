@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-arm="${1:?baseline or cmlfq}"
+arm="${1:?baseline, cmlfq, grp, or ehp}"
 rank="${2:?node rank 0-7}"
-case "$arm" in baseline|cmlfq) ;; *) echo "unsupported arm: $arm" >&2; exit 2 ;; esac
+case "$arm" in baseline|cmlfq|grp|ehp) ;; *) echo "unsupported arm: $arm" >&2; exit 2 ;; esac
 base=/data/qianzhirong/runtime_sources/Libra_Benchmark_20261009
 image=libra-v4-cann91-unified:20261009
 name="libra-v4-r2e-112-${arm}-20261010"
