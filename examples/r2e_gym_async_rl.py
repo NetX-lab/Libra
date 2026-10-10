@@ -8,6 +8,11 @@ import sys
 from collections import Counter
 from datetime import timedelta
 
+# Sparse Flash MLA initializes an independent local HCCL listener per rank.
+local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+os.environ["HCCL_IF_BASE_PORT"] = str(60000 + local_rank * 100)
+os.environ["HCCL_HOST_SOCKET_PORT_RANGE"] = "auto"
+
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
