@@ -14,11 +14,30 @@ docker image inspect "$image" >/dev/null
 if docker container inspect "$name" >/dev/null 2>&1; then
   echo "container already exists: $name" >&2; exit 4
 fi
+npu_devices=(--device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3
+  --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7
+  --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc)
+for i in {0..7}; do
+  optical="$(hccn_tool -i "$i" -optical -g 2>/dev/null)"
+  lldp="$(hccn_tool -i "$i" -lldp -g 2>/dev/null)"
+  grep -Eq 'present[[:space:]]*:[[:space:]]*present' <<<"$optical" || {
+    echo "NPU $i optical module is absent on $(hostname)" >&2; exit 5;
+  }
+  grep -q 'System Name TLV' <<<"$lldp" || {
+    echo "NPU $i HCCN link has no LLDP neighbor on $(hostname)" >&2; exit 6;
+  }
+done
+docker run --rm --network host --shm-size 8g "${npu_devices[@]}" \
+  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro -v /data:/data:ro \
+  -v "$base":/libra-work -e LIBRA_SOURCE_PARENT=/libra-work \
+  -e LIBRA_CANN_TOOLKIT_ROOT=/data/image/libra-cann91-toolkit-installed/cann-9.1.0 \
+  -e LIBRA_CANN_OPS_ROOT=/tmp/libra-cann91-ops/cann-9.1.0 \
+  -e LIBRA_CANN_KB_ROOT=/usr/local/Ascend/cann-9.1.0-beta.3 \
+  --entrypoint /bin/bash "$image" -lc \
+  'source /libra-work/RL_Framework/scripts/mindspeed_v4_env.sh >/dev/null; python3 -c '\''import torch, torch_npu; n=torch.npu.device_count(); assert torch.npu.is_available() and n == 8, f"expected 8 available NPUs, got {n}"; print(f"NPU preflight passed: {n} devices")'\'''
 mkdir -p "$run_dir/logs"
 docker run -d --name "$name" --network host --shm-size 64g \
-  --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3 \
-  --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7 \
-  --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc \
+  "${npu_devices[@]}" \
   -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro -v /data:/data:ro \
   -v "$base":/libra-work -e LIBRA_SOURCE_PARENT=/libra-work \
   -e NODE_RANK="$rank" -e LIBRA_BENCH_ARM="$arm" -e OMP_NUM_THREADS=4 -e R2E_MAX_TURNS=2 \

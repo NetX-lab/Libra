@@ -16,13 +16,17 @@ This runbook defines the repeatable 112-card GRP arm used to compare with the ex
 
 The GRP config enables `initial_allocation_strategy: grp`, with 8-card allocation granularity and feasible 64-train/48-rollout limits. Rank 0 runs `scripts/deepseek_v4_grp_preflight.py` before torchrun. It must produce a planned config with `initial_allocation_applied: true`, preserve the two deployed rollout endpoints, and pass a YAML round trip. Other ranks wait for this artifact and refuse to launch if it is missing. The preflight artifact is written to `benchmark_r2e_112_20261010/grp/planned.yaml`; its planner decision is saved beside it as `planned.yaml.decision.json`.
 
-Before launching training, check that both rollout health endpoints return HTTP 200 and that all eight training nodes each have eight free NPUs. Launch ranks 0–7 concurrently with:
+Before launching training, check that both rollout health endpoints return HTTP 200 and that all eight training nodes each have eight free NPUs. The launcher now checks every card's optical module and LLDP neighbor, then starts a short-lived container with the benchmark image and verifies `torch.npu.is_available()` plus an eight-device count before it allocates the training container. A failed device or link check rejects that node before `torchrun` starts.
+
+Launch ranks 0–7 concurrently with:
 
 ```bash
 bash scripts/launch_deepseek_v4_r2e_112_train.sh grp <rank>
 ```
 
 Use one process per training node and do not reuse an old container or planned config. A run counts as successful only when all eight node exit files contain `0`, all eight `step_timings/step_*.json` files exist, and the completed-step list is exactly 0–7.
+
+If logs contain `Execution_Error_ROCE_CQE(EI0013)`, `The network port is down`, or `MindSpeed V4 requires an available Ascend NPU`, archive the failed arm directory under `grp/attempts/` before retrying. For an NPU availability error, rerun the same image/container preflight on that host; for a link error, replace the node or repair the link and confirm the HCCN optical/LLDP checks before relaunch. Never treat a run without all eight completed steps as a performance result.
 
 ## Metrics and comparison
 
