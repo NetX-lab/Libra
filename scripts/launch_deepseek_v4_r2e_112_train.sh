@@ -27,7 +27,7 @@ for i in {0..7}; do
     echo "NPU $i HCCN link has no LLDP neighbor on $(hostname)" >&2; exit 6;
   }
 done
-docker run --rm --network host --shm-size 8g "${npu_devices[@]}" \
+docker run --rm --privileged --network host --shm-size 8g "${npu_devices[@]}" \
   -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro -v /data:/data:ro \
   -v "$base":/libra-work -e LIBRA_SOURCE_PARENT=/libra-work \
   -e LIBRA_CANN_TOOLKIT_ROOT=/data/image/libra-cann91-toolkit-installed/cann-9.1.0 \
@@ -36,7 +36,7 @@ docker run --rm --network host --shm-size 8g "${npu_devices[@]}" \
   --entrypoint /bin/bash "$image" -lc \
   'source /libra-work/RL_Framework/scripts/mindspeed_v4_env.sh >/dev/null; python3 -c '\''import torch, torch_npu; n=torch.npu.device_count(); assert torch.npu.is_available() and n == 8, f"expected 8 available NPUs, got {n}"; print(f"NPU preflight passed: {n} devices")'\'''
 mkdir -p "$run_dir/logs"
-docker run -d --name "$name" --network host --shm-size 64g \
+docker run -d --name "$name" --privileged --network host --shm-size 64g \
   "${npu_devices[@]}" \
   -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro -v /data:/data:ro \
   -v "$base":/libra-work -e LIBRA_SOURCE_PARENT=/libra-work \
