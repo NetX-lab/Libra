@@ -3,7 +3,7 @@
 set -o pipefail
 cluster="${1:?a or b}"
 case "$cluster" in
-  a) head_ip=192.168.0.2; ray_port=6769; dp=4; api_port=8010; dp_nodes=192.168.0.2,192.168.0.89,192.168.0.71,192.168.0.217 ;;
+  a) head_ip=192.168.0.2; ray_port=6769; dp=2; api_port=8010; dp_nodes=192.168.0.2,192.168.0.89 ;;
   b) head_ip=192.168.0.109; ray_port=6779; dp=2; api_port=8011; dp_nodes=192.168.0.109,192.168.0.192 ;;
   *) exit 2 ;;
 esac
