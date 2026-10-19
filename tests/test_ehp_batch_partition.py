@@ -134,23 +134,23 @@ def _gloo_collection_worker(rank, rendezvous, directory):
                             init_method=f"file://{rendezvous}", timeout=timedelta(seconds=30))
     try:
         path = Path(directory)
-        dp_rank = rank // 2
-        trainer = make_trainer(path, rank, 2, dp_rank, rank % 2 == 0)
-        trainer.world_size = 4
-        trainer._initialize_rollout_source_layout()
-        trainer._collect_complete_grpo_batch = lambda generator, count: trajectories(f"source{dp_rank}", count)
         results = []
+        # Each case is a separately initialized fixed Core layout. These do
+        # not exercise or claim support for runtime Core topology changes.
         for global_count, compute_dp_size in ((16, 2), (16, 4), (16, 1), (8, 4)):
+            width = 4 // compute_dp_size
+            trainer = make_trainer(path, rank, compute_dp_size, rank // width, rank % width == 0)
+            trainer.world_size = 4
             trainer.config.batch_size = global_count
-            trainer.train_engine.dp_size = compute_dp_size
-            trainer.train_engine.dp_rank = rank // (4 // compute_dp_size)
-            trainer.train_engine.source = rank % (4 // compute_dp_size) == 0
+            trainer._initialize_rollout_source_layout()
+            trainer._collect_complete_grpo_batch = lambda generator, count: trajectories(
+                f"source{trainer.train_engine.dp_rank}", count)
             batch, participants = trainer._collect_fixed_global_batch(None, trainer._source_batch_sample_count(), [])
             own = trainer._assign_fixed_global_batch(0, batch, participants)
             results.append({"global_groups": [x["grpo_group_id"] for x in batch],
                             "own_groups": [x["grpo_group_id"] for x in own]})
         torch.save(results, path / f"rank{rank}.pt")
-        trainer._collect_complete_grpo_batch = lambda generator, count: trajectories("partial", 0 if dp_rank == 1 else count)
+        trainer._collect_complete_grpo_batch = lambda generator, count: trajectories("partial", 0 if trainer.train_engine.dp_rank == 1 else count)
         with pytest.raises(RuntimeError, match="incomplete fixed batch"):
             trainer._collect_fixed_global_batch(None, trainer._source_batch_sample_count(), [])
     finally:
@@ -182,7 +182,7 @@ def test_incomplete_source_batch_fails_before_optimizer_update(tmp_path):
     assert not trainer.train_engine.updated
 
 
-def test_logical_sampler_cursor_survives_compute_topology_change(tmp_path):
+def test_logical_sampler_cursor_survives_rollout_client_rebind(tmp_path):
     trainer = make_trainer(tmp_path, dp_size=2)
     trainer._rollout_source_world_size = 2
     trainer._rollout_source_rank = 0
@@ -190,8 +190,7 @@ def test_logical_sampler_cursor_survives_compute_topology_change(tmp_path):
     dataset = [{"id": index} for index in range(12)]
     stream = AsyncRLTrainer._create_data_generator(trainer, dataset, None)
     first = [next(stream) for _ in range(4)]
-    trainer.train_engine.dp_size = 1
-    trainer.train_engine.source = False
+    trainer._reset_rollout_pipeline_after_reconfigure()
     second = [next(stream) for _ in range(4)]
     assert [task.task_id for task in first + second] == list(range(8))
     assert {task.group_id for task in first} == {"dp0:epoch0:sample0"}

@@ -1,4 +1,4 @@
-"""Every parked training rank must execute live-state/topology commands."""
+"""Every parked training rank must execute fixed-topology live-state commands."""
 
 import threading
 import time
@@ -20,6 +20,8 @@ class Engine:
         self.calls.append((self.rank, "capture", worker, target))
         if self.barrier:
             self.barrier.wait(timeout=3)
+        if self.rank == self.failing_rank:
+            raise RuntimeError("rank-local capture failed")
         return 17
 
     def get_elastic_state_snapshot_path(self, revision):
@@ -32,14 +34,6 @@ class Engine:
     def release_elastic_state_snapshot(self, revision):
         self.calls.append((self.rank, "release", revision))
 
-    def reconfigure_parallelism(self, target, transaction_id):
-        self.calls.append((self.rank, "rebuild", target, transaction_id))
-        if self.barrier:
-            self.barrier.wait(timeout=3)
-        if self.rank == self.failing_rank:
-            raise RuntimeError("rank-local install failed")
-        return {"acknowledged": True, "optimizer_revision": 17,
-                "topology": {"train_tp": target["train_tp_size"], "train_dp": 2}}
 
 
 class Trainer:
@@ -82,7 +76,7 @@ def follow_one(trainer, directory):
     raise AssertionError("leader did not publish command")
 
 
-@pytest.mark.parametrize("operation", ["capture", "release", "rebuild"])
+@pytest.mark.parametrize("operation", ["capture", "release"])
 def test_every_training_rank_executes_command(tmp_path, operation):
     calls = []
     barrier = threading.Barrier(2) if operation != "release" else None
@@ -105,15 +99,6 @@ def test_every_training_rank_executes_command(tmp_path, operation):
     elif operation == "release":
         assert {(item[0], item[2]) for item in calls if item[1] == "release"} == {
             (0, 16), (0, 17), (1, 16), (1, 17)}
-    else:
-        for rank, trainer in enumerate(trainers):
-            assert trainer.config.train_tp_size == trainer.config.tp_size == 1
-            assert trainer.config.train_dp_size == 2
-            assert trainer._elastic_gradient_server is None
-            stages = [item[1] for item in calls if item[0] == rank]
-            assert stages.index("close-gradient-server") < stages.index("rebuild")
-            assert stages.index("rebuild") < stages.index("new-comm-domain")
-            assert stages[-2:] == ["new-gradient-server", "new-topology-hook"]
 
 
 def test_one_rank_failure_reaches_dispatch_and_follower(tmp_path):
@@ -122,10 +107,10 @@ def test_one_rank_failure_reaches_dispatch_and_follower(tmp_path):
     trainers = [Trainer(engine, calls) for engine in engines]
     with ThreadPoolExecutor(max_workers=1) as pool:
         peer = pool.submit(follow_one, trainers[1], tmp_path)
-        with pytest.raises(RuntimeError, match="collective core rebuild failed"):
-            protocol.dispatch_core_command(executor(tmp_path, engines[0], trainers[0]), "rebuild",
+        with pytest.raises(RuntimeError, match="collective core capture failed"):
+            protocol.dispatch_core_command(executor(tmp_path, engines[0], trainers[0]), "capture",
                                            target={"train_tp_size": 1, "train_dp_size": 2})
-        with pytest.raises(RuntimeError, match="rank-local install failed"):
+        with pytest.raises(RuntimeError, match="rank-local capture failed"):
             peer.result(timeout=4)
     failed = read_record(tmp_path / "core_receipts" / "rank_1.json")
     assert failed["status"] == "failed"
@@ -192,3 +177,12 @@ def test_closing_executor_does_not_report_partial_success(tmp_path):
     instance._closing.set()
     with pytest.raises(RuntimeError, match="executor closed"):
         protocol.dispatch_core_command(instance, "release")
+
+
+def test_topology_rebuild_is_outside_fixed_core_protocol(tmp_path):
+    receipt = protocol.execute_core_command(Engine(0, []), {
+        "command_id": "unsupported", "coord_id": "coord-current",
+        "run_id": "run-current", "operation": "rebuild",
+    }, tmp_path)
+    assert receipt["status"] == "failed"
+    assert "unknown collective core operation: rebuild" in receipt["error"]

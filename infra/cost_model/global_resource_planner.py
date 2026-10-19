@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class CoreRuntimeCapabilities:
-    """Executable Core layouts on the already initialized physical ranks.
+    """Fixed Core layout on the already initialized physical ranks.
 
     Hybrid replicas use a separate process group and do not enlarge this rank
     set. No capability is supplied to startup GRP, which may choose its size.
@@ -39,10 +39,10 @@ class CoreRuntimeCapabilities:
     cp: int
     ep: int
     dp: int
-    rebuild_tp_dp: bool
+    rebuild_tp_dp: bool = field(default=False, init=False)
 
     @classmethod
-    def from_engine(cls, engine, *, allow_reconfiguration=True):
+    def from_engine(cls, engine):
         world = getattr(engine, "world_size", None)
         if not isinstance(world, int) or world < 1:
             return None
@@ -50,8 +50,7 @@ class CoreRuntimeCapabilities:
         state = getter() if callable(getter) else {}
         dimensions = {axis: int(state.get(f"train_{axis}",
             getattr(engine, f"train_{axis}_size", 1))) for axis in ("tp", "pp", "cp", "ep", "dp")}
-        return cls(world_size=world, **dimensions, rebuild_tp_dp=bool(allow_reconfiguration
-            and callable(getattr(engine, "reconfigure_parallelism", None))))
+        return cls(world_size=world, **dimensions)
 
     def incompatibility(self, plan):
         topology = plan.train_config

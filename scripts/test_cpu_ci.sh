@@ -17,7 +17,7 @@ python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_r2e_gym_workflow.py \
   tests/test_collective_weight_export.py \
   tests/test_core_reconfiguration_protocol.py \
-  tests/test_core_topology_rebuild.py \
+  tests/test_optimizer_state.py \
   tests/test_ehp_batch_partition.py \
   tests/test_ehp_correctness.py \
   tests/test_ehp_membership_release.py \

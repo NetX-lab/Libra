@@ -37,7 +37,8 @@ def config():
     planner.min_train_gpus = planner.min_rollout_gpus = 4
     planner.elastic_hybrid_planning_enabled = True
     planner.runtime_reconfigure_training = True
-    planner.runtime_training_pool_only = planner.runtime_training_pool_plan_only = False
+    planner.runtime_training_pool_only = True
+    planner.runtime_training_pool_plan_only = False
     planner.runtime_manage_rollout_processes = planner.hybrid_worker_launch_enabled = True
     planner.elastic_hybrid_require_planner_signal = True
     planner.elastic_hybrid_min_rollout_gpus = 4
@@ -72,19 +73,21 @@ def test_runtime_replaces_unlaunchable_core_resize_but_preserves_hybrid_demand()
     cfg = config()
     planner = GlobalResourcePlanner.from_config(cfg)
     planner.runtime_capabilities = CoreRuntimeCapabilities.from_engine(engine())
-    planner.optimizer.optimize = Mock(side_effect=[result(8), result(4, tp=2)])
+    planner.optimizer.optimize = Mock(side_effect=[result(8), result(4)])
     metrics = RuntimeResourceMetrics(step=5, train_time_s=1, rollout_time_s=10)
     decision = planner.plan_if_needed(step=5, config=cfg, batch=ROWS, runtime_metrics=metrics)
     assert decision.candidate_plan.train_gpus == 4
-    assert decision.candidate_plan.train_config.tp == 2
-    assert decision.candidate_plan.train_config.dp == 2
+    assert decision.candidate_plan.train_config.tp == 4
+    assert decision.candidate_plan.train_config.dp == 1
     assert decision.candidate_plan.rollout_gpus == 8
     assert decision.elastic_hybrid_signal.desired_replicas == 1
     assert decision.elastic_hybrid_signal.reason == 'candidate_requests_more_training_capacity'
-    assert decision.resource_should_reconfigure
+    assert not decision.resource_should_reconfigure
+    assert decision.should_reconfigure  # Real EHP membership still changes.
     first, second = planner.optimizer.optimize.call_args_list
     assert first.kwargs['fixed_train_gpus'] == 0
     assert second.kwargs['fixed_train_gpus'] == 4
+    assert second.kwargs['allowed_train_tp'] == [4]
     assert second.kwargs['allowed_train_ep'] == second.kwargs['allowed_train_pp'] == [1]
     assert cfg.global_resource_planner.fixed_train_gpus == 0  # No configuration workaround.
     proof = decision.candidate_plan.metadata['runtime_candidate_filter']
@@ -128,18 +131,31 @@ def test_live_core_rebuild_rejects_unsupported_model_axes(axis):
     assert capability.incompatibility(candidate) == f'core_{axis}_rebuild_unsupported'
 
 
-def test_same_world_tp_dp_and_rollout_repartition_remain_executable():
+def test_fixed_core_keeps_rollout_repartition_and_actual_ehp_enabled():
     cfg = config()
     planner = GlobalResourcePlanner.from_config(cfg)
     planner.runtime_capabilities = CoreRuntimeCapabilities.from_engine(engine())
-    planner.optimizer.optimize = Mock(return_value=result(4, tp=2))
+    candidate = result(4)
+    candidate.rollout_config = RolloutClusterConfig(tp_list=[4, 4])
+    planner.optimizer.optimize = Mock(return_value=candidate)
     decision = planner.plan_if_needed(step=5, config=cfg, batch=ROWS)
     assert decision.resource_should_reconfigure
-    assert decision.candidate_plan.train_gpus == 4
-    assert planner.optimizer.optimize.call_count == 1
+    assert decision.candidate_plan.train_config.tp == 4
+    assert decision.candidate_plan.train_config.dp == 1
+    assert decision.candidate_plan.rollout_tp_list == [4, 4]
     executor = RuntimeElasticExecutor(config=cfg, planner=planner, train_engine=engine())
     prepared = executor.prepare_transaction(decision)
     assert prepared.should_execute and prepared.resource_reconfiguration
+    assert cfg.global_resource_planner.runtime_reconfigure_training
+    assert cfg.global_resource_planner.runtime_training_pool_only
+    assert not cfg.global_resource_planner.runtime_training_pool_plan_only
+    assert cfg.global_resource_planner.hybrid_worker_launch_enabled
+
+
+def test_fixed_core_rejects_tp_dp_change_even_if_adapter_exposes_old_rebuild_hook():
+    capability = CoreRuntimeCapabilities.from_engine(engine())
+    assert not capability.rebuild_tp_dp
+    assert capability.incompatibility(as_plan(result(4, tp=2))) == "core_tp_dp_rebuild_unsupported"
 
 
 def test_executor_rejects_stale_resize_before_any_generation_or_core_side_effect():

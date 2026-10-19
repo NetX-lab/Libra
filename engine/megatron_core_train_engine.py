@@ -745,10 +745,6 @@ class MegatronCoreTrainEngine:
                 pass
         self._elastic_gradient_process_group_owned = False
 
-    def reconfigure_parallelism(self, target, *, transaction_id):
-        from RL_Framework.engine.runtime_topology import reconfigure_core_engine
-        return reconfigure_core_engine(self, target, transaction_id=transaction_id)
-
     def get_elastic_gradient_process_group(self):
         return self._elastic_gradient_process_group
 
@@ -933,7 +929,7 @@ class MegatronCoreTrainEngine:
             raise ValueError("live EHP model chunk count mismatch")
         for chunk, state in zip(self.model, payload["model"]):
             chunk.load_state_dict(state, strict=True)
-        from RL_Framework.engine.runtime_topology import optimizer_state_load_context
+        from RL_Framework.engine.optimizer_state import optimizer_state_load_context
         # DP-zero restoration reaches the same MCore 0.14 low-level tensor
         # setter as model-space restoration. Keep the real step supplied by
         # common metadata visible while it installs master/Adam tensors.

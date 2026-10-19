@@ -1,7 +1,7 @@
 """Collective core-state operations inside the existing training boundary.
 
 Only small commands and receipts use the shared filesystem. Model/Adam tensors
-stay in memory and move through the live-state or topology transport.
+stay in memory and move through the live-state transport.
 """
 from __future__ import annotations
 
@@ -40,30 +40,7 @@ def _run_operation(engine, command, trainer=None):
         trainer._reopen_restored_rollouts()
         trainer._rebind_rollout_engine_from_config(reason="core_boundary_publication")
         return {"optimizer_revision": revision, "acknowledged": True}
-    if operation != "rebuild":
-        raise ValueError(f"unknown collective core operation: {operation}")
-    if trainer is not None:
-        engine._elastic_step_hybrid_workers = ()
-        server = getattr(trainer, "_elastic_gradient_server", None)
-        if server is not None:
-            server.close()
-            trainer._elastic_gradient_server = None
-    receipt = engine.reconfigure_parallelism(
-        command["target"], transaction_id=command["command_id"],
-    )
-    if not receipt.get("acknowledged"):
-        raise RuntimeError("core topology rebuild did not acknowledge installed state")
-    if trainer is not None:
-        for field, value in command["target"].items():
-            if hasattr(trainer.config, field):
-                setattr(trainer.config, field, value)
-        trainer.config.tp_size = trainer.config.train_tp_size
-        trainer._initialize_elastic_communication_domains()
-        trainer._init_nonblocking_elastic_core()
-        hook = getattr(trainer, "_on_train_engine_reconfigured", None)
-        if callable(hook):
-            hook()
-    return receipt
+    raise ValueError(f"unknown collective core operation: {operation}")
 
 
 def execute_core_command(engine, command, directory: Path, trainer=None):

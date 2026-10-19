@@ -2015,10 +2015,7 @@ class AsyncRLTrainer:
             return
 
         self.global_resource_planner = GlobalResourcePlanner.from_config(self.config)
-        self.global_resource_planner.runtime_capabilities = CoreRuntimeCapabilities.from_engine(
-            self.train_engine,
-            allow_reconfiguration=bool(getattr(planner_cfg, "runtime_reconfigure_training", False)),
-        )
+        self.global_resource_planner.runtime_capabilities = CoreRuntimeCapabilities.from_engine(self.train_engine)
         self.runtime_elastic_executor = RuntimeElasticExecutor(
             config=self.config,
             planner=self.global_resource_planner,
@@ -2768,10 +2765,10 @@ class AsyncRLTrainer:
         return active_hybrid_ids
 
     def _initialize_rollout_source_layout(self) -> None:
-        """Freeze logical data producers independently of compute topology.
+        """Register one stable data producer per initialized Core DP replica.
 
-        Their samplers, task counters and admitted groups remain alive when GRP
-        redistributes the same training ranks into new TP/DP compute groups.
+        Keep source identities and admitted groups across rollout client
+        rebindings and elastic Hybrid membership changes.
         """
         source = None
         if self.train_engine.is_batch_source():

@@ -210,8 +210,7 @@ class RuntimeElasticExecutor:
         should_execute = bool(decision.should_reconfigure and plan is not None)
         reason = str(decision.reason)
         current_train_gpus = int(self.config.train_gpus)
-        capabilities = CoreRuntimeCapabilities.from_engine(self.train_engine,
-            allow_reconfiguration=bool(getattr(planner_cfg, "runtime_reconfigure_training", False)))
+        capabilities = CoreRuntimeCapabilities.from_engine(self.train_engine)
         if should_execute and resource_reconfiguration and capabilities is not None:
             rejection = capabilities.incompatibility(plan)
             if rejection:
@@ -363,7 +362,6 @@ class RuntimeElasticExecutor:
             self._release_all_hybrid_workers(reason="resource_repartition", result=result)
             from RL_Framework.infra.elastic.rollout_lending import return_rollout
             result.started_processes.extend(return_rollout(self))
-        self._rebuild_core_if_required(plan, result)
         rollout_runtime_enabled = prepared.rollout_runtime_enabled
         current_train_gpus = prepared.current_train_gpus
         strategy = prepared.strategy
@@ -776,48 +774,6 @@ class RuntimeElasticExecutor:
                     "gpus": list(inst.gpus), "host": inst.host, "port": inst.port}
                    for inst in self.config.heterogeneous_rollout.instances]
         dispatch_core_command(self, "publish", target={"instances": targets})
-
-    def _rebuild_core_if_required(self, plan, result):
-        cfg = self.config.global_resource_planner
-        if (not getattr(cfg, "runtime_reconfigure_training", False)
-                or getattr(cfg, "runtime_training_pool_plan_only", True)
-                or getattr(cfg, "runtime_training_pool_only", True)):
-            return
-        target = {f"train_{axis}_size": int(getattr(plan.train_config, axis, 1))
-                  for axis in ("tp", "pp", "cp", "ep", "dp")}
-        # MCore's DP dimension contains EP lanes; the planner factors them out.
-        target["train_dp_size"] *= int(getattr(plan.train_config, "ep", 1))
-        target.update(train_gpus=int(plan.train_gpus), micro_batch_size=int(plan.train_config.b_micro))
-        engine = self.train_engine
-        actual = engine.get_parallel_state() if hasattr(engine, "get_parallel_state") else {}
-        if all(int(actual.get(f"train_{axis}", getattr(engine, f"train_{axis}_size", -1)))
-               == target[f"train_{axis}_size"] for axis in ("tp", "pp", "cp", "ep", "dp")):
-            engine.micro_batch_size = target["micro_batch_size"]
-            return
-        if not callable(getattr(engine, "reconfigure_parallelism", None)):
-            raise RuntimeError("training backend cannot execute the requested core topology transition")
-        if self.dispatcher is not None:
-            self.dispatcher.pause()
-            self.dispatcher.wait_until_idle(timeout=float(getattr(cfg, "runtime_drain_timeout_s", 3600)))
-        self._release_all_hybrid_workers(reason="core_topology_transition", result=result)
-        from RL_Framework.infra.elastic.rollout_lending import return_rollout
-        return_rollout(self)
-        from RL_Framework.infra.elastic.core_reconfiguration import dispatch_core_command
-        # Clear membership before closing the old core's elastic communicators.
-        engine._elastic_step_hybrid_workers = ()
-        receipts = dispatch_core_command(self, "rebuild", target=target)
-        for name, value in target.items():
-            setattr(self.config, name, value)
-        self.config.tp_size = self.config.train_tp_size
-        self._snapshot_manifests.clear()
-        if self.elastic_pool is not None:
-            self.elastic_pool.close()
-            self.elastic_pool = None
-        trainer = getattr(self, "trainer", None)
-        if trainer is not None:
-            self.gradient_server = trainer._elastic_gradient_server
-        self._ensure_elastic_pool()
-        result.training_actions.append(f"core_topology_rebuilt:rank_acks={len(receipts)}")
 
     def _reconfigure_training_pool(
         self,
