@@ -21,6 +21,7 @@ from RL_Framework.engine.megatron_core_checkpointing import (
     MegatronDistributedCheckpointManager,
 )
 from RL_Framework.engine.device_utils import set_device
+from RL_Framework.engine.optimizer_memory import bound_default_torch_adam_memory
 from RL_Framework.infra.elastic import (
     GradientPayload,
     GradientUpdate,
@@ -268,6 +269,13 @@ class MegatronCoreTrainEngine:
                 self.model,
                 use_gloo_process_groups=True,
             )
+            bounded_groups = bound_default_torch_adam_memory(self.optimizer)
+            if bounded_groups and self.is_main_process:
+                print(
+                    "MCORE_INIT_PHASE native_torch_adam_foreach_disabled "
+                    f"groups={bounded_groups}",
+                    flush=True,
+                )
             if self.is_main_process:
                 print("MCORE_INIT_PHASE optimizer_build_complete", flush=True)
         if self.is_main_process:
@@ -584,6 +592,7 @@ class MegatronCoreTrainEngine:
             optimizer=self.optimizer,
             version=version,
         )
+        bound_default_torch_adam_memory(self.optimizer)
         self.current_version = version
 
     def get_parallel_state(self) -> dict[str, Any]:
@@ -938,6 +947,7 @@ class MegatronCoreTrainEngine:
             parameter_state = payload.get("distributed_optimizer")
             if payload.get("has_distributed_optimizer", parameter_state is not None):
                 self._restore_optimizer_parameter_state(self.optimizer, parameter_state)
+        bound_default_torch_adam_memory(self.optimizer)
         self.optimizer_revision = int(payload["optimizer_revision"])
         self.current_version = int(payload["version"])
         self._synchronize_optimizer_parameters()
