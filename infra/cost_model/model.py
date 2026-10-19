@@ -128,12 +128,12 @@ class RolloutCostModel:
     # ========================================================================
 
     def compute_token_kv_bytes(self, tp: int) -> float:
-        """Compute token kv bytes."""
-        kv_heads_per_gpu = max(1, self.n_kv_heads // tp)
+        """KV bytes per token on one TP worker, including replicated heads."""
+        kv_heads_per_gpu = max(1, math.ceil(self.n_kv_heads / tp))
         return 2.0 * self.n_layers * kv_heads_per_gpu * self.head_dim * self.dtype_bytes
 
     def compute_kv_pool(self, tp: int) -> float:
-        """Compute kv pool."""
+        """Aggregate KV bytes for the instance; workspace is instance-wide."""
         total_mem = tp * self.mem_capacity
         weights_total = self.P * self.dtype_bytes
         kv_pool = total_mem - weights_total - self.act_workspace
@@ -142,7 +142,9 @@ class RolloutCostModel:
     def compute_token_capacity(self, tp: int) -> int:
         """Compute token capacity."""
         kv_pool = self.compute_kv_pool(tp)
-        s_token_kv = self.compute_token_kv_bytes(tp)
+        # Every logical token occupies a shard on each TP worker. Both
+        # numerator and denominator must describe the whole instance.
+        s_token_kv = tp * self.compute_token_kv_bytes(tp)
         if s_token_kv <= 0:
             return 0
         raw_capacity = kv_pool / s_token_kv
@@ -188,7 +190,9 @@ class RolloutCostModel:
 
         d_read = weights_per_gpu + kv_read_per_gpu
 
-        effective_bw = tp * self.mem_bw * max(self.decode_bw_util, 1e-6)
+        # d_read is already per GPU. Using aggregate TP bandwidth here
+        # would count tensor-parallel sharding a second time.
+        effective_bw = self.mem_bw * max(self.decode_bw_util, 1e-6)
         t_mem = d_read / effective_bw
 
         t_comm = 2.0 * self.n_layers * self.tp_comm_overhead if tp > 1 else 0.0
