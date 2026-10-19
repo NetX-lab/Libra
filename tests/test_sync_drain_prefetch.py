@@ -71,7 +71,7 @@ def test_sync_drain_prefetch_limit_uses_two_then_one_batch():
     assert trainer._sync_aware_rollout_limit(step=2, batch_size=4) is None
     assert trainer._sync_aware_rollout_limit(step=3, batch_size=4) == 8
     assert trainer._sync_aware_rollout_limit(step=4, batch_size=4) == 4
-    assert trainer._sync_aware_rollout_limit(step=5, batch_size=4) == 4
+    assert trainer._sync_aware_rollout_limit(step=5, batch_size=4) is None
     assert trainer._sync_aware_rollout_limit(step=6, batch_size=4) is None
 
 

@@ -259,6 +259,8 @@ class NativeRDMAGradientClient:
                     "step": payload.step,
                     "state_version": payload.state_version,
                     "membership_epoch": payload.membership_epoch,
+                    "sample_count": payload.sample_count,
+                    "global_sample_count": payload.global_sample_count,
                 },
                 path,
             )
@@ -358,6 +360,8 @@ class NativeRDMAGradientServer:
                     step=int(data.get("step", -1)),
                     state_version=int(data.get("state_version", -1)),
                     membership_epoch=int(data.get("membership_epoch", 0)),
+                    sample_count=int(data.get("sample_count", 1)),
+                    global_sample_count=int(data.get("global_sample_count", 0)),
                 )
                 self.on_payload(payload)
                 self._received += 1

@@ -14,4 +14,25 @@ python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_rollout_engine.py \
   tests/test_cpu_offload_backend.py \
   tests/test_r2e_patch_harness.py \
-  tests/test_r2e_gym_workflow.py
+  tests/test_r2e_gym_workflow.py \
+  tests/test_collective_weight_export.py \
+  tests/test_core_reconfiguration_protocol.py \
+  tests/test_core_topology_rebuild.py \
+  tests/test_ehp_batch_partition.py \
+  tests/test_ehp_correctness.py \
+  tests/test_ehp_membership_release.py \
+  tests/test_ehp_readiness_stop.py \
+  tests/test_elastic_gradient_idle_path.py \
+  tests/test_elastic_hybrid_pool.py \
+  tests/test_grp_decision_gates.py \
+  tests/test_rollout_lending.py \
+  tests/test_rollout_lifecycle.py \
+  tests/test_rollout_process.py \
+  tests/test_rollout_supply.py \
+  tests/test_runtime_boundary_integration.py \
+  tests/test_runtime_core_capabilities.py \
+  tests/test_runtime_elastic_executor.py \
+  tests/test_runtime_executor_shutdown.py \
+  tests/test_runtime_rollout_ownership.py \
+  tests/test_scheduling_audit.py \
+  tests/test_sync_drain_prefetch.py

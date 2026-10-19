@@ -327,7 +327,7 @@ class HeterogeneousRolloutEngine:
 
     def wait_until_idle(self, timeout: float = 3600.0, poll_interval: float = 0.5):
         """Block until no rollout requests are active before reconfiguration."""
-        deadline = time.time() + max(0.0, timeout)
+        deadline = time.time() + timeout if timeout > 0 else float("inf")
         while True:
             with self._lock:
                 handles = list(getattr(self.scheduler, "_instances", []))

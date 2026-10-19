@@ -49,9 +49,9 @@ class ElasticGradientClient:
 
     def send(self, payload: GradientPayload, *, expect_update: bool = False):
         with socket.create_connection(
-            (self.endpoint.host, self.endpoint.port), timeout=self.timeout
+            (self.endpoint.host, self.endpoint.port), timeout=self.timeout or None
         ) as sock:
-            sock.settimeout(self.timeout)
+            sock.settimeout(self.timeout or None)
             metadata = self._serialize_metadata(payload, expect_update=expect_update)
             sock.sendall(_HEADER.pack(len(metadata)))
             sock.sendall(metadata)
@@ -70,7 +70,7 @@ class ElasticGradientClient:
         buffer = io.BytesIO()
         torch.save(
             {
-                "protocol_version": 3,
+                "protocol_version": 4,
                 "authkey": self.endpoint.authkey,
                 "replica_id": payload.replica_id,
                 "target_core_id": payload.target_core_id,
@@ -82,6 +82,8 @@ class ElasticGradientClient:
                 "state_version": payload.state_version,
                 "membership_epoch": payload.membership_epoch,
                 "expect_update": bool(expect_update),
+                "sample_count": payload.sample_count,
+                "global_sample_count": payload.global_sample_count,
             },
             buffer,
         )
@@ -242,13 +244,13 @@ class ElasticGradientServer:
 
     def _wait_for_update(self, payload: GradientPayload) -> GradientUpdate:
         key = (payload.replica_id, int(payload.step), int(payload.membership_epoch))
-        deadline = time.monotonic() + max(self.update_timeout, 0.0)
+        deadline = time.monotonic() + self.update_timeout if self.update_timeout > 0 else None
         with self._update_condition:
             while key not in self._updates and not self._stop.is_set():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                remaining = deadline - time.monotonic() if deadline is not None else None
+                if remaining is not None and remaining <= 0:
                     raise TimeoutError(f"timed out waiting for post-AllReduce update: {key}")
-                self._update_condition.wait(timeout=min(remaining, 0.5))
+                self._update_condition.wait(timeout=min(remaining, 0.5) if remaining is not None else 0.5)
             if key not in self._updates:
                 raise RuntimeError("gradient server closed before update was published")
             return self._updates.pop(key)
@@ -279,7 +281,7 @@ class ElasticGradientServer:
         data = torch.load(io.BytesIO(self._recv_exact(conn, length)), map_location="cpu", weights_only=False)
         if self.authkey and data.get("authkey") != self.authkey:
             raise PermissionError("invalid elastic gradient authkey")
-        if int(data.get("protocol_version", 0)) not in {2, 3}:
+        if int(data.get("protocol_version", 0)) not in {2, 3, 4}:
             raise ValueError("unsupported elastic gradient protocol")
         tensors = []
         for _ in range(int(data["tensor_count"])):
@@ -295,6 +297,8 @@ class ElasticGradientServer:
             step=int(data.get("step", -1)),
             state_version=int(data.get("state_version", -1)),
             membership_epoch=int(data.get("membership_epoch", 0)),
+            sample_count=int(data.get("sample_count", 1)),
+            global_sample_count=int(data.get("global_sample_count", 0)),
         ), bool(data.get("expect_update", False))
 
     @staticmethod

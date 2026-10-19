@@ -109,6 +109,7 @@ def test_non_blocking_join_returns_before_snapshot_fetch_finishes():
         return 12
 
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Standalone state-machine simulation, no engine.
         core_train_workers=["core0"],
         core_rollout_workers=["rollout0"],
         snapshot_fetcher=slow_fetch,
@@ -260,6 +261,7 @@ def test_activation_barrier_keeps_join_non_blocking_until_worker_ready():
         assert release.wait(timeout=2.0)
 
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Standalone state-machine simulation, no engine.
         core_train_workers=["core0"],
         core_rollout_workers=["rollout0"],
         snapshot_fetcher=lambda *_args: 5,
@@ -295,6 +297,7 @@ def test_complete_dp_replica_rejoins_non_blocking_and_activates_atomically():
         return 23
 
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Standalone state-machine simulation, no engine.
         core_train_workers=["core0", "core1"],
         core_rollout_workers=["rollout0", "rollout1"],
         snapshot_fetcher=fetch,
@@ -331,6 +334,7 @@ def test_dp_replica_join_failure_rolls_back_every_member():
         return 7
 
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Standalone state-machine simulation, no engine.
         core_train_workers=["core0"],
         core_rollout_workers=["rollout0", "rollout1"],
         snapshot_fetcher=fetch,
@@ -355,6 +359,7 @@ def test_dp_replica_join_failure_rolls_back_every_member():
 
 def test_released_dp_replica_can_rejoin_with_a_new_generation():
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Standalone state-machine simulation, no engine.
         core_train_workers=["core0"],
         core_rollout_workers=["rollout0", "rollout1"],
         snapshot_fetcher=lambda *_args: 4,
@@ -384,6 +389,7 @@ def test_cancelled_join_cannot_become_active_after_grp_reversal():
         return 9
 
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Standalone state-machine simulation, no engine.
         core_train_workers=["core0"],
         core_rollout_workers=["rollout0"],
         snapshot_fetcher=fetch,
@@ -406,6 +412,7 @@ def test_failed_join_rolls_worker_back_to_rollout():
         raise RuntimeError("snapshot unavailable")
 
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Standalone state-machine simulation, no engine.
         core_train_workers=["core0"],
         core_rollout_workers=["rollout0"],
         snapshot_fetcher=fetch,

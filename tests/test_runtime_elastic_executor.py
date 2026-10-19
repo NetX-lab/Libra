@@ -377,6 +377,7 @@ def test_runtime_executor_does_not_rejoin_hybrids_after_target_is_reached():
     cfg.global_resource_planner.runtime_training_pool_target_gpus = 3
     cfg.global_resource_planner.runtime_training_pool_plan_only = False
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Pure scheduling-state simulation; no worker/backend.
         core_train_workers=["core0"],
         core_rollout_workers=["rollout0", "rollout1"],
         zero_sync_steps=0,
@@ -545,6 +546,7 @@ def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path
     # Exercise ownership/ordering without leaving a real shell/sleep process.
     process = Mock(pid=12345)
     process.poll.return_value = None
+    process.terminate.side_effect = lambda: setattr(process.poll, "return_value", 0)
     monkeypatch.setattr(
         "RL_Framework.infra.elastic.runtime_executor.subprocess.Popen",
         lambda *args, **kwargs: process,
@@ -554,6 +556,11 @@ def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path
 
     class FakeTrainEngine:
         current_version = 3
+        optimizer_revision = 3
+
+        def get_elastic_lane_state(self):
+            return {"data_parallel_rank": 0, "tensor_parallel_rank": 0,
+                    "pipeline_parallel_rank": 0, "context_parallel_rank": 0}
 
         def __init__(self):
             self.snapshots = []
@@ -567,9 +574,7 @@ def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path
             return self.current_version
 
         def get_elastic_state_snapshot_path(self, version):
-            path = tmp_path / f"rank0_v{version}.pt"
-            path.write_bytes(b"snapshot")
-            return path
+            return f"ehp://fake-state:12345/revision-{version}"
 
         def set_elastic_gradient_domain(self, domain):
             self.domain = domain
@@ -587,6 +592,18 @@ def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path
         def __init__(self, events, **kwargs):
             super().__init__(**kwargs)
             self.events = events
+
+        def _capture_core_snapshot(self):
+            # This test isolates prewarm ordering; simulate the collective
+            # capture of every configured core DP lane without real workers.
+            import json
+            path = tmp_path / "capture.json"
+            path.write_text(json.dumps({"format": "libra-ehp-lanes-v1", "optimizer_revision": 3,
+                                        "snapshot_id": "simulated-collective",
+                                        "lanes": {f"dp{i}": {"0": f"ehp://fake/dp{i}"}
+                                                  for i in range(self.config.train_dp_size)}}))
+            self._snapshot_manifests[3] = str(path)
+            return str(path)
 
         def _ensure_gradient_server(self):
             class Endpoint:
@@ -623,6 +640,7 @@ def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path
             return worker_id in self._hybrid_worker_meta
 
     cfg = _config()
+    cfg.global_resource_planner.hybrid_worker_task_dir = str(tmp_path / "tasks")
     cfg.global_resource_planner.runtime_reconfigure_training = True
     cfg.global_resource_planner.runtime_training_pool_plan_only = False
     cfg.global_resource_planner.runtime_training_pool_target_gpus = 4
@@ -796,6 +814,7 @@ def test_runtime_executor_cluster_swap_returns_training_gpu_to_rollout():
     decision.candidate_plan.train_config.dp = 2
     decision.candidate_plan.rollout_config.tp_list = [1, 1]
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Pure scheduling-state simulation; no worker/backend.
         core_train_workers=["core0", "core1"],
         core_rollout_workers=["rollout0", "rollout1"],
         zero_sync_steps=0,
@@ -1157,6 +1176,7 @@ def test_runtime_executor_prewarms_rollout_before_dispatcher_pause():
             self.events.append(f"external_stop:{meta.instance_id}")
 
     cfg = _config()
+    cfg.global_resource_planner.vllm_stop_command_template = "test-owned-stop {instance_id}"
     cfg.global_resource_planner.runtime_manage_rollout_processes = True
     cfg.global_resource_planner.runtime_rollout_reconfigure_strategy = "prewarm"
     cfg.global_resource_planner.runtime_wait_rollout_process_start_ready = True
@@ -1238,6 +1258,7 @@ def test_runtime_executor_prewarm_falls_back_when_no_spare_capacity():
             self.events.append(f"external_stop:{meta.instance_id}")
 
     cfg = _config()
+    cfg.global_resource_planner.vllm_stop_command_template = "test-owned-stop {instance_id}"
     cfg.global_resource_planner.runtime_manage_rollout_processes = True
     cfg.global_resource_planner.runtime_rollout_reconfigure_strategy = "prewarm"
     cfg.global_resource_planner.runtime_prewarm_no_spare_fallback_strategy = "restart_all"

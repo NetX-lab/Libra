@@ -307,6 +307,12 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
         return selected
 
+    def peek_ready_data(self) -> list[Any]:
+        """Snapshot ready payloads in consumption order without changing queues."""
+        with self._result_cv:
+            ready = sorted(self._pending_results.values(), key=lambda result: result.create_time)
+            return [result.data for result in ready]
+
     def active_submit_and_wait(
         self,
         input_generator: Generator[TInput, None, None],

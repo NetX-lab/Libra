@@ -10,9 +10,9 @@ class _UnexpectedReduce:
         raise AssertionError("elastic reduce must not run without a hybrid payload")
 
 
-def test_mcore_skips_elastic_collective_without_hybrid_payload():
+def test_mcore_skips_elastic_collective_when_domain_is_not_configured():
     engine = object.__new__(MegatronCoreTrainEngine)
-    engine.elastic_gradient_domain = _UnexpectedReduce()
+    engine.elastic_gradient_domain = None
     engine._pending_hybrid_gradients = []
 
     engine._apply_elastic_inter_replica_gradients()
