@@ -72,7 +72,7 @@ def test_rejects_duplicate_payload_before_double_counting():
         domain.reduce_core_gradients(**kwargs)
 
 
-def _gloo_worker(rank, rendezvous, output):
+def _gloo_worker(rank, rendezvous, output, in_place=False):
     dist.init_process_group('gloo', init_method=f'file://{rendezvous}', rank=rank, world_size=2)
     isolated = dist.new_group([0, 1], backend='gloo')
     domain = _domain()
@@ -82,16 +82,18 @@ def _gloo_worker(rank, rendezvous, output):
         core_sample_counts={f'dp{rank}': 4 if rank == 0 else 2},
         global_sample_count=8, hybrid_payloads=[_payload()] if rank == 0 else [],
         step=3, state_version=2,
+        in_place=in_place,
     )
     output[rank] = float(result[f'dp{rank}'][0].item())
     dist.destroy_process_group()
 
 
-def test_real_gloo_lane_without_hybrid_still_participates(tmp_path):
+@pytest.mark.parametrize('in_place', [False, True])
+def test_real_gloo_lane_without_hybrid_still_participates(tmp_path, in_place):
     context = mp.get_context('spawn')
     with context.Manager() as manager:
         results = manager.dict()
-        processes = [context.Process(target=_gloo_worker, args=(rank, str(tmp_path / 'rendezvous'), results)) for rank in range(2)]
+        processes = [context.Process(target=_gloo_worker, args=(rank, str(tmp_path / 'rendezvous'), results, in_place)) for rank in range(2)]
         for process in processes:
             process.start()
         for process in processes:
@@ -228,6 +230,8 @@ def test_empty_core_lane_enters_elastic_reduce_without_pending_or_expected_hybri
     engine.elastic_gradient_domain.reduce_core_gradients = reduce
     engine._apply_elastic_inter_replica_gradients()
     assert len(entered) == 1
+    assert entered[0]['in_place'] is True
+    assert entered[0]['core_gradients']['dp1'][0].data_ptr() == grad.data_ptr()
     torch.testing.assert_close(grad, torch.tensor([7.]))
 
 

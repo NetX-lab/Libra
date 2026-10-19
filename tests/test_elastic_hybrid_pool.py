@@ -19,6 +19,128 @@ from RL_Framework.infra.elastic import (
 )
 
 
+def _owned_gradient_case():
+    domain = InterReplicaGradientDomain(core_replica_ids=['core'])
+    payloads = []
+    for index, count in enumerate((2, 3)):
+        name = f'hybrid{index}'
+        domain.request_join(name, 'core', membership_epoch=1)
+        domain.mark_active(name, membership_epoch=1)
+        payloads.append(GradientPayload(
+            name, 'core', (torch.linspace(-3., 7., 73),),
+            step=3, state_version=2, membership_epoch=1,
+            sample_count=count, global_sample_count=11,
+        ))
+    return domain, dict(
+        core_gradients={'core': (torch.linspace(-8., 5., 73),)},
+        core_sample_counts={'core': 6}, global_sample_count=11,
+        hybrid_payloads=payloads, step=3, state_version=2,
+    )
+
+
+def test_owned_gradient_reduction_matches_pure_api_with_chunk_bounded_allocations(monkeypatch):
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_flatten
+    module = importlib.import_module(InterReplicaGradientDomain.__module__)
+    monkeypatch.setattr(module, 'DEFAULT_CHUNK_BYTES', 64)
+
+    class Allocations(TorchDispatchMode):
+        def __init__(self, inputs):
+            self.input_storages = {t.untyped_storage().data_ptr() for t in inputs}
+            self.largest_temporary = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            result = func(*args, **(kwargs or {}))
+            for value in tree_flatten(result)[0]:
+                if (isinstance(value, torch.Tensor)
+                        and value.untyped_storage().data_ptr() not in self.input_storages):
+                    self.largest_temporary = max(
+                        self.largest_temporary, value.untyped_storage().nbytes())
+            return result
+
+    pure_domain, pure_args = _owned_gradient_case()
+    original = pure_args['core_gradients']['core'][0].clone()
+    with Allocations([pure_args['core_gradients']['core'][0]]) as pure_allocations:
+        pure = pure_domain.reduce_core_gradients(**pure_args)['core'][0]
+    assert torch.equal(pure_args['core_gradients']['core'][0], original)
+    assert pure.data_ptr() != pure_args['core_gradients']['core'][0].data_ptr()
+    domain, args = _owned_gradient_case()
+    original_payloads = [p.tensors[0].clone() for p in args['hybrid_payloads']]
+    inputs = [args['core_gradients']['core'][0]]
+    inputs += [p.tensors[0] for p in args['hybrid_payloads']]
+    with Allocations(inputs) as allocations:
+        owned = domain.reduce_core_gradients(**args, in_place=True)['core'][0]
+    assert owned.data_ptr() == inputs[0].data_ptr()
+    assert torch.equal(owned, pure)
+    assert allocations.largest_temporary <= 64
+    assert pure_allocations.largest_temporary >= original.numel() * original.element_size()
+    for payload, saved in zip(args['hybrid_payloads'], original_payloads):
+        assert torch.equal(payload.tensors[0], saved)
+
+
+@pytest.mark.parametrize('failure', ['identity', 'duplicate', 'shape', 'noncontiguous'])
+def test_owned_gradient_validates_all_payloads_before_mutating_inputs(failure):
+    from dataclasses import replace
+    domain, args = _owned_gradient_case()
+    payloads = args['hybrid_payloads']
+    if failure == 'identity':
+        payloads[1] = replace(payloads[1], state_version=1)
+    elif failure == 'duplicate':
+        payloads.append(payloads[0])
+    elif failure == 'shape':
+        payloads[1] = replace(payloads[1], tensors=(torch.ones(74),))
+    else:
+        payloads[1] = replace(payloads[1], tensors=(torch.ones(146)[::2],))
+    core = args['core_gradients']['core'][0]
+    original = core.clone()
+    with pytest.raises(ValueError):
+        domain.reduce_core_gradients(**args, in_place=True)
+    assert torch.equal(core, original)
+    assert not domain._consumed_payloads
+
+
+def test_owned_gradient_rejects_multiple_local_lanes_without_changing_pure_api():
+    domain = InterReplicaGradientDomain(core_replica_ids=['a', 'b'])
+    gradients = {'a': (torch.tensor([1.]),), 'b': (torch.tensor([3.]),)}
+    with pytest.raises(ValueError, match='one local core lane'):
+        domain.reduce_core_gradients(core_gradients=gradients, in_place=True)
+    reduced = domain.reduce_core_gradients(core_gradients=gradients)
+    assert reduced['a'][0].item() == 2.
+    assert gradients['a'][0].item() == 1.
+
+
+def test_owned_gradient_collective_uses_bounded_chunks_and_original_buffers(monkeypatch):
+    module = importlib.import_module(InterReplicaGradientDomain.__module__)
+    monkeypatch.setattr(module, 'DEFAULT_CHUNK_BYTES', 64)
+    monkeypatch.setattr(module.dist, 'is_initialized', lambda: True)
+
+    class Transport:
+        def __init__(self):
+            self.widths = []
+
+        def exchange(self, local, *, group, average):
+            assert group is marker
+            assert average is False
+            self.widths.append(local.numel())
+            return local + 10.
+
+    marker = object()
+    domain, args = _owned_gradient_case()
+    # The test transport stands in for the isolated side-channel collective;
+    # real two-process Gloo coverage lives in test_ehp_correctness.py.
+    domain.bind_hybrid_process_group(marker)
+    domain.transport = Transport()
+    pure_domain, pure_args = _owned_gradient_case()
+    pure_domain.bind_hybrid_process_group(marker)
+    pure_domain.transport = Transport()
+    expected = pure_domain.reduce_core_gradients(**pure_args)['core'][0]
+    core = args['core_gradients']['core'][0]
+    reduced = domain.reduce_core_gradients(**args, in_place=True)['core'][0]
+    assert reduced.data_ptr() == core.data_ptr()
+    assert torch.equal(reduced, expected)
+    assert domain.transport.widths == [16, 16, 16, 16, 9]
+
+
 def test_joining_worker_contributes_zero_gradient_placeholder():
     domain = InterReplicaGradientDomain(core_replica_ids=["core0", "core1"])
     domain.request_join("hybrid0", "core0")

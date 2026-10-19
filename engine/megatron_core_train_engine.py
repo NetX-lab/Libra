@@ -1303,14 +1303,17 @@ class MegatronCoreTrainEngine:
         # finalize_model_grads has already averaged the weighted core sum
         # across DP. Each lane holds the same core contribution, so divide by
         # DP before the second SUM, while adding each hybrid exactly once.
-        local = tuple(grad.detach() / world if weighted else grad.detach()
-                      for _, grad in params_and_grads)
+        local = tuple(grad.detach() for _, grad in params_and_grads)
+        if weighted and world > 1:
+            for grad in local:
+                grad.div_(world)
         reduced = self.elastic_gradient_domain.reduce_core_gradients(
             core_gradients={core_id: local}, hybrid_payloads=pending,
             core_sample_counts={core_id: partition[1]} if weighted else None,
             global_sample_count=partition[1] if weighted else 0,
             step=self._elastic_training_step,
             state_version=self._elastic_expected_state_version,
+            in_place=True,
         )
         for (_, grad), reduced_grad in zip(
             params_and_grads,
@@ -1320,12 +1323,22 @@ class MegatronCoreTrainEngine:
                 reduced_grad.to(device=grad.device, dtype=grad.dtype)
             )
         if self._elastic_gradient_update_callback is not None:
+            # The callback can queue this update for asynchronous serialization.
+            # Optimizer clipping and the next zero_grad may mutate main_grad as
+            # soon as it returns. Preserve an owned CPU snapshot, rather than
+            # restoring a full-model FP32 duplicate on the GPU.
+            update_tensors = None
             for payload in pending:
                 if payload.replica_id in expected:
+                    if update_tensors is None:
+                        update_tensors = tuple(
+                            tensor.detach().to(device="cpu", copy=True)
+                            for tensor in reduced[core_id]
+                        )
                     self._elastic_gradient_update_callback(
                         GradientUpdate(
                             replica_id=payload.replica_id,
-                            tensors=tuple(reduced[core_id]),
+                            tensors=update_tensors,
                             step=payload.step,
                             state_version=self._elastic_expected_state_version + 1,
                             membership_epoch=payload.membership_epoch,
