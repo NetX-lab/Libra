@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 import logging
 import os
 import threading
@@ -179,10 +180,18 @@ class VLLMRolloutEngine:
     ) -> dict[str, Any]:
         """Generate."""
         await self._ensure_client()
+        lease = kwargs.pop("kv_lease", None)
+        prompt_token_ids = kwargs.pop("prompt_token_ids", None)
+        request_options = {}
+        kv_request_id = kwargs.pop("kv_request_id", None)
+        if kv_request_id is not None:
+            request_options["headers"] = {"X-Request-Id": str(kv_request_id)}
+        if lease is not None:
+            request_options.setdefault("headers", {})["X-Libra-KV-Lease"] = lease["lease_id"]
 
         payload = {
             "model": self.model_path,
-            "prompt": prompt,
+            "prompt": prompt_token_ids if prompt_token_ids is not None else prompt,
             "max_tokens": max_new_tokens,
             "temperature": temperature,
             "top_p": top_p,
@@ -207,7 +216,7 @@ class VLLMRolloutEngine:
         try:
             response = await self.http_client.post(
                 self.completions_url,
-                json=payload,
+                json=payload, **request_options,
             )
 
             if response.status_code != 200:
@@ -261,6 +270,37 @@ class VLLMRolloutEngine:
             valid_results.append(result)
 
         return valid_results
+
+    async def get_kv_cache_identity(self):
+        await self._ensure_client()
+        response = await self.http_client.get(f"{self.base_url}/libra/kv/identity")
+        response.raise_for_status()
+        return response.json()
+
+    async def acquire_kv_lease(self):
+        await self._ensure_client()
+        lease_id = uuid.uuid4().hex
+        try:
+            response = await self.http_client.post(
+                f"{self.base_url}/libra/kv/lease", json={"lease_id": lease_id},
+            )
+            response.raise_for_status()
+            return response.json()
+        except BaseException:
+            # A server may reserve before its response is cancelled. The
+            # client-generated ID makes that reservation safe to withdraw.
+            try:
+                await self.http_client.delete(f"{self.base_url}/libra/kv/lease/{lease_id}")
+            except Exception:
+                logger.exception("Failed to release cancelled KV reservation %s", lease_id)
+            raise
+
+    async def release_kv_lease(self, lease):
+        await self._ensure_client()
+        response = await self.http_client.delete(
+            f"{self.base_url}/libra/kv/lease/{lease['lease_id']}",
+        )
+        response.raise_for_status()
 
     async def wait_for_cpu_offload(self, key: str, source_tp: int, timeout: float = 30.0):
         """Await only the portion of offload not hidden by tool execution."""

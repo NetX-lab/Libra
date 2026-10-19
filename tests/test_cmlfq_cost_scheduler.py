@@ -205,8 +205,17 @@ class TestBackendIntegration(unittest.IsolatedAsyncioTestCase):
             "nixl" if transfer else "recompute", [(1, 4)],
         )
         engine.engines = [VLLMRolloutEngine(host="host-a"), VLLMRolloutEngine(host="host-b")]
+        def versioned_handler(request):
+            if request.url.path == "/libra/kv/lease":
+                return httpx.Response(200, json=dict(
+                    lease_id=json.loads(request.content)["lease_id"], snapshot_id="shared-snapshot",
+                    optimizer_revision=0, server_instance_id=request.url.host, server_generation=0,
+                ))
+            if request.method == "DELETE" and request.url.path.startswith("/libra/kv/lease/"):
+                return httpx.Response(200, json={"released": True})
+            return handler(request)
         for backend in engine.engines:
-            backend.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            backend.http_client = httpx.AsyncClient(transport=httpx.MockTransport(versioned_handler))
             backend._http_client_loop = asyncio.get_running_loop()
         engine._configure_cost_runtime()
         return engine

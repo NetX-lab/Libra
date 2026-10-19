@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import ipaddress
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -15,6 +16,10 @@ import torch
 _COMMUNICATOR_CACHE: dict[tuple[str, int, int, int, str], object] = {}
 _COMMUNICATOR_CACHE_LOCK = threading.Lock()
 _PIPELINE_DEPTH = 2
+# vLLM constructs datetime.timedelta(seconds=store_timeout), so None/inf and
+# timedelta.max are unsafe. A century represents the application's unbounded
+# wait while staying below signed int64 even after conversion to nanoseconds.
+_UNBOUNDED_STORE_TIMEOUT_S = 100 * 365 * 24 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -44,13 +49,25 @@ class NcclReloadSpec:
 def _group(spec: NcclReloadSpec):
     from vllm.distributed.utils import StatelessProcessGroup
 
-    return StatelessProcessGroup.create(
+    timeout_s = float(spec.timeout_s)
+    if not math.isfinite(timeout_s) or timeout_s < 0:
+        raise ValueError("NCCL store timeout must be finite non-negative seconds")
+    group = StatelessProcessGroup.create(
         host=spec.host,
         port=int(spec.port),
         rank=int(spec.rank),
         world_size=int(spec.world_size),
-        store_timeout=max(30, int(spec.timeout_s)),
+        store_timeout=timeout_s if timeout_s > 0 else _UNBOUNDED_STORE_TIMEOUT_S,
     )
+    # vLLM 0.9.2 keeps a Python socket for the master_listen_fd handed to
+    # TCPStore. TCPStore owns and closes that descriptor. Letting the Python
+    # socket also close it can abort the store's daemon during cache eviction
+    # or interpreter shutdown. Transfer ownership while both objects are alive;
+    # receiver groups have no listening socket.
+    listen_socket = getattr(group, "socket", None)
+    if spec.rank == 0 and listen_socket is not None:
+        listen_socket.detach()
+    return group
 
 
 def _communicator(spec: NcclReloadSpec):

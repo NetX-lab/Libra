@@ -48,7 +48,7 @@ class InplaceReloadWorkerExtension:
             self.vllm_config.model_config.model = previous_path
             raise
         finished_at = time.time()
-        return {
+        result = {
             "rank": int(getattr(self, "rank", 0)),
             "checkpoint_path": str(checkpoint),
             "previous_path": previous_path,
@@ -56,6 +56,7 @@ class InplaceReloadWorkerExtension:
             "finished_at": finished_at,
             "load_seconds": time.perf_counter() - started,
         }
+        return self._attest_reload(result)
 
     def reload_weights_nccl(
         self,
@@ -65,6 +66,7 @@ class InplaceReloadWorkerExtension:
         rank_offset: int,
         timeout_seconds: float = 1200.0,
         chunk_bytes: int = 256 * 1024 * 1024,
+        expected_tensor_count: int | None = None,
     ) -> dict[str, Any]:
         """Load full HF-format weights from a Megatron NCCL broadcast."""
         import torch
@@ -85,11 +87,35 @@ class InplaceReloadWorkerExtension:
             chunk_bytes=int(chunk_bytes),
         )
         started = time.perf_counter()
-        loaded = self.model_runner.model.load_weights(receive_weights(spec))
+        count, complete = 0, False
+        source = receive_weights(spec)
+        def observed():
+            nonlocal count, complete
+            for name, tensor in source:
+                count += 1
+                yield name, tensor
+            complete = True
+        weights = observed()
+        try:
+            loaded = self.model_runner.model.load_weights(weights)
+            if not complete:
+                raise RuntimeError('Model loader returned before the NCCL done marker')
+            if expected_tensor_count is not None and count != expected_tensor_count:
+                raise RuntimeError('Received source tensor count differs from the snapshot')
+        finally:
+            weights.close()
+            source.close()
         torch.cuda.synchronize()
-        return {
+        result = {
             "rank": local_rank,
             "nccl_rank": spec.rank,
             "loaded_parameters": len(loaded) if loaded is not None else 0,
+            "received_tensors": count,
+            "receive_complete": complete,
             "load_seconds": time.perf_counter() - started,
         }
+        return self._attest_reload(result)
+
+    def _attest_reload(self, result):
+        self._libra_service_generation = getattr(self, '_libra_service_generation', 0) + 1
+        return dict(result, service_generation=self._libra_service_generation)

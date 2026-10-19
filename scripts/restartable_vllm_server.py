@@ -44,8 +44,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def wait_until_ready(process: subprocess.Popen, url: str, timeout: float) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    deadline = time.monotonic() + timeout if timeout > 0 else None
+    while deadline is None or time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(f"vLLM exited with status {process.returncode}")
         try:
@@ -70,7 +70,7 @@ def reload_inplace(health_url: str, checkpoint_path: str, timeout: float) -> dic
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout + 10) as response:
+    with urllib.request.urlopen(request, timeout=timeout + 10 if timeout > 0 else None) as response:
         if response.status != 200:
             raise RuntimeError(f"vLLM reload returned HTTP {response.status}")
         return json.loads(response.read().decode("utf-8"))
@@ -89,7 +89,7 @@ def reload_nccl(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout + 10) as response:
+    with urllib.request.urlopen(request, timeout=timeout + 10 if timeout > 0 else None) as response:
         if response.status != 200:
             raise RuntimeError(f"vLLM NCCL reload returned HTTP {response.status}")
         return json.loads(response.read().decode("utf-8"))
@@ -133,6 +133,7 @@ def main() -> int:
     control_dir.mkdir(parents=True, exist_ok=True)
     request_path = control_dir / "reload_request.json"
     current_version = 0
+    current_snapshot = None
     process: subprocess.Popen | None = None
 
     def request_shutdown(signum, _frame):
@@ -178,7 +179,10 @@ def main() -> int:
                 except (OSError, ValueError, KeyError, json.JSONDecodeError):
                     time.sleep(max(0.05, args.poll_interval))
                     continue
-                if requested_version > current_version:
+                requested_snapshot = request.get('snapshot_id')
+                if (requested_version > current_version or
+                        requested_version == current_version and requested_snapshot
+                        and requested_snapshot != current_snapshot):
                     if reload_mode == "checkpoint" and not Path(checkpoint_path).is_dir():
                         raise FileNotFoundError(checkpoint_path)
                     current_version = requested_version
@@ -205,6 +209,8 @@ def main() -> int:
                                         ),
                                         "timeout_seconds": float(args.ready_timeout),
                                         "chunk_bytes": int(request["nccl_chunk_bytes"]),
+                                        **{key: request[key] for key in ('snapshot_id', 'optimizer_revision', 'expected_tensor_count')
+                                           if key in request},
                                     },
                                     args.ready_timeout,
                                 )
@@ -226,6 +232,7 @@ def main() -> int:
                             {
                                 "instance_id": args.instance_id,
                                 "version": current_version,
+                                **{key: request[key] for key in ('snapshot_id', 'optimizer_revision', 'topology_epoch') if key in request},
                                 "checkpoint_path": checkpoint_path,
                                 "reload_strategy": reload_strategy,
                                 "reload_method": reload_method,
@@ -241,6 +248,7 @@ def main() -> int:
                         {
                             "instance_id": args.instance_id,
                             "version": current_version,
+                            **{key: request[key] for key in ('snapshot_id', 'optimizer_revision', 'topology_epoch') if key in request},
                             "checkpoint_path": checkpoint_path,
                             "reload_strategy": reload_strategy,
                             "reload_method": reload_method,
@@ -256,6 +264,7 @@ def main() -> int:
                             "server_response": response,
                         },
                     )
+                    current_snapshot = requested_snapshot
                     print(
                         f"[vllm-reloader] ready version={current_version} "
                         f"method={reload_method} strategy={reload_strategy} "

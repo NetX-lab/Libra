@@ -17,6 +17,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .kv_identity import same_snapshot, same_incarnation
+
 import torch
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -87,9 +89,11 @@ class LibraCPUOffloadConnector(KVConnectorBase_V1):
             "request_id": request.request_id, "key": key,
             "block_ids": list(block_ids)[:n // self.block_size],
             "tokens": list(request.all_token_ids[:n]), "source_tp": self.tp,
+            "libra_kv_identity": params.get("libra_kv_identity"),
         })
         return True, {"libra_offload_key": key, "source_tp": self.tp,
-                      "cached_tokens": n, "libra_imported_tokens": loaded}
+                      "cached_tokens": n, "libra_imported_tokens": loaded,
+                      "libra_kv_identity": params.get("libra_kv_identity")}
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
         params = request.kv_transfer_params or {}
@@ -99,11 +103,23 @@ class LibraCPUOffloadConnector(KVConnectorBase_V1):
         directory = cache_directory(self.root, key)
         try:
             manifest = json.loads((directory / "rank_0.json").read_text())
-            if manifest.get("block_size") != self.block_size:
+            if (manifest.get("block_size") != self.block_size
+                    or not same_snapshot(manifest.get("libra_kv_identity"),
+                                         params.get("libra_kv_identity"))
+                    or not same_incarnation(manifest.get("libra_kv_identity"),
+                                            params.get("libra_kv_source_identity"))):
                 return 0, False
             source_tp = int(manifest["source_tp"])
-            if any(not (directory / f"rank_{rank}.json").exists() for rank in range(source_tp)):
+            if not 1 <= source_tp <= 64:
                 return 0, False
+            for rank in range(source_tp):
+                shard = json.loads((directory / f"rank_{rank}.json").read_text())
+                if (shard.get("tokens") != manifest["tokens"]
+                        or shard.get("source_tp") != source_tp
+                        or shard.get("block_size") != self.block_size
+                        or not same_incarnation(shard.get("libra_kv_identity"),
+                                                manifest.get("libra_kv_identity"))):
+                    return 0, False
             tokens = manifest["tokens"]
             n = min(len(tokens), len(request.prompt_token_ids) - 1)
             n = n // self.block_size * self.block_size
@@ -114,9 +130,11 @@ class LibraCPUOffloadConnector(KVConnectorBase_V1):
             self.matches[request.request_id] = {
                 "key": key, "source_tp": source_tp, "num_tokens": n,
                 "request_id": request.request_id,
+                "libra_kv_identity": params.get("libra_kv_identity"),
+                "libra_kv_source_identity": params.get("libra_kv_source_identity"),
             }
             return n - num_computed_tokens, False
-        except (FileNotFoundError, json.JSONDecodeError):
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             return 0, False
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens):
@@ -193,7 +211,7 @@ class LibraCPUOffloadConnector(KVConnectorBase_V1):
         temporary.replace(directory / f"rank_{self.rank}.pt")
         atomic_json(directory / f"rank_{self.rank}.json", {
             "tokens": item["tokens"], "source_tp": item["source_tp"],
-            "block_size": self.block_size,
+            "block_size": self.block_size, "libra_kv_identity": item.get("libra_kv_identity"),
             "offload_started_at": started, "dma_done_at": dma_done,
             "ready_at": time.time(), "bytes": sum(t.numel() * t.element_size() for t in host.values()),
         })
@@ -203,6 +221,11 @@ class LibraCPUOffloadConnector(KVConnectorBase_V1):
 
     def _reload(self, item):
         directory = cache_directory(self.root, item["key"])
+        for rank in range(item["source_tp"]):
+            manifest = json.loads((directory / f"rank_{rank}.json").read_text())
+            if (not same_incarnation(manifest.get("libra_kv_identity"), item.get("libra_kv_source_identity"))
+                    or not same_snapshot(manifest.get("libra_kv_identity"), item.get("libra_kv_identity"))):
+                raise RuntimeError("CPU KV identity changed before worker reload")
         source_heads = self.num_heads // item["source_tp"]
         target_heads = self.num_heads // self.tp
         first_head, last_head = self.rank * target_heads, (self.rank + 1) * target_heads

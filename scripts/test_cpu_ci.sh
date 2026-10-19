@@ -11,6 +11,11 @@ python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_cmlfq_cost_scheduler.py \
   tests/test_hetero_cmlfq_integration.py \
   tests/test_rollout_engine.py \
+  tests/test_checked_prefix_cache_reset.py \
+  tests/test_nccl_store_lifecycle.py \
+  tests/test_nccl_store_timeout.py \
+  tests/test_serving_protocol.py \
+  tests/test_versioned_kv_compatibility.py \
   tests/test_cpu_offload_backend.py \
   tests/test_r2e_patch_harness.py \
   tests/test_r2e_gym_workflow.py

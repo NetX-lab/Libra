@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from RL_Framework.infra.scheduling.kv_identity import same_snapshot, same_incarnation, snapshot_identity
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,12 +52,28 @@ class CMLFQGenerationBackend:
             return BackendResult(await target.generate(prompt=prompt, **kwargs), path)
         if self.mode != "nixl":
             raise RuntimeError("transfer selected on a recompute-only backend")
+        leases = []
         try:
-            # Materialize the exact next prompt on the source. Its generated
-            # token is discarded; the target samples the user's full output.
-            # Profile transfer_ms must include this preparation overhead.
+            # Acquisitions fail immediately when a publisher already owns a peer.
+            # Never wait for another engine while holding a generation lease.
+            for engine in dict.fromkeys((source, target)):
+                leases.append((engine, await engine.acquire_kv_lease()))
+            by_engine = {engine: lease for engine, lease in leases}
+            if not same_snapshot(by_engine[source], by_engine[target]):
+                raise RuntimeError("KV snapshot differs or is unknown")
+            # Strict workflows must materialize exactly the token IDs decoded on
+            # the target; tokenizing transcript text again can change its prefix.
+            preparation = {}
+            if kwargs.get("prompt_token_ids") is not None:
+                preparation["prompt_token_ids"] = kwargs["prompt_token_ids"]
             prepared = await source.generate(
-                prompt=prompt, max_new_tokens=1, temperature=0.0, top_p=1.0, n=1,
+                # Preparation also goes through the strict sampler hook. Its
+                # discarded token must use a seeded stochastic row, never the
+                # greedy fast path. Sampling does not change cached prompt KV.
+                prompt=prompt, max_new_tokens=1,
+                temperature=max(float(kwargs.get("temperature", 1.0)), 1e-4),
+                top_p=kwargs.get("top_p", 1.0), n=1, seed=kwargs.get("seed", 0),
+                kv_lease=by_engine[source], **preparation,
                 kv_transfer_params={"do_remote_decode": True, "do_remote_prefill": False},
             )
             params = prepared.get("kv_transfer_params")
@@ -67,14 +85,17 @@ class CMLFQGenerationBackend:
                 raise RuntimeError("source exported no KV blocks")
             params = dict(params)
             params.update(do_remote_prefill=True, do_remote_decode=False)
-            output = await target.generate(prompt=prompt, kv_transfer_params=params, **kwargs)
+            output = await target.generate(prompt=prompt, kv_transfer_params=params,
+                                           kv_lease=by_engine[target], **kwargs)
             return BackendResult(output, "transfer")
         except Exception as error:
-            # Non-streaming requests: no partial output has reached the caller.
-            # Cancellation (BaseException) is deliberately not retried.
             logger.warning("CMLFQ KV transfer failed; recomputing: %s", error)
-            output = await target.generate(prompt=prompt, **kwargs)
-            return BackendResult(output, "recompute", type(error).__name__)
+            fallback = type(error).__name__
+        finally:
+            await asyncio.gather(*(self._release_kv_lease(engine, lease)
+                                   for engine, lease in reversed(leases)))
+        output = await target.generate(prompt=prompt, **kwargs)
+        return BackendResult(output, "recompute", fallback)
 
     async def _generate_cpu(self, target, prompt, path, request_id, kwargs):
         if not request_id:
@@ -83,32 +104,61 @@ class CMLFQGenerationBackend:
         key = uuid.uuid4().hex
         params = {"libra_offload_key": key}
         fallback = "cache_unavailable" if path == "transfer" and previous is None else ""
-        wait_started = time.perf_counter()
+        leases = []
+        lease = None
         status = None
-        if previous and path in {"stay", "transfer"}:
-            old_engine, descriptor = previous
-            try:
-                status = await old_engine.wait_for_cpu_offload(
-                    descriptor["libra_offload_key"], descriptor["source_tp"],
-                )
-                params["libra_load_key"] = descriptor["libra_offload_key"]
-            except Exception as error:
-                fallback = type(error).__name__
-        wait_ms = (time.perf_counter() - wait_started) * 1000
+        wait_started = time.perf_counter()
         try:
             try:
-                output = await target.generate(prompt=prompt, kv_transfer_params=params, **kwargs)
+                lease = await target.acquire_kv_lease()
+                leases.append((target, lease))
+            except Exception as error:
+                # Plain full-prompt generation remains available on old servers.
+                fallback = type(error).__name__
+            identity = snapshot_identity(lease or {})
+            params["libra_kv_identity"] = identity
+            if previous and path in {"stay", "transfer"}:
+                old_engine, descriptor = previous
+                previous_identity = descriptor.get("libra_kv_identity")
+                if lease is not None and same_snapshot(previous_identity, identity):
+                    try:
+                        source_lease = lease if old_engine is target else await old_engine.acquire_kv_lease()
+                        if old_engine is not target:
+                            leases.append((old_engine, source_lease))
+                        if not same_incarnation(previous_identity, source_lease):
+                            fallback = "incarnation_mismatch"
+                        elif not same_snapshot(source_lease, identity):
+                            fallback = "snapshot_mismatch"
+                        else:
+                            status = await old_engine.wait_for_cpu_offload(
+                                descriptor["libra_offload_key"], descriptor["source_tp"],
+                            )
+                            params["libra_load_key"] = descriptor["libra_offload_key"]
+                            params["libra_kv_source_identity"] = snapshot_identity(source_lease)
+                    except Exception as error:
+                        fallback = type(error).__name__
+                else:
+                    fallback = "snapshot_mismatch"
+            wait_ms = (time.perf_counter() - wait_started) * 1000
+            options = dict(kwargs, **({"kv_lease": lease} if lease is not None else {}))
+            try:
+                output = await target.generate(prompt=prompt, kv_transfer_params=params, **options)
             except Exception as error:
                 if "libra_load_key" not in params:
                     raise
                 fallback = type(error).__name__
                 params.pop("libra_load_key")
-                output = await target.generate(prompt=prompt, kv_transfer_params=params, **kwargs)
+                params.pop("libra_kv_source_identity", None)
+                output = await target.generate(prompt=prompt, kv_transfer_params=params, **options)
         except BaseException:
             self._release(target, key)
             raise
+        finally:
+            await asyncio.gather(*(self._release_kv_lease(engine, held)
+                                   for engine, held in reversed(leases)))
         descriptor = output.get("kv_transfer_params", {})
         if descriptor.get("libra_offload_key"):
+            descriptor = dict(descriptor, libra_kv_identity=descriptor.get("libra_kv_identity", identity))
             self._offloads[request_id] = (target, descriptor)
         else:
             self._offloads.pop(request_id, None)
@@ -124,6 +174,14 @@ class CMLFQGenerationBackend:
         if previous and path in {"stay", "transfer"} and not imported and not fallback:
             fallback = "cache_prefix_miss"
         return BackendResult(output, actual, fallback)
+
+    async def _release_kv_lease(self, engine, lease):
+        try:
+            await engine.release_kv_lease(lease)
+        except Exception:
+            # Preserve generation failures/cancellation. The server keeps a
+            # failed release fenced and publication will time out fail-closed.
+            logger.exception("Failed to release KV weight lease %s", lease.get("lease_id"))
 
     def _release(self, engine, key):
         async def cleanup():

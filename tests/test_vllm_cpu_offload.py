@@ -13,6 +13,10 @@ pytest.importorskip("vllm")
 from RL_Framework.infra.scheduling.vllm_cpu_offload import LibraCPUOffloadConnector, cache_directory
 
 
+IDENTITY = dict(snapshot_id="test-snapshot", optimizer_revision=1,
+                server_instance_id="source", server_generation=0)
+
+
 def bare_connector(root, tp=1, rank=0):
     connector = object.__new__(LibraCPUOffloadConnector)
     connector.root, connector.tp, connector.rank = root, tp, rank
@@ -28,9 +32,12 @@ def test_prefix_identity_and_complete_block_boundaries():
         directory.mkdir()
         (directory / "rank_0.json").write_text(json.dumps({
             "tokens": list(range(64)), "source_tp": 1, "block_size": 16,
+            "libra_kv_identity": IDENTITY,
         }))
         connector = bare_connector(root)
-        request = SimpleNamespace(kv_transfer_params={"libra_load_key": key},
+        request = SimpleNamespace(kv_transfer_params={"libra_load_key": key,
+                                      "libra_kv_identity": IDENTITY,
+                                      "libra_kv_source_identity": IDENTITY},
                                   request_id="r", prompt_token_ids=list(range(65)))
         assert connector.get_num_new_matched_tokens(request, 16) == (48, False)
         request.prompt_token_ids[1] = 999
@@ -58,12 +65,18 @@ def test_real_cuda_cpu_head_resharding(source_tp, target_tp):
                     pinned.copy_(gpu, non_blocking=True)
                 stream.synchronize()
                 torch.save({"layer": pinned}, directory / f"rank_{rank}.pt")
+                (directory / f"rank_{rank}.json").write_text(json.dumps({
+                    "tokens": list(range(32)), "source_tp": source_tp, "block_size": 16,
+                    "libra_kv_identity": IDENTITY,
+                }))
         for rank in range(target_tp):
             with torch.cuda.device(rank):
                 connector = bare_connector(root, target_tp, rank)
                 destination = torch.zeros(2, 3, 16, 8 // target_tp, 4, device="cuda")
                 connector.caches = {"layer": destination}
                 connector._reload({"key": key, "source_tp": source_tp,
-                                   "num_tokens": 32, "block_ids": [2, 0]})
+                                   "num_tokens": 32, "block_ids": [2, 0],
+                                   "libra_kv_identity": IDENTITY,
+                                   "libra_kv_source_identity": IDENTITY})
                 observed = destination[:, [2, 0]].cpu()
                 assert torch.equal(observed, full.chunk(target_tp, dim=-2)[rank])
