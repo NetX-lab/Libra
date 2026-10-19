@@ -4,3 +4,4 @@ pytest-asyncio==0.26.0
 numpy==1.26.4
 PyYAML==6.0.2
 httpx==0.28.1
+transformers==4.56.2
