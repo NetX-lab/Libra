@@ -1,6 +1,5 @@
 import asyncio
 import unittest
-import uuid
 
 from RL_Framework.engine.cmlfq_backend import CMLFQGenerationBackend
 
@@ -10,20 +9,6 @@ class FakeCPUBackend:
         self.calls = []
         self.released = []
         self.ready = asyncio.Event()
-        self.instance_id = uuid.uuid4().hex
-        self.generation = 0
-        self.revision = 0
-        self.leases = set()
-
-    async def acquire_kv_lease(self):
-        lease_id = uuid.uuid4().hex
-        self.leases.add(lease_id)
-        return dict(lease_id=lease_id, snapshot_id=f"snapshot-{self.revision}",
-                    optimizer_revision=self.revision, server_instance_id=self.instance_id,
-                    server_generation=self.generation)
-
-    async def release_kv_lease(self, lease):
-        self.leases.discard(lease["lease_id"])
 
     async def generate(self, prompt, kv_transfer_params, **kwargs):
         self.calls.append(kv_transfer_params)

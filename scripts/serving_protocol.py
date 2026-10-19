@@ -1,7 +1,7 @@
-"""Shared serving identity, request/KV leases and global reload receipts.
+"""Shared serving identity, request leases and global reload receipts.
 
-Generation and reload share one boundary so cached KV remains tied to the
-weights and service incarnation that produced it.
+Generation and reload share one boundary. Request reservations keep verified
+service identity stable until the reserved request has completed.
 """
 from __future__ import annotations
 
@@ -134,19 +134,6 @@ def generation_headers(state, request_id, generation, status, streaming=False):
     return [(key.encode(), value.encode()) for key, value in values.items()]
 
 
-def fence_kv_payload(payload, state):
-    """The service owns target weight identity; stale imports must recompute."""
-    from RL_Framework.infra.scheduling.kv_identity import same_snapshot, snapshot_identity
-    params = payload.get('kv_transfer_params') if isinstance(payload, dict) else None
-    if isinstance(params, dict) and ('libra_offload_key' in params or 'libra_load_key' in params):
-        identity = snapshot_identity(state.status())
-        if not same_snapshot(params.get('libra_kv_identity'), identity):
-            params.pop('libra_load_key', None)
-            params.pop('libra_kv_source_identity', None)
-        params['libra_kv_identity'] = identity
-    return payload
-
-
 class GenerationMiddleware:
     """Admit request lifetimes through the same boundary used by weight reload."""
     def __init__(self, app, state):
@@ -186,33 +173,6 @@ class GenerationMiddleware:
                 for part in bodies:
                     await send(part)
         try:
-            if receive is None:
-                return await self.app(scope, receive, observe)
-            chunks = []
-            while True:
-                message = await receive()
-                if message['type'] == 'http.disconnect':
-                    return
-                chunks.append(message.get('body', b''))
-                if not message.get('more_body', False):
-                    break
-            body = b''.join(chunks)
-            try:
-                payload = json.loads(body)
-            except (ValueError, TypeError):
-                payload = None
-            if isinstance(payload, dict) and isinstance(payload.get('kv_transfer_params'), dict):
-                body = json.dumps(fence_kv_payload(payload, self.state)).encode()
-                scope = dict(scope, headers=[(key, value) for key, value in scope.get('headers', [])
-                                             if key.lower() != b'content-length']
-                             + [(b'content-length', str(len(body)).encode())])
-            consumed = False
-            async def replay():
-                nonlocal consumed
-                if not consumed:
-                    consumed = True
-                    return dict(type='http.request', body=body, more_body=False)
-                return await receive()
-            await self.app(scope, replay, observe)
+            await self.app(scope, receive, observe)
         finally:
             await self.state.leave()

@@ -1,4 +1,4 @@
-"""Shared serving correctness across arbitrary TP layouts, reload and KV leases."""
+"""Shared serving correctness across arbitrary TP layouts, reload and request leases."""
 
 import asyncio
 import importlib.util
@@ -10,7 +10,7 @@ import sys
 import pytest
 import torch
 
-from RL_Framework.scripts.serving_protocol import ServingState, GenerationMiddleware, fence_kv_payload
+from RL_Framework.scripts.serving_protocol import ServingState, GenerationMiddleware
 from RL_Framework.vllm_hot_reload import InplaceReloadWorkerExtension
 
 
@@ -61,7 +61,7 @@ def test_incomplete_stale_or_inconsistent_tp_receipts_cannot_advance(mutate):
     asyncio.run(run())
 
 
-def test_reload_drains_inflight_requests_and_kv_continuations_before_install():
+def test_reload_drains_inflight_requests_and_reserved_dispatch_before_install():
     async def run():
         state = ServingState(2)
         lease = await state.acquire_kv_lease()
@@ -74,7 +74,7 @@ def test_reload_drains_inflight_requests_and_kv_continuations_before_install():
         waiting = asyncio.create_task(state.enter())
         await asyncio.sleep(0)
         assert not waiting.done()
-        assert await state.enter(lease['lease_id']) == 0  # Existing KV continuation progresses.
+        assert await state.enter(lease['lease_id']) == 0  # A previously reserved request progresses.
         await state.leave()
         await state.leave()
         assert not installing.done()
@@ -99,17 +99,7 @@ def test_positive_drain_timeout_reopens_before_any_mutation():
     asyncio.run(run())
 
 
-def test_server_owns_target_kv_identity_and_strips_stale_import():
-    state = ServingState(2, '/models/test')
-    payload = dict(kv_transfer_params=dict(libra_offload_key='save', libra_load_key='old',
-        libra_kv_identity=dict(snapshot_id='old', optimizer_revision=-1), libra_kv_source_identity={'old': True}))
-    fenced = fence_kv_payload(payload, state)['kv_transfer_params']
-    assert 'libra_load_key' not in fenced and 'libra_kv_source_identity' not in fenced
-    assert fenced['libra_kv_identity']['server_instance_id'] == state.server_instance_id
-    assert fenced['libra_offload_key'] == 'save'
-
-
-def test_generation_headers_match_actual_completion_and_body_identity_is_authoritative():
+def test_generation_headers_attest_completion_without_changing_request_body():
     async def run():
         state, sent = ServingState(1), []
         received_payload = []
@@ -118,7 +108,7 @@ def test_generation_headers_match_actual_completion_and_body_identity_is_authori
             await send(dict(type='http.response.start', status=200, headers=[(b'content-type', b'application/json')]))
             await send(dict(type='http.response.body', body=b'{"choices":[]}'))
         middleware = GenerationMiddleware(app, state)
-        payload = dict(prompt=[1], kv_transfer_params=dict(libra_offload_key='save', libra_load_key='old'))
+        payload = dict(prompt=[1, 2, 3], seed=42, temperature=.8, top_p=.95, custom_field='unchanged')
         async def receive():
             return dict(type='http.request', body=json.dumps(payload).encode(), more_body=False)
         async def send(message):
@@ -132,9 +122,7 @@ def test_generation_headers_match_actual_completion_and_body_identity_is_authori
         assert headers[b'x-libra-service-generation-verified'] == b'1'
         assert headers[b'x-libra-reload-overlap'] == b'0'
         assert state.active_requests == 0
-        params = received_payload[0]['kv_transfer_params']
-        assert 'libra_load_key' not in params
-        assert params['libra_kv_identity']['server_instance_id'] == state.server_instance_id
+        assert received_payload == [payload]
     asyncio.run(run())
 
 
@@ -253,7 +241,7 @@ def load_serving_app(monkeypatch, tp=4, invalid_ack=False):
     return app
 
 
-def test_real_http_routes_fence_reload_by_kv_lease_and_attest_physical_workers(monkeypatch):
+def test_real_http_routes_fence_reload_by_request_lease_and_attest_physical_workers(monkeypatch):
     import httpx
     app = load_serving_app(monkeypatch)
     async def run():
@@ -283,11 +271,10 @@ def test_real_http_routes_fence_reload_by_kv_lease_and_attest_physical_workers(m
             assert live['server_generation'] == 1 and live['server_generation_verified']
             assert live['workers'] == reply.json()['workers']
             response = await client.post('/v1/completions', headers={'X-Libra-Request-Id': 'new-request'},
-                json=dict(prompt=[1], kv_transfer_params=dict(libra_offload_key='next', libra_load_key='old',
-                    libra_kv_identity=lease)))
+                json=dict(prompt=[1, 2], seed=42))
             assert response.headers['x-libra-service-generation-verified'] == '1'
             assert response.headers['x-libra-service-generation'] == '1'
-            assert 'libra_load_key' not in response.json()['received']['kv_transfer_params']
+            assert response.json()['received'] == dict(prompt=[1, 2], seed=42)
     asyncio.run(run())
 
 
@@ -303,4 +290,25 @@ def test_real_http_partial_tp_failure_quarantines_service(monkeypatch):
             assert state['failed'] and not state['server_generation_verified']
             assert state['server_generation'] == 0
             assert (await client.post('/v1/completions', json=dict(prompt=[1]))).status_code == 409
+    asyncio.run(run())
+
+
+def test_cancelled_lease_response_withdraws_server_reservation():
+    import httpx
+    from RL_Framework.engine.rollout_engine import VLLMRolloutEngine
+    async def run():
+        state = ServingState(1)
+        async def handler(request):
+            if request.method == "POST":
+                await state.acquire_kv_lease(json.loads(request.content)["lease_id"])
+                raise asyncio.CancelledError()
+            await state.release_kv_lease(request.url.path.rsplit("/", 1)[-1])
+            return httpx.Response(200, json={"released": True})
+        engine = VLLMRolloutEngine(host="test")
+        engine.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        engine._http_client_loop = asyncio.get_running_loop()
+        with pytest.raises(asyncio.CancelledError):
+            await engine.acquire_kv_lease()
+        assert not state.kv_leases
+        await engine.close()
     asyncio.run(run())
