@@ -21,6 +21,7 @@ python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_ehp_batch_partition.py \
   tests/test_ehp_correctness.py \
   tests/test_torch_optimizer_memory.py \
+  tests/test_ehp_dp_resharding.py \
   tests/test_ehp_membership_release.py \
   tests/test_ehp_readiness_stop.py \
   tests/test_elastic_gradient_idle_path.py \
