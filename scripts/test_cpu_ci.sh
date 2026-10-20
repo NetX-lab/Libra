@@ -10,6 +10,8 @@ python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_restartable_vllm_server.py \
   tests/test_cmlfq_scheduler.py \
   tests/test_cmlfq_cost_scheduler.py \
+  tests/test_cost_model_units.py \
+  tests/test_cmlfq_rebind_state.py \
   tests/test_hetero_cmlfq_integration.py \
   tests/test_rollout_engine.py \
   tests/test_cpu_offload_backend.py \

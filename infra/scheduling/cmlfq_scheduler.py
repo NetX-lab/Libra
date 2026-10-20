@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
@@ -639,6 +640,38 @@ class CMLFQScheduler(BaseScheduler):
             f"active requests={len(self._request_states)}, "
             f"tree statistics={self.prefix_tree.get_stats()}"
         )
+
+    def export_learned_state(self) -> dict:
+        """Carry live evidence and the rebuild window across engine rebinds."""
+        state = super().export_learned_state()
+        state["cmlfq"] = {
+            "prefix_tree": self.prefix_tree.clone(),
+            "recent_trajectories": copy.deepcopy(self._recent_trajectories),
+            "current_epoch": self._current_epoch,
+            "tree_update_count": self._tree_update_count,
+            "migration_count": self._migration_count,
+            "tool_return_count": self._tool_return_count,
+        }
+        return state
+
+    def import_learned_state(self, state: dict) -> None:
+        super().import_learned_state(state)
+        carried = state.get("cmlfq") if isinstance(state, dict) else None
+        if not isinstance(carried, dict):
+            return
+        tree = carried.get("prefix_tree")
+        if isinstance(tree, CausalPrefixTree):
+            # Prefer live state over a possibly older tree loaded from disk.
+            self.prefix_tree = tree.clone()
+        recent = carried.get("recent_trajectories")
+        if isinstance(recent, list):
+            self._recent_trajectories = copy.deepcopy([
+                traj for traj in recent if isinstance(traj, Trajectory)
+            ][-self._max_recent_trajectories:])
+        for key in ("current_epoch", "tree_update_count", "migration_count", "tool_return_count"):
+            value = carried.get(key)
+            if isinstance(value, int):
+                setattr(self, "_" + key, value)
 
     def on_epoch_end(self, epoch: int):
         """On epoch end."""

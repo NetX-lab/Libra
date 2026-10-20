@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -262,6 +263,15 @@ class CausalPrefixTree:
                     else 0
                 ),
             }
+
+    def clone(self) -> "CausalPrefixTree":
+        """Copy live evidence without sharing mutable nodes or rounding means."""
+        other = CausalPrefixTree()
+        with self._lock:
+            other._roots = copy.deepcopy(self._roots)
+            other._global_root = copy.deepcopy(self._global_root)
+            other._total_insertions = self._total_insertions
+        return other
 
     def merge(self, other: "CausalPrefixTree") -> None:
         """Merge another rank's observations into this tree."""
