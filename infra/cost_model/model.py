@@ -29,6 +29,35 @@ class RequestInfo:
         return self.prompt_length + self.gen_length
 
 
+def representative_global_batch(
+    requests: list[RequestInfo], batch_size: int
+) -> list[RequestInfo]:
+    """Use history as a length distribution, not a growing rollout workload.
+
+    Deterministic length quantiles retain the observed endpoints, including the
+    longest sequence used for memory checks. Repeated quantiles are deliberate
+    when the requested global batch is larger than the available history.
+    """
+    if batch_size < 1:
+        raise ValueError("global batch size must be positive")
+    ordered = sorted(
+        requests,
+        key=lambda request: (
+            request.total_length, request.prompt_length, request.gen_length
+        ),
+    )
+    if not ordered:
+        return []
+    if batch_size == 1:
+        return [ordered[-1]]
+    result = [
+        ordered[min(len(ordered) - 1, int((index + 0.5) * len(ordered) / batch_size))]
+        for index in range(batch_size)
+    ]
+    result[0], result[-1] = ordered[0], ordered[-1]
+    return result
+
+
 @dataclass
 class InstanceConfig:
     """Instance config implementation."""

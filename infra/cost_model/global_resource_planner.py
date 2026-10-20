@@ -15,6 +15,7 @@ from RL_Framework.infra.cost_model.model import (
     RequestInfo,
     RolloutClusterConfig,
     TrainParallelConfig,
+    representative_global_batch,
 )
 from RL_Framework.infra.cost_model.optimizer import (
     OptimizationResult,
@@ -564,7 +565,8 @@ class GlobalResourcePlanner:
                 )
             )
 
-        current = self._build_current_plan(config, self._history)
+        workload = representative_global_batch(self._history, int(config.batch_size))
+        current = self._build_current_plan(config, workload)
         forced_rollout_tp = self._forced_rollout_tp_list(config)
         forced_train = self._forced_train_config(
             config,
@@ -578,7 +580,7 @@ class GlobalResourcePlanner:
         forced_candidate = forced_rollout_tp is not None or forced_train is not None
         result = self.optimizer.optimize(
             n_total_gpus=self.n_total_gpus,
-            requests=list(self._history),
+            requests=workload,
             B_global=config.batch_size,
             allowed_train_tp=self.allowed_train_tp,
             allowed_train_ep=self.allowed_train_ep,
@@ -619,12 +621,12 @@ class GlobalResourcePlanner:
             forced_rollout = RolloutClusterConfig(tp_list=forced_rollout_tp)
             forced_rollout_time, forced_rollout_details = self.evaluator.evaluate_rollout(
                 forced_rollout,
-                list(self._history),
+                workload,
             )
             forced_train_time = current.t_train
             forced_train_details = current.metadata.get("training", {})
             if forced_train is not None:
-                sequence_lengths = [r.total_length for r in self._history] or [1024]
+                sequence_lengths = [r.total_length for r in workload] or [1024]
                 forced_train_time, forced_train_details = self.evaluator.evaluate_training(
                     forced_train,
                     config.batch_size,
@@ -649,7 +651,7 @@ class GlobalResourcePlanner:
                 },
             )
         elif forced_train is not None:
-            sequence_lengths = [r.total_length for r in self._history] or [1024]
+            sequence_lengths = [r.total_length for r in workload] or [1024]
             forced_train_time, forced_train_details = self.evaluator.evaluate_training(
                 forced_train,
                 config.batch_size,
@@ -669,6 +671,12 @@ class GlobalResourcePlanner:
                 },
             )
 
+        candidate.metadata["workload"] = {
+            "global_batch_size": int(config.batch_size),
+            "history_size": len(self._history),
+            "representative_requests": len(workload),
+            "selection": "deterministic_length_quantiles",
+        }
         raw_gain = current.t_global - candidate.t_global
         net_gain = raw_gain - self.reconfiguration_cost_s
         gain_ratio = raw_gain / max(current.t_global, 1e-6)
@@ -1142,6 +1150,7 @@ class GlobalResourcePlanner:
         config: AsyncRLConfig,
         requests: list[RequestInfo],
     ) -> GlobalResourcePlan:
+        requests = representative_global_batch(requests, int(config.batch_size))
         train = TrainParallelConfig(
             tp=config.train_tp_size,
             ep=max(1, int(getattr(config, "train_ep_size", 1) or 1)),
