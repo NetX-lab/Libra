@@ -16,6 +16,7 @@ from .model import (
     RequestInfo,
     RolloutClusterConfig,
     TrainParallelConfig,
+    representative_global_batch,
 )
 
 logger = logging.getLogger(__name__)
@@ -614,6 +615,7 @@ class TwoLevelNestedOptimizer:
         dp_batch_group_size: int = 1,
     ) -> OptimizationResult:
         start_time = time.perf_counter()
+        requests = representative_global_batch(requests, B_global)
         lengths = [request.total_length for request in requests] or [1024]
         result = OptimizationResult()
         granularity = max(1, int(allocation_granularity_gpus))
