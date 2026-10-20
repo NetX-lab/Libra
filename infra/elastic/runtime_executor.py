@@ -820,8 +820,30 @@ class RuntimeElasticExecutor:
 
         if delta > 0:
             if self._hybrid_worker_launch_enabled:
-                self._capture_core_snapshot()
-            groups = self._candidate_replica_groups(candidates, replica_size)
+                # Only confirmed loans/cluster swaps transfer physical GPU
+                # ownership. A failed loan must not fall back to live rollout
+                # slots or start a snapshot/join with an empty allocation.
+                by_host: dict[str, list[str]] = {}
+                physical = set()
+                for worker_id in candidates:
+                    slot = self._cluster_swap_training_slot(worker_id)
+                    gpus = slot.get("gpus", [])
+                    if len(gpus) != 1:
+                        continue
+                    host = str(slot.get("host", ""))
+                    address = (host, int(gpus[0]))
+                    if address in physical:
+                        continue
+                    physical.add(address)
+                    by_host.setdefault(host, []).append(worker_id)
+                groups = [
+                    group for workers in by_host.values()
+                    for group in self._candidate_replica_groups(workers, replica_size)
+                ]
+                if groups:
+                    self._capture_core_snapshot()
+            else:
+                groups = self._candidate_replica_groups(candidates, replica_size)
             for offset, (replica_id, members) in enumerate(groups[:delta]):
                 target_core = core_ids[(active_replicas + offset) % len(core_ids)]
                 member_ranks = {worker_id: rank for rank, worker_id in enumerate(members)}

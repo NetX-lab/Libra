@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from RL_Framework.infra.elastic.rollout_lending import lend_rollout, return_rollout, wait_hybrid_stopped
+from RL_Framework.infra.elastic.rollout_lending import _choose_engines, lend_rollout, return_rollout, wait_hybrid_stopped
 from RL_Framework.infra.elastic.runtime_executor import ManagedRolloutProcess
 from RL_Framework.scripts.elastic_hybrid_controller import Controller, _remote_stop_code
 
@@ -76,6 +76,77 @@ def test_rejected_candidate_is_never_used_to_select_lending_gpu(tmp_path):
     executor.rejected_plan = SimpleNamespace(rollout_tp_list=[4], gpus=[99])
     slots = lend_rollout(executor, 4)
     assert {gpu for slot in slots.values() for gpu in slot["gpus"]} == {0, 1, 2, 3}
+
+
+def test_tp2_loan_does_not_stop_a_tp4_engine_through_rollout_reserve(tmp_path):
+    executor, events, _, handles = executor_fixture(tmp_path)
+    executor.config.train_tp_size = 2
+    executor.config.global_resource_planner.elastic_hybrid_min_rollout_gpus = 2
+    meta = ManagedRolloutProcess('whole-pool', 'vllm', 10, [0, 1, 2, 3], 8000,
+                                 host='rollout-host', tp=4)
+    executor._process_meta = {meta.instance_id: meta}
+
+    assert lend_rollout(executor, 2) == {}
+    assert events == []
+    assert executor._process_meta == {meta.instance_id: meta}
+    assert all(handle.is_ready for handle in handles)
+    assert not getattr(executor, '_lent_rollout', None)
+
+
+def test_tp2_loan_leaves_the_other_tp2_engine_running(tmp_path):
+    executor, events, original, handles = executor_fixture(tmp_path)
+    executor.config.train_tp_size = 2
+    executor.config.global_resource_planner.elastic_hybrid_min_rollout_gpus = 2
+
+    def stop(instance_id):
+        assert not handles[0].is_ready and handles[1].is_ready
+        events.append(f'stop-{instance_id}')
+        return [executor._process_meta.pop(instance_id)]
+
+    executor._stop_rollout_process = stop
+    slots = lend_rollout(executor, 2)
+    assert {gpu for slot in slots.values() for gpu in slot['gpus']} == {0, 1}
+    assert list(executor._process_meta) == [original[1].instance_id]
+    assert handles[1].is_ready
+    assert events[-1] == 'stop-engine0'
+    assert not executor.dispatcher.paused
+
+
+@pytest.mark.parametrize('tp_list,train_tp,required,reserve,expected', [
+    ([4], 2, 2, 0, 4),
+    ([1, 1, 1, 1], 2, 2, 2, 2),
+    ([2, 1, 1], 2, 2, 2, 2),
+    ([1, 1, 1, 1], 1, 1, 2, 1),
+])
+def test_engine_selection_honors_reserve_for_complete_physical_engines(
+    tmp_path, tp_list, train_tp, required, reserve, expected,
+):
+    executor, _, _, _ = executor_fixture(tmp_path)
+    executor.config.train_tp_size = train_tp
+    executor.config.global_resource_planner.elastic_hybrid_min_rollout_gpus = reserve
+    offset, metas = 0, []
+    for index, tp in enumerate(tp_list):
+        metas.append(ManagedRolloutProcess(f'engine{index}', 'vllm', index + 10,
+            list(range(offset, offset + tp)), 8000 + index, host='rollout-host', tp=tp))
+        offset += tp
+    executor._process_meta = {meta.instance_id: meta for meta in metas}
+    chosen = _choose_engines(executor, required)
+    assert len({(meta.host, gpu) for meta in chosen for gpu in meta.gpus}) == expected
+
+
+def test_reserve_counts_unique_host_gpu_addresses(tmp_path):
+    executor, _, original, _ = executor_fixture(tmp_path)
+    executor.config.train_tp_size = 1
+    executor.config.global_resource_planner.elastic_hybrid_min_rollout_gpus = 3
+    duplicate = ManagedRolloutProcess('alias', 'vllm', 11, [0, 1], 8002,
+                                      host='rollout-host', tp=2)
+    executor._process_meta[duplicate.instance_id] = duplicate
+    assert _choose_engines(executor, 1) == ()
+
+    executor.config.global_resource_planner.elastic_hybrid_min_rollout_gpus = 2
+    original[1].host = 'another-host'
+    original[1].gpus = [0, 1]
+    assert len(_choose_engines(executor, 1)) == 1
 
 
 def test_failed_engine_stop_exposes_no_gpu_slots_and_can_recover(tmp_path):

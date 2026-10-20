@@ -94,6 +94,83 @@ def _decision(cfg: AsyncRLConfig):
     return planner, decision
 
 
+@pytest.mark.parametrize('slots', [
+    {},
+    {'rollout0': {'host': 'a', 'gpus': [0]}},
+    {'rollout0': {'host': 'a', 'gpus': [0]}, 'rollout1': {'host': 'b', 'gpus': [1]}},
+    {'rollout0': {'host': 'a', 'gpus': [0]}, 'rollout1': {'host': 'a', 'gpus': [0]}},
+])
+@pytest.mark.parametrize('existing_replica', [False, True])
+def test_real_hybrid_join_requires_safely_lent_complete_single_host_slots(
+    monkeypatch, slots, existing_replica,
+):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    cfg = _config()
+    cfg.train_gpus, cfg.rollout_gpus = 4, 6
+    cfg.train_tp_size, cfg.train_dp_size = 2, 2
+    cfg.global_resource_planner.hybrid_worker_launch_enabled = True
+    executor = RuntimeElasticExecutor(config=cfg, planner=GlobalResourcePlanner.from_config(cfg))
+    core = {f'dp{i}': SimpleNamespace(role='core_training') for i in range(2)}
+    candidates = {f'rollout{i}': SimpleNamespace(role='hybrid_rollout') for i in range(4)}
+    active = ([SimpleNamespace(worker_id='old0', role='hybrid_training'),
+               SimpleNamespace(worker_id='old1', role='hybrid_training')]
+              if existing_replica else [])
+    active_before = [(worker.worker_id, worker.role) for worker in active]
+    replicas = {'existing': active} if active else {}
+    join = Mock(side_effect=AssertionError('unsafe physical allocation reached join'))
+    executor.elastic_pool = SimpleNamespace(
+        snapshot=lambda: {**core, **candidates}, replica_snapshot=lambda: replicas,
+        join_replica=join,
+    )
+    executor._cluster_swap_training_slots = slots
+    monkeypatch.setattr(executor, '_desired_hybrid_workers', lambda *_: 4 if active else 2)
+    capture = Mock(side_effect=AssertionError('unsafe physical allocation reached capture'))
+    monkeypatch.setattr(executor, '_capture_core_snapshot', capture)
+
+    actions = executor._reconfigure_training_pool(4, None, SimpleNamespace())
+
+    assert actions == ['join_replica_capacity_shortfall:1']
+    capture.assert_not_called()
+    join.assert_not_called()
+    assert [(worker.worker_id, worker.role) for worker in replicas.get('existing', [])] == active_before
+    assert not executor._pending_hybrid_joins
+
+
+def test_real_hybrid_join_groups_confirmed_slots_by_host_before_capture(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    cfg = _config()
+    cfg.train_gpus, cfg.rollout_gpus = 4, 4
+    cfg.train_tp_size, cfg.train_dp_size = 2, 2
+    cfg.global_resource_planner.hybrid_worker_launch_enabled = True
+    executor = RuntimeElasticExecutor(config=cfg, planner=GlobalResourcePlanner.from_config(cfg))
+    core = {f'dp{i}': SimpleNamespace(role='core_training') for i in range(2)}
+    candidates = {f'rollout{i}': SimpleNamespace(role='hybrid_rollout') for i in range(4)}
+    join = Mock(return_value=SimpleNamespace(generation=1))
+    executor.elastic_pool = SimpleNamespace(
+        snapshot=lambda: {**core, **candidates}, replica_snapshot=lambda: {}, join_replica=join,
+        activation_guard=lambda *_: nullcontext(),
+    )
+    executor._cluster_swap_training_slots = {
+        f'rollout{i}': {'host': 'a' if i % 2 == 0 else 'b', 'gpus': [i // 2]}
+        for i in range(4)
+    }
+    monkeypatch.setattr(executor, '_desired_hybrid_workers', lambda *_: 2)
+    capture = Mock()
+    monkeypatch.setattr(executor, '_capture_core_snapshot', capture)
+
+    actions = executor._reconfigure_training_pool(4, None, SimpleNamespace())
+
+    capture.assert_called_once()
+    assert join.call_args.args[1] == ('rollout0', 'rollout2')
+    assert any(action.startswith('join_replica_submitted:') for action in actions)
+    assert not any('shortfall' in action for action in actions)
+
+
 def test_runtime_executor_applies_rollout_reconfiguration():
     cfg = _config()
     planner, decision = _decision(cfg)
@@ -656,6 +733,12 @@ def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path
         planner=planner,
         train_engine=train_engine,
         dispatcher=OrderedDispatcher(events),
+    )
+    # The fake prewarm process does not execute a physical rollout stop. Model
+    # the confirmed loan explicitly instead of relying on an unowned fallback.
+    monkeypatch.setattr(
+        'RL_Framework.infra.elastic.rollout_lending.lend_rollout',
+        lambda *_: {'rollout0': {'host': '', 'gpus': [0]}},
     )
 
     result = executor.execute(decision)

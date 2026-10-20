@@ -24,18 +24,25 @@ def _set_unavailable(executor, instance_ids):
 def _choose_engines(executor, required):
     metas = sorted(executor._process_meta.values(), key=lambda meta: meta.instance_id)
     width = max(1, int(getattr(executor.config, "train_tp_size", 1)))
+    reserve = max(0, int(getattr(
+        executor.config.global_resource_planner, "elastic_hybrid_min_rollout_gpus", 0,
+    ) or 0))
+    all_physical = {(meta.host, int(gpu)) for meta in metas for gpu in meta.gpus}
     # A current launcher starts each full Hybrid replica on one host. Include
-    # only subsets whose hosts each contain whole replicas, without imposing a
-    # minimum remaining rollout pool (a TP4 replica may borrow both TP2 engines).
+    # only subsets whose hosts each contain whole replicas. Stopping a wider
+    # engine lends all its GPUs, even when the Hybrid needs fewer of them.
     candidates = []
     for count in range(1, len(metas) + 1):
         for subset in combinations(metas, count):
             by_host = {}
             for meta in subset:
                 by_host.setdefault(meta.host, set()).update(int(gpu) for gpu in meta.gpus)
+            borrowed = {(host, gpu) for host, gpus in by_host.items() for gpu in gpus}
+            if len(all_physical - borrowed) < reserve:
+                continue
             capacity = sum(len(gpus) // width * width for gpus in by_host.values())
             if capacity >= required:
-                candidates.append((sum(len(gpus) for gpus in by_host.values()), count, subset))
+                candidates.append((len(borrowed), count, subset))
     return min(candidates, key=lambda item: item[:2])[2] if candidates else ()
 
 
