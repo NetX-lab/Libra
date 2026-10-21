@@ -569,7 +569,11 @@ class AsyncRLTrainer:
                     return selected
                 continue
             if self.staleness_manager is not None:
-                self.staleness_manager.on_batch_consumed(len(raw_batch))
+                accepted_count = sum(
+                    isinstance(trajectory, dict) and trajectory.get("status") != "failed"
+                    for trajectory in raw_batch
+                )
+                self.staleness_manager.on_batch_consumed(accepted_count)
             for trajectory in raw_batch:
                 if trajectory.get("status") == "failed":
                     continue
