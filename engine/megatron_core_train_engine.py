@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import copy
+import json
+import uuid
 import threading
 import time
 from pathlib import Path
@@ -259,7 +262,7 @@ class MegatronCoreTrainEngine:
             self.optimizer = get_megatron_optimizer(
                 optimizer_config,
                 self.model,
-                use_gloo_process_groups=False,
+                use_gloo_process_groups=True,
             )
             bound_default_torch_adam_memory(self.optimizer,
                 release_main_gradients=(getattr(self, 'use_distributed_optimizer', False)
@@ -798,7 +801,104 @@ class MegatronCoreTrainEngine:
         ok, _norm, _zeros = self.optimizer.step()
         if not ok:
             raise FloatingPointError("Hybrid Megatron optimizer rejected the update")
-        self.current_version = int(state_version)
+        self.optimizer_revision = int(state_version)
+
+    @staticmethod
+    def _clone_cpu_state(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().to(device="cpu", copy=True)
+        if isinstance(value, dict):
+            return {key: MegatronCoreTrainEngine._clone_cpu_state(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            items = [MegatronCoreTrainEngine._clone_cpu_state(item) for item in value]
+            return tuple(items) if isinstance(value, tuple) else items
+        return copy.deepcopy(value)
+
+    def capture_elastic_state(self):
+        """Clone current parameters, optimizer master parameters and Adam state."""
+        self._synchronize_optimizer_parameters()
+        optimizer = self.optimizer.state_dict()
+        # MCore DistributedOptimizer deliberately omits DP-zero parameter and
+        # Adam shards from state_dict; include its actual DP-zero state too.
+        distributed_state = self._capture_optimizer_parameter_state(self.optimizer)
+        return {
+            "format_version": 1,
+            "snapshot_id": uuid.uuid4().hex,
+            "model": self._clone_cpu_state([chunk.state_dict() for chunk in self.model]),
+            "optimizer": self._clone_cpu_state(optimizer),
+            "distributed_optimizer": self._clone_cpu_state(distributed_state),
+            "has_distributed_optimizer": distributed_state is not None,
+            "optimizer_revision": int(self.optimizer_revision),
+            "version": int(self.current_version),
+            "parallel_state": self.get_parallel_state(),
+        }
+
+    @classmethod
+    def _capture_optimizer_parameter_state(cls, optimizer):
+        chained = getattr(optimizer, "chained_optimizers", None)
+        if chained is not None:
+            return {"kind": "chain", "children": [cls._capture_optimizer_parameter_state(child) for child in chained]}
+        if hasattr(optimizer, "get_parameter_state_dp_zero"):
+            if getattr(optimizer, "data_parallel_group_gloo", None) is None:
+                raise RuntimeError("live EHP optimizer state requires its initialized DP Gloo group")
+            return {"kind": "dp_zero", "state": optimizer.get_parameter_state_dp_zero()}
+        return None
+
+    @classmethod
+    def _restore_optimizer_parameter_state(cls, optimizer, payload):
+        if payload is None:
+            return
+        if payload["kind"] == "chain":
+            children = getattr(optimizer, "chained_optimizers", ())
+            if len(children) != len(payload["children"]):
+                raise ValueError("live EHP optimizer chain count mismatch")
+            for child, state in zip(children, payload["children"]):
+                cls._restore_optimizer_parameter_state(child, state)
+        elif payload["kind"] == "dp_zero":
+            if not hasattr(optimizer, "load_parameter_state_from_dp_zero"):
+                raise RuntimeError("optimizer cannot restore DP-zero Adam/master state")
+            group = getattr(optimizer, "data_parallel_group_gloo", None)
+            if payload["state"] is None and (group is None or group.rank() == 0):
+                raise ValueError("live EHP snapshot lacks the master parameters and Adam state on its receiving DP root")
+            optimizer.load_parameter_state_from_dp_zero(payload["state"])
+        else:
+            raise ValueError("unknown live EHP optimizer parameter state format")
+
+    def _synchronize_optimizer_parameters(self):
+        if self.optimizer is not None and hasattr(self.optimizer, "finish_param_sync"):
+            for index in range(len(self.model)):
+                self.optimizer.finish_param_sync(index)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self._device())
+
+    def restore_elastic_state(self, payload):
+        if payload.get("format_version") != 1 or "optimizer" not in payload:
+            raise ValueError("live EHP snapshot is missing optimizer state")
+        if len(payload["model"]) != len(self.model):
+            raise ValueError("live EHP model chunk count mismatch")
+        for chunk, state in zip(self.model, payload["model"]):
+            chunk.load_state_dict(state, strict=True)
+        from RL_Framework.engine.optimizer_state import optimizer_state_load_context
+        # DP-zero restoration reaches the same MCore 0.14 low-level tensor
+        # setter as model-space restoration. Keep the real step supplied by
+        # common metadata visible while it installs master/Adam tensors.
+        with optimizer_state_load_context(self.optimizer):
+            self.optimizer.load_state_dict(payload["optimizer"])
+            parameter_state = payload.get("distributed_optimizer")
+            if payload.get("has_distributed_optimizer", parameter_state is not None):
+                self._restore_optimizer_parameter_state(self.optimizer, parameter_state)
+        bound_default_torch_adam_memory(self.optimizer,
+            release_main_gradients=(getattr(self, 'use_distributed_optimizer', False)
+                and not getattr(self, 'grad_reduce_in_fp32', False)
+                and not getattr(self, 'optimizer_cpu_offload', False)))
+        self.optimizer_revision = int(payload["optimizer_revision"])
+        self.current_version = int(payload["version"])
+        self._synchronize_optimizer_parameters()
+        receipt = {"acknowledged": True, "snapshot_id": payload["snapshot_id"],
+                   "state_version": self.optimizer_revision,
+                   "optimizer_revision": self.optimizer_revision}
+        self._elastic_state_receipt = receipt
+        return receipt
 
     def capture_elastic_state_snapshot(
         self,
