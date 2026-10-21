@@ -951,7 +951,7 @@ class AsyncRLTrainer:
 
             weight_sync_time = 0.0
             rollout_sync_drain = None
-            if self.config.sync_interval > 0 and step > 0 and step % self.config.sync_interval == 0:
+            if self.config.sync_interval > 0 and (step + 1) % self.config.sync_interval == 0:
                 self._trace_train_phase(step, "weight_sync_start")
                 if self.dispatcher is not None:
                     drain_started = time.time()
@@ -1115,7 +1115,7 @@ class AsyncRLTrainer:
         if interval <= 0 or lead_steps <= 0:
             return None
         remainder = step % interval
-        steps_until_sync = 0 if step > 0 and remainder == 0 else interval - remainder
+        steps_until_sync = interval - remainder
         if steps_until_sync > lead_steps:
             return None
         prefetch_batches = max(1, steps_until_sync)
