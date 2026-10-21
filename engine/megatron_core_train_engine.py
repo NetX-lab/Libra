@@ -17,6 +17,7 @@ from transformers import AutoTokenizer
 from RL_Framework.engine.megatron_core_checkpointing import (
     MegatronDistributedCheckpointManager,
 )
+from RL_Framework.engine.optimizer_memory import bound_default_torch_adam_memory
 from RL_Framework.engine.device_utils import set_device
 from RL_Framework.infra.elastic import (
     GradientPayload,
@@ -260,6 +261,10 @@ class MegatronCoreTrainEngine:
                 self.model,
                 use_gloo_process_groups=False,
             )
+            bound_default_torch_adam_memory(self.optimizer,
+                release_main_gradients=(getattr(self, 'use_distributed_optimizer', False)
+                    and not getattr(self, 'grad_reduce_in_fp32', False)
+                    and not getattr(self, 'optimizer_cpu_offload', False)))
             if self.is_main_process:
                 print("MCORE_INIT_PHASE optimizer_build_complete", flush=True)
         if self.is_main_process:
@@ -575,6 +580,10 @@ class MegatronCoreTrainEngine:
             optimizer=self.optimizer,
             version=version,
         )
+        bound_default_torch_adam_memory(self.optimizer,
+            release_main_gradients=(getattr(self, 'use_distributed_optimizer', False)
+                and not getattr(self, 'grad_reduce_in_fp32', False)
+                and not getattr(self, 'optimizer_cpu_offload', False)))
         self.current_version = version
 
     def get_parallel_state(self) -> dict[str, Any]:
