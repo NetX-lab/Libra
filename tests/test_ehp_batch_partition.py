@@ -122,7 +122,7 @@ def test_actual_train_collects_fixed_batch_and_dispatches_complete_groups(tmp_pa
         assert sum(len(task["trajectories"]) for task in tasks) + expected == 16
         assert all(task["global_sample_count"] == 16 for task in tasks)
         assert all(task["sample_count"] == len(task["trajectories"]) for task in tasks)
-        assert all(task["state_version"] == 0 for task in tasks)
+        assert all(task["state_version"] == step for task in tasks)
         all_groups = trainer.train_engine.updated[step] + [x["grpo_group_id"] for task in tasks for x in task["trajectories"]]
         assert len(all_groups) == 16
         assert len(set(all_groups)) == 4
@@ -208,3 +208,17 @@ def test_rebind_preserves_admitted_results_and_incomplete_group_members(tmp_path
     trainer._reset_rollout_pipeline_after_reconfigure()
     assert trainer._pending_grpo_groups is pending
     assert len(pending["group"]) == 3
+
+
+def test_dispatch_rejects_membership_generation_change_before_update(tmp_path):
+    trainer = make_trainer(tmp_path, hybrids=["hybrid0"])
+    trainer.train_engine.elastic_gradient_domain = SimpleNamespace(
+        membership_state=lambda: {"membership_epochs": {"hybrid0": 7}})
+    (tmp_path / "membership").mkdir()
+    (tmp_path / "membership" / "hybrid0.json").write_text(json.dumps(
+        dict(run_id="fixed-b-test", role="hybrid_training", membership_epoch=8)))
+    trainer._collect_complete_grpo_batch = lambda generator, count: trajectories("batch", count)
+    with pytest.raises(RuntimeError, match="generation changed"):
+        trainer.train(None, dataset=[1])
+    assert not trainer.train_engine.updated
+    assert not (tmp_path / "hybrid0.step_0.pt").exists()

@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from RL_Framework.config import AsyncRLConfig
 from RL_Framework.engine.megatron_core_train_engine import MegatronCoreTrainEngine
@@ -28,6 +29,7 @@ from RL_Framework.trainer.async_rl_trainer import AsyncRLTrainer
 class NoReconfigurationDecision:
     should_reconfigure = False
     candidate_plan = None
+    current_plan = None
     reason = "same_plan"
     num_requests = 1
 
@@ -133,12 +135,22 @@ def test_release_only_post_is_visible_at_next_pre_before_gradient_freeze(tmp_pat
     engine._hybrid_gradient_condition = threading.Condition()
     engine._elastic_active_gradient_timeout_s = 0.0
     engine._elastic_step_hybrid_workers = ()
+    engine.optimizer_revision = 0
+    engine.current_version = 0
+    engine._elastic_seen_payloads = set()
+    engine._elastic_batch_partition = None
+    engine._elastic_gradient_update_callback = None
+    engine._model_main_gradients = lambda: [torch.zeros(1)]
     follower.train_engine = engine
     follower._elastic_membership_run_id = "membership-run"
     follower._elastic_membership_epochs = {}
 
     try:
-        pool.join_replica("replica0", ["rollout0"], "dp0").result(timeout=2)
+        pool.join_replica(
+            "replica0", ["rollout0"], "dp0",
+            replica_activation_barrier=lambda *args: {"acknowledged": True, "state_version": 0,
+                                                      "optimizer_revision": 0},
+        ).result(timeout=2)
         executor.hybrid_runtime_state()
         assert follower._prepare_elastic_training_step(0) == ["replica0"]
         membership_path = tmp_path / "tasks/membership/replica0.json"
@@ -204,15 +216,18 @@ def test_final_boundary_waits_for_leader_close_before_follower_teardown(tmp_path
     assert follower._elastic_gradient_server is None
 
 
-def test_cleanup_releases_cached_rollout_weight_communicators(tmp_path):
+def test_cleanup_releases_cached_rollout_weight_communicators(tmp_path, monkeypatch):
     """Catch interpreter-shutdown aborts from lingering TCPStore owners."""
     leader, _follower = make_cleanup_trainers(tmp_path)
     cache_key = ("127.0.0.1", 29620, 2, 0, "cuda:0")
-    nccl_weight_sync._COMMUNICATOR_CACHE[cache_key] = object()
+    communicator = SimpleNamespace(comm=None, disabled=False, available=True, group=object())
+    monkeypatch.setitem(nccl_weight_sync._COMMUNICATOR_CACHE, cache_key, communicator)
 
     leader._cleanup()
 
     assert nccl_weight_sync._COMMUNICATOR_CACHE == {}
+    assert communicator.disabled and not communicator.available
+    assert communicator.group is None
 
 
 def test_final_draining_transaction_reaches_terminal_then_done(tmp_path):

@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from RL_Framework.config import AsyncRLConfig
 from RL_Framework.engine.megatron_core_train_engine import MegatronCoreTrainEngine
@@ -51,8 +52,14 @@ def make_harness(tmp_path):
         engine.get_data_parallel_rank = lambda: 0
         engine._pending_hybrid_gradients = []
         engine._hybrid_gradient_condition = threading.Condition()
-        engine._elastic_active_gradient_timeout_s = 0.0
+        engine._elastic_active_gradient_timeout_s = 0.05
         engine._elastic_step_hybrid_workers = ()
+        engine.optimizer_revision = 0
+        engine.current_version = 0
+        engine._elastic_seen_payloads = set()
+        engine._elastic_batch_partition = None
+        engine._elastic_gradient_update_callback = None
+        engine._model_main_gradients = lambda: [torch.zeros(1)]
         peer = object.__new__(AsyncRLTrainer)
         peer.config = config
         peer.train_engine = engine
@@ -69,8 +76,14 @@ def make_harness(tmp_path):
         pool.close()
 
 
+def _installed(*args):
+    # No real model/worker in these membership-ordering tests. Simulate the
+    # successful installation receipt; the readiness suite verifies real files.
+    return {"acknowledged": True, "state_version": 0, "optimizer_revision": 0}
+
+
 def activate(harness, replica="replica0", worker="rollout0"):
-    harness.pool.join_replica(replica, [worker], "dp0").result(timeout=3)
+    harness.pool.join_replica(replica, [worker], "dp0", replica_activation_barrier=_installed).result(timeout=3)
     harness.executor.hybrid_runtime_state()
     harness.peer._prepare_elastic_training_step(0)
 
@@ -172,9 +185,9 @@ def test_m5_cancelled_join_cannot_republish_active_membership(make_harness, repl
         exit_record = record(h, worker)
         if rejoin:
             if replica:
-                newer = h.pool.join_replica(worker, ["rollout0"], "dp0")
+                newer = h.pool.join_replica(worker, ["rollout0"], "dp0", replica_activation_barrier=_installed)
             else:
-                newer = h.pool.join_training(worker, "dp0")
+                newer = h.pool.join_training(worker, "dp0", activation_barrier=_installed)
             newer.result(timeout=3)
             h.executor.hybrid_runtime_state()
             expected_record = record(h, worker)
@@ -210,9 +223,9 @@ def test_activation_and_release_commit_membership_and_role_atomically(make_harne
     monkeypatch.setattr(h.pool.gradient_domain, "mark_active", pause_after_domain_activation)
     worker = "replica0" if replica else "rollout0"
     if replica:
-        handle = h.pool.join_replica(worker, ["rollout0"], "dp0")
+        handle = h.pool.join_replica(worker, ["rollout0"], "dp0", replica_activation_barrier=_installed)
     else:
-        handle = h.pool.join_training(worker, "dp0")
+        handle = h.pool.join_training(worker, "dp0", activation_barrier=_installed)
     h.executor._pending_hybrid_joins[worker] = handle
     h.executor._pending_hybrid_join_started_at[worker] = time.time()
     with ThreadPoolExecutor(max_workers=1) as workers:

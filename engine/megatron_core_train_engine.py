@@ -109,6 +109,10 @@ class MegatronCoreTrainEngine:
         self.is_main_process = self.rank == 0
         self.current_version = 0
         self.optimizer_revision = 0
+        self._elastic_state_server = None
+        self._elastic_snapshot_urls = {}
+        self._elastic_expected_state_version = 0
+        self._elastic_seen_payloads = set()
         self._elastic_batch_partition = None
 
         self.bridge = None
@@ -544,12 +548,15 @@ class MegatronCoreTrainEngine:
                 local_stats.append(stats)
 
             finalize_model_grads(self.model)
-            self._apply_elastic_inter_replica_gradients()
+            hybrid_stats = self._apply_elastic_inter_replica_gradients()
             update_successful, grad_norm, _ = self.optimizer.step()
             if not update_successful:
                 raise FloatingPointError("Megatron optimizer rejected the update")
             self.optimizer_revision += 1
-            merged = self._merge_stats(local_stats)
+            merged = self._merge_stats(local_stats + (hybrid_stats or []))
+            # Hybrid contributes samples, not extra Core optimizer updates or
+            # additional weight in the existing DP gradient-norm statistic.
+            merged["n_updates"] = sum(float(item.get("n_updates", 1.0)) for item in local_stats)
             if isinstance(grad_norm, torch.Tensor):
                 merged["grad_norm"] = float(grad_norm.detach().item())
             else:
@@ -740,6 +747,10 @@ class MegatronCoreTrainEngine:
         )
 
     def close_elastic_communication_domain(self) -> None:
+        if self._elastic_state_server is not None:
+            self._elastic_state_server.close()
+            self._elastic_state_server = None
+            self._elastic_snapshot_urls.clear()
         group = self._elastic_gradient_process_group
         self._elastic_gradient_process_group = None
         self._elastic_gradient_group_ranks = ()
@@ -754,14 +765,45 @@ class MegatronCoreTrainEngine:
         return self._elastic_gradient_process_group
 
     def enqueue_hybrid_gradient_payload(self, payload: GradientPayload) -> None:
+        domain = self.elastic_gradient_domain
+        if domain is None:
+            raise RuntimeError("hybrid gradient arrived without an elastic domain")
+        membership = domain.membership_state()
+        epochs = membership["membership_epochs"]
+        if payload.step != self._elastic_training_step:
+            raise ValueError("hybrid gradient training step does not match")
+        if payload.state_version != self._elastic_expected_state_version:
+            raise ValueError("hybrid gradient optimizer revision does not match")
+        if payload.membership_epoch != epochs.get(payload.replica_id):
+            raise ValueError("hybrid gradient membership epoch does not match")
+        if payload.replica_id not in self._elastic_step_hybrid_workers:
+            raise ValueError("unexpected hybrid gradient replica")
+        if payload.zero_placeholder:
+            raise ValueError("active hybrid replicas cannot replace assigned data with placeholders")
+        if payload.replica_rank != domain.local_replica_rank or payload.replica_world_size != domain.replica_world_size:
+            raise ValueError("hybrid gradient model lane does not match")
+        partition = self._elastic_batch_partition
+        if partition is not None:
+            _, total, counts = partition
+            if payload.sample_count != counts.get(payload.replica_id) or payload.global_sample_count != total:
+                raise ValueError("hybrid gradient sample count does not match partition")
+        identity = (payload.replica_id, payload.replica_rank, payload.step,
+                    payload.state_version, payload.membership_epoch)
         with self._hybrid_gradient_condition:
+            if identity in self._elastic_seen_payloads:
+                raise ValueError("duplicate hybrid gradient payload")
+            self._elastic_seen_payloads.add(identity)
             self._pending_hybrid_gradients.append(payload)
             self._hybrid_gradient_condition.notify_all()
 
-    def set_elastic_training_step(self, step: int, active_hybrid_workers=None) -> None:
+    def set_elastic_training_step(self, step: int, active_hybrid_workers=None, *, state_version=None) -> None:
         self._elastic_training_step = int(step)
+        self._elastic_expected_state_version = int(
+            self.optimizer_revision if state_version is None else state_version
+        )
         if active_hybrid_workers is not None:
             self._elastic_step_hybrid_workers = tuple(str(w) for w in active_hybrid_workers)
+        self._elastic_seen_payloads = {key for key in self._elastic_seen_payloads if key[2] >= step - 1}
 
     def set_elastic_batch_partition(self, local_sample_count, global_sample_count, hybrid_sample_counts):
         if local_sample_count < 0 or global_sample_count <= 0 or local_sample_count > global_sample_count:
@@ -801,6 +843,8 @@ class MegatronCoreTrainEngine:
         global_sample_count: int = 0,
     ) -> GradientPayload:
         from megatron.core.distributed import finalize_model_grads
+        if int(state_version) != self.optimizer_revision:
+            raise ValueError("hybrid task optimizer revision does not match installed state")
         micro_batches = list(self._iter_micro_batches(trajectories))
         self._zero_grad()
         self._set_train_mode(True)
@@ -840,7 +884,7 @@ class MegatronCoreTrainEngine:
             raise FloatingPointError("Hybrid Megatron optimizer rejected the update")
         if cache_released:
             self._hybrid_optimizer_cuda_cache_released = True
-        self.current_version = int(state_version)
+        self.optimizer_revision = int(state_version)
 
     @staticmethod
     def _clone_cpu_state(value):
@@ -939,50 +983,55 @@ class MegatronCoreTrainEngine:
         self._elastic_state_receipt = receipt
         return receipt
 
-    def capture_elastic_state_snapshot(
-        self,
-        worker_id: str,
-        target_core_id: str,
-    ) -> int:
-        """Write metadata for the latest collective distributed checkpoint."""
+    def capture_elastic_state_snapshot(self, worker_id, target_core_id):
         del worker_id, target_core_id
-        snapshot_path = Path(
-            self.get_elastic_state_snapshot_path(self.current_version)
-        )
-        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path = (
-            self.checkpoints.sync_path
-            / f"v{self.current_version}"
-            / "megatron_checkpoint_manifest.json"
-        )
-        torch.save(
-            {
-                "backend": self.train_backend,
-                "version": self.current_version,
-                "manifest_path": str(manifest_path),
-                "parallel_state": self.get_parallel_state(),
-            },
-            snapshot_path,
-        )
-        return self.current_version
+        from RL_Framework.infra.elastic.state_transfer import LiveStateServer
+        if self._elastic_state_server is None:
+            self._elastic_state_server = LiveStateServer()
+        revision = int(self.optimizer_revision)
+        signature = tuple(sorted((key, repr(value)) for key, value in self.get_parallel_state().items()))
+        if getattr(self, "_elastic_snapshot_topology", signature) != signature:
+            for previous in list(self._elastic_snapshot_urls):
+                self.release_elastic_state_snapshot(previous)
+        self._elastic_snapshot_topology = signature
+        if revision not in self._elastic_snapshot_urls:
+            self._elastic_snapshot_urls[revision] = self._elastic_state_server.publish(self.capture_elastic_state())
+        return revision
 
-    def get_elastic_state_snapshot_path(self, version: int) -> str:
-        state_dir = Path(
-            os.getenv(
-                "ELASTIC_TRAINING_STATE_DIR",
-                "./logs/elastic_training_state",
-            )
-        )
-        return str(state_dir / f"v{version}" / f"rank_{self.rank}.pt")
+    def get_elastic_state_snapshot_path(self, version):
+        try:
+            return self._elastic_snapshot_urls[int(version)]
+        except KeyError as exc:
+            raise RuntimeError(f"live EHP state revision {version} has not been captured") from exc
 
-    def load_elastic_state_snapshot(self, snapshot_path: str) -> None:
-        payload = torch.load(
-            snapshot_path,
-            map_location="cpu",
-            weights_only=False,
-        )
-        version = int(payload["version"])
-        self.load_weights(str(self.checkpoints.sync_path), version)
+    def release_elastic_state_snapshot(self, version):
+        uri = self._elastic_snapshot_urls.pop(int(version), None)
+        if uri is not None:
+            self._elastic_state_server.release(uri)
+
+
+    def load_elastic_state_snapshot(self, snapshot_path, *, target_core_id=None, replica_rank=None):
+        from RL_Framework.infra.elastic.state_transfer import receive_live_state
+        uri = snapshot_path
+        manifest = None
+        if not str(snapshot_path).startswith("ehp://"):
+            manifest = json.loads(Path(snapshot_path).read_text(encoding="utf-8"))
+            if manifest.get("format") != "libra-ehp-lanes-v1":
+                raise ValueError("invalid live EHP lane manifest")
+            if target_core_id is None:
+                raise ValueError("target core identity is required for a live EHP lane manifest")
+            lane = int(os.environ.get("RANK", "0")) if replica_rank is None else int(replica_rank)
+            uri = manifest["lanes"][str(target_core_id)][str(lane)]
+        payload = receive_live_state(uri)
+        if manifest is not None and int(payload["optimizer_revision"]) != int(manifest["optimizer_revision"]):
+            raise ValueError("live EHP manifest revision does not match transferred state")
+        receipt = self.restore_elastic_state(payload)
+        if manifest is not None:
+            receipt["lane_snapshot_id"] = receipt["snapshot_id"]
+            receipt["snapshot_id"] = manifest["snapshot_id"]
+            receipt["target_core_id"] = str(target_core_id)
+            receipt["source_uri"] = str(uri)
+        return receipt
 
     def _iter_micro_batches(self, trajectories: list[dict[str, Any]]):
         for start in range(0, len(trajectories), self.micro_batch_size):
@@ -1252,15 +1301,15 @@ class MegatronCoreTrainEngine:
                     dist.all_gather_into_tensor(flat, local, group=group)
 
 
-    def _apply_elastic_inter_replica_gradients(self) -> None:
+    def _apply_elastic_inter_replica_gradients(self) -> list[dict[str, float]]:
         pending = getattr(self, "_pending_hybrid_gradients", [])
         expected = set(getattr(self, "_elastic_step_hybrid_workers", ()))
         if self.elastic_gradient_domain is None and not pending and not expected:
-            return
+            return []
         if self.elastic_gradient_domain is None:
             with self._hybrid_gradient_condition:
                 self._pending_hybrid_gradients.clear()
-            return
+            return []
         deadline = (time.monotonic() + self._elastic_active_gradient_timeout_s
                     if self._elastic_active_gradient_timeout_s > 0 else None)
         with self._hybrid_gradient_condition:
@@ -1268,7 +1317,8 @@ class MegatronCoreTrainEngine:
                 present = {
                     p.replica_id for p in self._pending_hybrid_gradients
                     if p.replica_id in expected
-                    and (p.step < 0 or p.step == self._elastic_training_step)
+                    and p.step == self._elastic_training_step
+                    and p.state_version == self._elastic_expected_state_version
                 }
                 missing = expected - present
                 if not missing:
@@ -1286,7 +1336,7 @@ class MegatronCoreTrainEngine:
         if not params_and_grads:
             with self._hybrid_gradient_condition:
                 self._pending_hybrid_gradients.clear()
-            return
+            return []
 
         core_id = f"dp{self.get_data_parallel_rank()}"
         partition = self._elastic_batch_partition
@@ -1299,12 +1349,22 @@ class MegatronCoreTrainEngine:
         if weighted and world > 1:
             for grad in local:
                 grad.div_(world)
+        consumed_before = set(self.elastic_gradient_domain._consumed_payloads)
         reduced = self.elastic_gradient_domain.reduce_core_gradients(
             core_gradients={core_id: local}, hybrid_payloads=pending,
             core_sample_counts={core_id: partition[1]} if weighted else None,
             global_sample_count=partition[1] if weighted else 0,
+            step=self._elastic_training_step,
+            state_version=self._elastic_expected_state_version,
             in_place=True,
         )
+        # The reducer owns acceptance and lane routing. Only identities newly
+        # consumed by this successful reduction may contribute sample metrics.
+        consumed = self.elastic_gradient_domain._consumed_payloads - consumed_before
+        hybrid_stats = [payload.stats for payload in pending
+                        if (payload.replica_id, payload.replica_rank, payload.step,
+                            payload.state_version, payload.membership_epoch) in consumed
+                        and payload.stats]
         for (_, grad), reduced_grad in zip(
             params_and_grads,
             reduced[core_id],
@@ -1330,12 +1390,13 @@ class MegatronCoreTrainEngine:
                             replica_id=payload.replica_id,
                             tensors=update_tensors,
                             step=payload.step,
-                            state_version=self.current_version,
+                            state_version=self._elastic_expected_state_version + 1,
                             membership_epoch=payload.membership_epoch,
                         )
                     )
         with self._hybrid_gradient_condition:
             self._pending_hybrid_gradients.clear()
+        return hybrid_stats
 
     @staticmethod
     def _parallel_state():

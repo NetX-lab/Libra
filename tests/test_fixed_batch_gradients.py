@@ -267,3 +267,46 @@ def test_full_engine_gloo_prescale_finalize_elastic_sum_matches_full_batch_with_
                 if process.is_alive():
                     process.terminate()
                     process.join()
+
+
+@pytest.mark.parametrize('change,message', [
+    ({'step': -1}, 'step'), ({'state_version': -1}, 'revision'),
+    ({'membership_epoch': 6}, 'epoch'), ({'global_sample_count': 16}, 'batch size'),
+    ({'zero_placeholder': True}, 'placeholder'),
+])
+def test_rejects_stale_or_incomplete_gradient_identity(change, message):
+    with pytest.raises(ValueError, match=message):
+        _domain().reduce_core_gradients(
+            core_gradients={'dp0': (torch.ones(1),), 'dp1': (torch.ones(1),)},
+            core_sample_counts={'dp0': 4, 'dp1': 2}, global_sample_count=8,
+            hybrid_payloads=[_payload(**change)], step=3, state_version=2,
+        )
+
+
+
+def test_rejects_duplicate_payload_before_double_counting():
+    domain = _domain()
+    kwargs = dict(core_gradients={'dp0': (torch.ones(1),), 'dp1': (torch.ones(1),)},
+                  hybrid_payloads=[_payload(), _payload()], step=3, state_version=2)
+    with pytest.raises(ValueError, match='duplicate'):
+        domain.reduce_core_gradients(**kwargs)
+
+
+
+def test_engine_ingress_rejects_unknown_revision_and_duplicate_without_waking_waiters():
+    engine = MegatronCoreTrainEngine.__new__(MegatronCoreTrainEngine)
+    engine.elastic_gradient_domain = _domain()
+    engine.optimizer_revision = 2
+    engine._elastic_seen_payloads = set()
+    engine._pending_hybrid_gradients = []
+    engine._hybrid_gradient_condition = threading.Condition()
+    engine.set_elastic_training_step(3, ['hybrid'])
+    engine.set_elastic_batch_partition(4, 8, {'hybrid': 2})
+    for bad in (_payload(state_version=-1), _payload(step=-1), _payload(membership_epoch=6)):
+        with pytest.raises(ValueError):
+            engine.enqueue_hybrid_gradient_payload(bad)
+    assert not engine._pending_hybrid_gradients
+    engine.enqueue_hybrid_gradient_payload(_payload())
+    with pytest.raises(ValueError, match='duplicate'):
+        engine.enqueue_hybrid_gradient_payload(_payload())
+    assert len(engine._pending_hybrid_gradients) == 1

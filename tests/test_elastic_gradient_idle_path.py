@@ -38,7 +38,7 @@ def test_mcore_dp1_reuses_main_gradient_for_weighted_hybrid_update():
     engine._hybrid_gradient_condition = threading.Condition()
     engine._elastic_batch_partition = (2, 4, {'hybrid': 2})
     engine._elastic_training_step = 3
-    engine.current_version = 2
+    engine._elastic_expected_state_version = 2
     # This is the already weighted, finalized Core contribution. Passing it
     # through an out-of-place divide-by-one would waste a full model buffer.
     grad = torch.full((73,), 3.)
@@ -59,7 +59,7 @@ def test_mcore_dp1_reuses_main_gradient_for_weighted_hybrid_update():
     assert not engine._pending_hybrid_gradients
     assert len(acknowledgements) == 1
     assert acknowledgements[0].tensors[0].data_ptr() != grad.data_ptr()
-    assert acknowledgements[0].state_version == 2
+    assert acknowledgements[0].state_version == 3
     grad.zero_()
     assert torch.equal(acknowledgements[0].tensors[0], torch.full((73,), 6.5))
 
