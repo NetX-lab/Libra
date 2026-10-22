@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from types import SimpleNamespace
 
 import pytest
@@ -236,7 +237,7 @@ def test_activation_and_release_commit_membership_and_role_atomically(make_harne
             # worker-role update. With the old gap it completed in this window.
             try:
                 releasing.result(timeout=0.1)
-            except TimeoutError:
+            except FutureTimeout:
                 pass
         finally:
             resume.set()

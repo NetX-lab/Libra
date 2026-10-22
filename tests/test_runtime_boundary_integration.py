@@ -3,6 +3,7 @@
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from types import SimpleNamespace
 
 import pytest
@@ -206,7 +207,7 @@ def test_final_boundary_waits_for_leader_close_before_follower_teardown(tmp_path
 
     with ThreadPoolExecutor(max_workers=1) as threads:
         waiting = threads.submit(follower._cleanup)
-        with pytest.raises(TimeoutError):
+        with pytest.raises(FutureTimeout):
             waiting.result(timeout=0.05)
         leader._cleanup()
         waiting.result(timeout=2)
@@ -268,7 +269,7 @@ def test_final_draining_transaction_reaches_terminal_then_done(tmp_path):
         following.result(timeout=2)
 
         waiting = threads.submit(follower._cleanup)
-        with pytest.raises(TimeoutError):
+        with pytest.raises(FutureTimeout):
             waiting.result(timeout=0.05)
         leader._cleanup()
         waiting.result(timeout=2)

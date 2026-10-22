@@ -3,6 +3,7 @@
 import json
 import threading
 from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from types import SimpleNamespace
 
 import pytest
@@ -166,7 +167,7 @@ def test_s3_popen_to_registration_is_atomic_with_close(harness, monkeypatch):
             assert created.wait(3)
             finished = runner.submit(close)
             assert closing.wait(3)
-            with pytest.raises(TimeoutError):
+            with pytest.raises(FutureTimeout):
                 finished.result(timeout=0.05)
         finally:
             resume.set()
