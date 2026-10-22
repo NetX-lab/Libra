@@ -85,7 +85,7 @@ def test_positive_drain_timeout_reopens_before_any_mutation():
     async def run():
         state = ServingState(1)
         await state.enter()
-        with pytest.raises(TimeoutError):
+        with pytest.raises(asyncio.TimeoutError):
             await state.begin_reload(.001)
         assert not state.closed and state.failed is None and state.server_generation == 0
         await state.leave()
