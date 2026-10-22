@@ -25,4 +25,15 @@ python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_rollout_engine.py \
   tests/test_cpu_offload_backend.py \
   tests/test_r2e_patch_harness.py \
-  tests/test_r2e_gym_workflow.py
+  tests/test_r2e_gym_workflow.py \
+  tests/test_optimizer_state.py \
+  tests/test_elastic_optimizer_state.py \
+  tests/test_ehp_dp_resharding.py \
+  tests/test_ehp_batch_partition.py \
+  tests/test_fixed_batch_gradients.py \
+  tests/test_grpo_sample_mean.py \
+  tests/test_hybrid_sample_statistics_data.py \
+  tests/test_elastic_gradient_idle_path.py \
+  tests/test_torch_optimizer_memory.py \
+  tests/test_megatron_core_train_engine.py \
+  tests/test_hybrid_worker_batch_protocol.py

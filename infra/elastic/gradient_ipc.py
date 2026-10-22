@@ -70,7 +70,7 @@ class ElasticGradientClient:
         buffer = io.BytesIO()
         torch.save(
             {
-                "protocol_version": 3,
+                "protocol_version": 4,
                 "authkey": self.endpoint.authkey,
                 "replica_id": payload.replica_id,
                 "target_core_id": payload.target_core_id,
@@ -82,6 +82,9 @@ class ElasticGradientClient:
                 "state_version": payload.state_version,
                 "membership_epoch": payload.membership_epoch,
                 "expect_update": bool(expect_update),
+                "sample_count": payload.sample_count,
+                "global_sample_count": payload.global_sample_count,
+                "stats": payload.stats,
             },
             buffer,
         )
@@ -279,7 +282,7 @@ class ElasticGradientServer:
         data = torch.load(io.BytesIO(self._recv_exact(conn, length)), map_location="cpu", weights_only=False)
         if self.authkey and data.get("authkey") != self.authkey:
             raise PermissionError("invalid elastic gradient authkey")
-        if int(data.get("protocol_version", 0)) not in {2, 3}:
+        if int(data.get("protocol_version", 0)) not in {2, 3, 4}:
             raise ValueError("unsupported elastic gradient protocol")
         tensors = []
         for _ in range(int(data["tensor_count"])):
@@ -295,6 +298,9 @@ class ElasticGradientServer:
             step=int(data.get("step", -1)),
             state_version=int(data.get("state_version", -1)),
             membership_epoch=int(data.get("membership_epoch", 0)),
+            sample_count=int(data.get("sample_count", 1)),
+            global_sample_count=int(data.get("global_sample_count", 0)),
+            stats=data.get("stats", {}),
         ), bool(data.get("expect_update", False))
 
     @staticmethod

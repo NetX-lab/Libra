@@ -59,6 +59,8 @@ def _load_payload_file(path: Path, *, worker_id: str, target_core_id: str, args)
         step=int(data.get("step", -1)) if isinstance(data, dict) else -1,
         state_version=int(data.get("state_version", -1)) if isinstance(data, dict) else -1,
         membership_epoch=int(data.get("membership_epoch", 0)) if isinstance(data, dict) else 0,
+        sample_count=int(data.get("sample_count", 1)) if isinstance(data, dict) else 1,
+        global_sample_count=int(data.get("global_sample_count", 0)) if isinstance(data, dict) else 0,
     )
 
 
@@ -179,7 +181,7 @@ def main():
                         engine.load_elastic_state_snapshot(task_snapshot)
                         snapshot = Path(task_snapshot)
                     engine.recompute_logprobs(data["trajectories"])
-                    payload = engine.compute_elastic_gradient_payload(data["trajectories"], worker_id=args.replica_id or args.worker_id, target_core_id=args.target_core_id, step=int(data["step"]), state_version=int(data["state_version"]), membership_epoch=int(data["membership_epoch"]))
+                    payload = engine.compute_elastic_gradient_payload(data["trajectories"], worker_id=args.replica_id or args.worker_id, target_core_id=args.target_core_id, step=int(data["step"]), state_version=int(data["state_version"]), membership_epoch=int(data["membership_epoch"]), global_sample_count=int(data.get("global_sample_count", 0)))
                 else:
                     payload = _load_payload_file(task_path, worker_id=args.worker_id, target_core_id=args.target_core_id, args=args)
                 if payload is not None:

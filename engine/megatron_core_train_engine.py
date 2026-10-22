@@ -109,6 +109,7 @@ class MegatronCoreTrainEngine:
         self.is_main_process = self.rank == 0
         self.current_version = 0
         self.optimizer_revision = 0
+        self._elastic_batch_partition = None
 
         self.bridge = None
         self.provider = None
@@ -532,7 +533,8 @@ class MegatronCoreTrainEngine:
                 logits = self._forward(micro_batch)
                 loss, stats = self._loss(micro_batch, logits)
                 scaled_loss = self.optimizer.scale_loss(
-                    loss / max(len(micro_batches), 1)
+                    loss * (len(micro_batch["trajectories"]) / max(len(trajectories), 1))
+                    * self._elastic_core_loss_scale()
                 )
                 scaled_loss.backward()
                 local_stats.append(stats)
@@ -757,6 +759,23 @@ class MegatronCoreTrainEngine:
         if active_hybrid_workers is not None:
             self._elastic_step_hybrid_workers = tuple(str(w) for w in active_hybrid_workers)
 
+    def set_elastic_batch_partition(self, local_sample_count, global_sample_count, hybrid_sample_counts):
+        if local_sample_count < 0 or global_sample_count <= 0 or local_sample_count > global_sample_count:
+            raise ValueError("invalid fixed global batch partition")
+        self._elastic_batch_partition = (int(local_sample_count), int(global_sample_count), dict(hybrid_sample_counts))
+
+
+    def _elastic_core_loss_scale(self):
+        partition = self._elastic_batch_partition
+        if partition is None:
+            return 1.0
+        local_count, total_count, _ = partition
+        # MCore finalizes a MEAN across core DP first. Weight before that
+        # operation, then remove its duplicate copies in the elastic SUM.
+        world = max(1, self.get_data_parallel_world_size())
+        return local_count * world / total_count
+
+
     def set_elastic_active_gradient_timeout(self, timeout_s: float) -> None:
         self._elastic_active_gradient_timeout_s = max(0.0, float(timeout_s))
 
@@ -775,14 +794,17 @@ class MegatronCoreTrainEngine:
     def compute_elastic_gradient_payload(
         self, trajectories: list[dict[str, Any]], *, worker_id: str,
         target_core_id: str, step: int, state_version: int, membership_epoch: int,
+        global_sample_count: int = 0,
     ) -> GradientPayload:
         from megatron.core.distributed import finalize_model_grads
         micro_batches = list(self._iter_micro_batches(trajectories))
         self._zero_grad()
         self._set_train_mode(True)
+        local_stats = []
         for micro_batch in micro_batches:
-            loss, _ = self._loss(micro_batch, self._forward(micro_batch))
-            self.optimizer.scale_loss(loss / max(len(micro_batches), 1)).backward()
+            loss, stats = self._loss(micro_batch, self._forward(micro_batch))
+            self.optimizer.scale_loss(loss * (len(micro_batch["trajectories"]) / max(len(trajectories), 1))).backward()
+            local_stats.append(stats)
         finalize_model_grads(self.model)
         return GradientPayload(
             replica_id=worker_id, target_core_id=target_core_id,
@@ -790,6 +812,8 @@ class MegatronCoreTrainEngine:
             replica_rank=int(os.environ.get("RANK", "0")),
             replica_world_size=int(os.environ.get("WORLD_SIZE", "1")),
             step=int(step), state_version=int(state_version), membership_epoch=int(membership_epoch),
+            sample_count=len(trajectories), global_sample_count=int(global_sample_count),
+            stats=self._merge_stats(local_stats),
         )
 
     def apply_elastic_gradient_update(self, tensors: tuple[torch.Tensor, ...], *, state_version: int) -> None:
@@ -801,7 +825,7 @@ class MegatronCoreTrainEngine:
         ok, _norm, _zeros = self.optimizer.step()
         if not ok:
             raise FloatingPointError("Hybrid Megatron optimizer rejected the update")
-        self.optimizer_revision = int(state_version)
+        self.current_version = int(state_version)
 
     @staticmethod
     def _clone_cpu_state(value):
@@ -1081,11 +1105,13 @@ class MegatronCoreTrainEngine:
             -advantages.unsqueeze(1) * ratio,
             -advantages.unsqueeze(1) * clipped_ratio,
         )
-        count = loss_mask.sum().clamp(min=1.0)
-        pg_loss = (pg_loss * loss_mask).sum() / count
+        # A trajectory is one sample of the fixed global batch. Its weight
+        # must not depend on its token count or on the elastic microbatch split.
+        count = loss_mask.sum(dim=-1).clamp(min=1.0)
+        pg_loss = ((pg_loss * loss_mask).sum(dim=-1) / count).mean()
         # Positive second-order approximation of KL(old_policy || new_policy).
         kl_per_token = (ratio - 1.0) - log_ratio
-        kl = (kl_per_token * loss_mask).sum() / count
+        kl = ((kl_per_token * loss_mask).sum(dim=-1) / count).mean()
         loss = pg_loss + self.kl_coef * kl
         return loss, {
             "loss": float(loss.detach()),
@@ -1098,11 +1124,12 @@ class MegatronCoreTrainEngine:
 
     def _reduce_stats(self, stats: dict[str, float]) -> dict[str, float]:
         updates = float(stats["n_updates"])
+        samples = float(stats["n_samples"])
         values = torch.tensor(
             [
-                stats["loss"] * updates,
-                stats["pg_loss"] * updates,
-                stats["kl"] * updates,
+                stats["loss"] * samples,
+                stats["pg_loss"] * samples,
+                stats["kl"] * samples,
                 stats["reward_sum"],
                 stats["n_samples"],
                 updates,
@@ -1118,10 +1145,11 @@ class MegatronCoreTrainEngine:
         )
         dist.all_reduce(values, op=dist.ReduceOp.SUM, group=group)
         global_updates = values[5].clamp(min=1.0)
+        global_samples = values[4].clamp(min=1.0)
         return {
-            "loss": float(values[0] / global_updates),
-            "pg_loss": float(values[1] / global_updates),
-            "kl": float(values[2] / global_updates),
+            "loss": float(values[0] / global_samples),
+            "pg_loss": float(values[1] / global_samples),
+            "kl": float(values[2] / global_samples),
             "reward_sum": float(values[3]),
             "n_samples": float(values[4]),
             "n_updates": float(values[5]),
@@ -1146,17 +1174,17 @@ class MegatronCoreTrainEngine:
         reward_sum = sum(float(item.get("reward_sum", 0.0)) for item in stats)
         return {
             "loss": sum(
-                float(item["loss"]) * float(item.get("n_updates", 1.0))
+                float(item["loss"]) * float(item.get("n_samples", 0.0))
                 for item in stats
-            ) / max(updates, 1.0),
+            ) / max(samples, 1.0),
             "pg_loss": sum(
-                float(item["pg_loss"]) * float(item.get("n_updates", 1.0))
+                float(item["pg_loss"]) * float(item.get("n_samples", 0.0))
                 for item in stats
-            ) / max(updates, 1.0),
+            ) / max(samples, 1.0),
             "kl": sum(
-                float(item["kl"]) * float(item.get("n_updates", 1.0))
+                float(item["kl"]) * float(item.get("n_samples", 0.0))
                 for item in stats
-            ) / max(updates, 1.0),
+            ) / max(samples, 1.0),
             "reward_sum": reward_sum,
             "reward_mean": reward_sum / max(samples, 1.0),
             "n_samples": samples,
@@ -1177,16 +1205,49 @@ class MegatronCoreTrainEngine:
         for model_chunk in self.model:
             model_chunk.train(enabled)
 
+    def _materialize_elastic_core_gradients(self):
+        """Restore full bucket gradients after MCore distributed-optimizer RS.
+
+        MCore 0.14 only synchronizes the local shard of each grad bucket when
+        using DistributedOptimizer. Hybrid exchange is per model lane, so its
+        payload must see all finalized parameter gradients, not stale remote
+        shards that remain in the bucket after reduce-scatter.
+        """
+        if not getattr(self, "use_distributed_optimizer", False):
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        for model in self.model:
+            groups = list(getattr(model, "bucket_groups", ()))
+            groups += list(getattr(model, "expert_parallel_bucket_groups", ()))
+            for bucket_group in groups:
+                group = bucket_group.intra_distributed_optimizer_instance_group
+                world = dist.get_world_size(group)
+                if world <= 1:
+                    continue
+                rank = dist.get_rank(group)
+                for bucket in bucket_group.buckets:
+                    flat = bucket.grad_data.view(-1)
+                    if flat.numel() % world:
+                        raise ValueError("distributed optimizer grad bucket is not evenly sharded")
+                    width = flat.numel() // world
+                    # The output aliases the original RS input; clone only the
+                    # finalized local shard before gathering back into it.
+                    local = flat[rank * width:(rank + 1) * width].clone()
+                    dist.all_gather_into_tensor(flat, local, group=group)
+
+
     def _apply_elastic_inter_replica_gradients(self) -> None:
         pending = getattr(self, "_pending_hybrid_gradients", [])
         expected = set(getattr(self, "_elastic_step_hybrid_workers", ()))
-        if not pending and not expected:
+        if self.elastic_gradient_domain is None and not pending and not expected:
             return
         if self.elastic_gradient_domain is None:
             with self._hybrid_gradient_condition:
                 self._pending_hybrid_gradients.clear()
             return
-        deadline = time.monotonic() + self._elastic_active_gradient_timeout_s
+        deadline = (time.monotonic() + self._elastic_active_gradient_timeout_s
+                    if self._elastic_active_gradient_timeout_s > 0 else None)
         with self._hybrid_gradient_condition:
             while expected:
                 present = {
@@ -1197,14 +1258,15 @@ class MegatronCoreTrainEngine:
                 missing = expected - present
                 if not missing:
                     break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                remaining = deadline - time.monotonic() if deadline is not None else None
+                if remaining is not None and remaining <= 0:
                     raise TimeoutError(
                         "timed out waiting for active hybrid gradients: "
                         f"step={self._elastic_training_step}, missing={sorted(missing)}"
                     )
-                self._hybrid_gradient_condition.wait(timeout=min(remaining, 0.1))
+                self._hybrid_gradient_condition.wait(timeout=min(remaining, 0.1) if remaining is not None else 0.1)
             pending = list(self._pending_hybrid_gradients)
+        self._materialize_elastic_core_gradients()
         params_and_grads = [(None, grad) for grad in self._model_main_gradients()]
         if not params_and_grads:
             with self._hybrid_gradient_condition:
@@ -1212,11 +1274,21 @@ class MegatronCoreTrainEngine:
             return
 
         core_id = f"dp{self.get_data_parallel_rank()}"
+        partition = self._elastic_batch_partition
+        weighted = partition is not None
+        world = len(self.elastic_gradient_domain.core_replica_ids)
+        # finalize_model_grads has already averaged the weighted core sum
+        # across DP. Each lane holds the same core contribution, so divide by
+        # DP before the second SUM, while adding each hybrid exactly once.
+        local = tuple(grad.detach() for _, grad in params_and_grads)
+        if weighted and world > 1:
+            for grad in local:
+                grad.div_(world)
         reduced = self.elastic_gradient_domain.reduce_core_gradients(
-            core_gradients={
-                core_id: tuple(grad.detach() for _, grad in params_and_grads),
-            },
-            hybrid_payloads=pending,
+            core_gradients={core_id: local}, hybrid_payloads=pending,
+            core_sample_counts={core_id: partition[1]} if weighted else None,
+            global_sample_count=partition[1] if weighted else 0,
+            in_place=True,
         )
         for (_, grad), reduced_grad in zip(
             params_and_grads,
@@ -1226,12 +1298,22 @@ class MegatronCoreTrainEngine:
                 reduced_grad.to(device=grad.device, dtype=grad.dtype)
             )
         if self._elastic_gradient_update_callback is not None:
+            # The callback can queue this update for asynchronous serialization.
+            # Optimizer clipping and the next zero_grad may mutate main_grad as
+            # soon as it returns. Preserve an owned CPU snapshot, rather than
+            # restoring a full-model FP32 duplicate on the GPU.
+            update_tensors = None
             for payload in pending:
                 if payload.replica_id in expected:
+                    if update_tensors is None:
+                        update_tensors = tuple(
+                            tensor.detach().to(device="cpu", copy=True)
+                            for tensor in reduced[core_id]
+                        )
                     self._elastic_gradient_update_callback(
                         GradientUpdate(
                             replica_id=payload.replica_id,
-                            tensors=tuple(reduced[core_id]),
+                            tensors=update_tensors,
                             step=payload.step,
                             state_version=self.current_version,
                             membership_epoch=payload.membership_epoch,

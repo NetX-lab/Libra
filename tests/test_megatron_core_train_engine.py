@@ -8,7 +8,7 @@ from RL_Framework.engine.megatron_core_train_engine import (
 )
 
 
-def test_merge_stats_uses_update_weighted_averages():
+def test_merge_stats_weights_losses_by_samples_and_grad_norm_by_updates():
     merged = MegatronCoreTrainEngine._merge_stats(
         [
             {
@@ -32,9 +32,9 @@ def test_merge_stats_uses_update_weighted_averages():
         ]
     )
 
-    assert merged["loss"] == pytest.approx(2.5)
-    assert merged["pg_loss"] == pytest.approx(3.5)
-    assert merged["kl"] == pytest.approx(0.25)
+    assert merged["loss"] == pytest.approx(2.0)
+    assert merged["pg_loss"] == pytest.approx(3.0)
+    assert merged["kl"] == pytest.approx(0.2)
     assert merged["grad_norm"] == pytest.approx(4.5)
     assert merged["reward_mean"] == pytest.approx(1.5)
 

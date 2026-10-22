@@ -71,6 +71,9 @@ class GradientPayload:
     step: int = -1
     state_version: int = -1
     membership_epoch: int = 0
+    sample_count: int = 1
+    global_sample_count: int = 0
+    stats: dict[str, float] = field(default_factory=dict)
 
     @staticmethod
     def zeros_like(
@@ -510,12 +513,22 @@ class InterReplicaGradientDomain:
         *,
         core_gradients: Mapping[str, Iterable[torch.Tensor]],
         hybrid_payloads: Iterable[GradientPayload] = (),
+        core_sample_counts: Mapping[str, int] | None = None,
+        global_sample_count: int = 0,
+        step: int = -1,
+        state_version: int = -1,
+        in_place: bool = False,
     ) -> dict[str, tuple[torch.Tensor, ...]]:
-        """Return synchronized gradients for each core replica.
+        """Reduce local sample means into the fixed global batch gradient.
 
-        ``core_gradients`` must contain all fixed core replicas. Hybrid payloads
-        whose workers are still joining are treated as zero placeholders even if
-        a caller accidentally supplies non-zero tensors.
+        With sample counts, each local mean contributes ``n_local / B`` and the
+        core collective sums these contributions. Joining replicas have zero
+        weight. Every core lane participates, including lanes with no Hybrid.
+        Unweighted calls retain the legacy backend-neutral simulation API.
+        ``in_place`` explicitly transfers ownership of one local core lane's
+        gradient buffers to this call. It bounds temporary storage to transport
+        chunks, rather than duplicating every FP32 model gradient. The default
+        retains independent output buffers and leaves its inputs untouched.
         """
         distributed = (
             dist is not None
@@ -532,66 +545,126 @@ class InterReplicaGradientDomain:
             raise ValueError("no local core gradients were provided")
 
         effective = {
-            rid: tuple(t.clone() for t in core_gradients[rid])
+            rid: tuple(core_gradients[rid])
             for rid in provided_core_ids
         }
         self._validate_same_structure(effective.values())
+        if in_place and len(provided_core_ids) != 1:
+            raise ValueError("in-place reduction requires exactly one local core lane")
 
+        weighted = global_sample_count > 0
+        if weighted:
+            if core_sample_counts is None:
+                raise ValueError("sample counts are required for a fixed global batch")
+            scales = {rid: int(core_sample_counts[rid]) / global_sample_count
+                      for rid in provided_core_ids}
+        else:
+            scales = {rid: 1.0 for rid in provided_core_ids}
         with self._lock:
             targets = dict(self._hybrid_targets)
             joining = set(self._joining)
-
+            epochs = dict(self._membership_epochs)
+        accepted = []
         for payload in hybrid_payloads:
-            if payload.replica_id not in targets:
+            target = targets.get(payload.replica_id)
+            if target not in effective or payload.replica_id in joining:
                 continue
-            target = targets[payload.replica_id]
-            if target not in effective:
+            if payload.zero_placeholder:
                 continue
             if target != payload.target_core_id:
-                raise ValueError(
-                    f"payload target mismatch for {payload.replica_id}: "
-                    f"{payload.target_core_id} != {target}"
-                )
-            if payload.replica_id in joining or payload.zero_placeholder:
-                continue
+                raise ValueError(f"payload target mismatch for {payload.replica_id}")
             if payload.replica_world_size != self.replica_world_size:
-                raise ValueError(
-                    f"payload replica world size mismatch for {payload.replica_id}: "
-                    f"{payload.replica_world_size} != {self.replica_world_size}"
-                )
+                raise ValueError(f"payload replica world size mismatch for {payload.replica_id}")
             if payload.replica_rank != self.local_replica_rank:
-                # Each fixed TP/PP/CP lane consumes only the matching rank from
-                # the complete hybrid DP replica.
                 continue
             if len(payload.tensors) != len(effective[target]):
                 raise ValueError("hybrid payload tensor count mismatch")
-            effective[target] = tuple(
-                base + extra.to(device=base.device, dtype=base.dtype)
-                for base, extra in zip(effective[target], payload.tensors)
-            )
-
+            if any(a.shape != b.shape for a, b in zip(effective[target], payload.tensors)):
+                raise ValueError("hybrid payload tensor shape mismatch")
+            if weighted and payload.global_sample_count != global_sample_count:
+                raise ValueError("hybrid global batch size mismatch")
+            if payload.sample_count < 0:
+                raise ValueError("negative hybrid sample count")
+            scale = payload.sample_count / global_sample_count if weighted else 1.0
+            accepted.append((target, payload, scale))
+        # Validate the complete payload set before mutating an owned buffer or
+        # marking a payload consumed, including failures in a later payload.
+        if in_place:
+            all_tensors = [t for tensors in effective.values() for t in tensors]
+            all_tensors += [t for _, payload, _ in accepted for t in payload.tensors]
+            if any(not t.is_contiguous() for t in all_tensors):
+                raise ValueError("in-place reduction requires contiguous gradients")
+            with torch.no_grad():
+                for rid, tensors in effective.items():
+                    if scales[rid] != 1.0:
+                        for tensor in tensors:
+                            tensor.mul_(scales[rid])
+                for target, payload, scale in accepted:
+                    for base, extra in zip(effective[target], payload.tensors):
+                        width = max(DEFAULT_CHUNK_BYTES // max(base.element_size(), 1), 1)
+                        destination, source = base.view(-1), extra.view(-1)
+                        for start in range(0, base.numel(), width):
+                            stop = start + width
+                            # Preserve multiply-then-add rounding; add_(alpha=)
+                            # can fuse them and change the numerical update.
+                            contribution = source[start:stop].to(
+                                device=base.device, dtype=base.dtype, copy=True)
+                            contribution.mul_(scale)
+                            destination[start:stop].add_(contribution)
+                            del contribution
+        else:
+            effective = {rid: tuple(t.clone() for t in tensors)
+                         for rid, tensors in effective.items()}
+            if weighted:
+                effective = {rid: tuple(t * scales[rid] for t in tensors)
+                             for rid, tensors in effective.items()}
+            for target, payload, scale in accepted:
+                effective[target] = tuple(
+                    base + extra.to(device=base.device, dtype=base.dtype) * scale
+                    for base, extra in zip(effective[target], payload.tensors)
+                )
         # In a real distributed launch each rank owns one core replica lane. The
         # transport call performs the RDMA/NCCL all-reduce. For local tests we
         # compute the same reduction explicitly across the in-memory core map.
         if distributed and self.process_group is not None:
+            if in_place:
+                with torch.no_grad():
+                    for tensors in effective.values():
+                        for tensor in tensors:
+                            width = max(DEFAULT_CHUNK_BYTES // max(tensor.element_size(), 1), 1)
+                            flat = tensor.view(-1)
+                            for start in range(0, flat.numel(), width):
+                                chunk = flat[start:start + width]
+                                reduced = self.transport.exchange(
+                                    chunk, group=self.process_group,
+                                    average=self.average_core_replicas and not weighted,
+                                )
+                                chunk.copy_(reduced)
+                                del reduced
+                return effective
             return {
                 rid: tuple(
                     self.transport.exchange(
                         tensor,
                         group=self.process_group,
-                        average=self.average_core_replicas,
+                        average=self.average_core_replicas and not weighted,
                     )
                     for tensor in tensors
                 )
                 for rid, tensors in effective.items()
             }
 
+        if in_place:
+            # There is exactly one lane here. Avoid stack/sum/clone of that
+            # entire lane when no collective is needed (notably Core DP1).
+            return effective
+
         reduced = []
         for tensors_at_idx in zip(*(effective[rid] for rid in provided_core_ids)):
             total = torch.stack(
                 [t.to(tensors_at_idx[0].device) for t in tensors_at_idx]
             ).sum(dim=0)
-            if self.average_core_replicas:
+            if self.average_core_replicas and not weighted:
                 total = total / len(provided_core_ids)
             reduced.append(total)
         return {
