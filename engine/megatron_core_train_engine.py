@@ -126,6 +126,7 @@ class MegatronCoreTrainEngine:
         self._elastic_training_step = -1
         self._elastic_step_hybrid_workers: tuple[str, ...] = ()
         self._elastic_gradient_update_callback = None
+        self._hybrid_optimizer_cuda_cache_released = False
         self.hybrid_lockstep_gradient_sync = True
         self._elastic_active_gradient_timeout_s = 300.0
         self.checkpoints = MegatronDistributedCheckpointManager(
@@ -506,6 +507,7 @@ class MegatronCoreTrainEngine:
                     logits,
                     micro_batch["input_ids"],
                 ).cpu()
+                del logits
                 for row, trajectory in zip(
                     action_log_probs,
                     micro_batch["trajectories"],
@@ -532,11 +534,13 @@ class MegatronCoreTrainEngine:
             for micro_batch in micro_batches:
                 logits = self._forward(micro_batch)
                 loss, stats = self._loss(micro_batch, logits)
+                del logits
                 scaled_loss = self.optimizer.scale_loss(
                     loss * (len(micro_batch["trajectories"]) / max(len(trajectories), 1))
                     * self._elastic_core_loss_scale()
                 )
                 scaled_loss.backward()
+                del loss, scaled_loss
                 local_stats.append(stats)
 
             finalize_model_grads(self.model)
@@ -822,9 +826,20 @@ class MegatronCoreTrainEngine:
             raise ValueError(f"Hybrid update tensor count mismatch: {len(tensors)} != {len(local)}")
         for dst, src in zip(local, tensors):
             dst.copy_(src.to(device=dst.device, dtype=dst.dtype))
+        cache_released = False
+        if not getattr(self, "_hybrid_optimizer_cuda_cache_released", False) and torch.cuda.is_available():
+            device = next((grad.device for grad in local if grad.device.type == "cuda"), None)
+            if device is not None:
+                # Return unused cached blocks to external CUDA allocators
+                # before this Hybrid's first optimizer update.
+                with torch.cuda.device(device):
+                    torch.cuda.empty_cache()
+                cache_released = True
         ok, _norm, _zeros = self.optimizer.step()
         if not ok:
             raise FloatingPointError("Hybrid Megatron optimizer rejected the update")
+        if cache_released:
+            self._hybrid_optimizer_cuda_cache_released = True
         self.current_version = int(state_version)
 
     @staticmethod

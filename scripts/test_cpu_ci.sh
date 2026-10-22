@@ -34,6 +34,7 @@ python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_grpo_sample_mean.py \
   tests/test_hybrid_sample_statistics_data.py \
   tests/test_elastic_gradient_idle_path.py \
+  tests/test_hybrid_optimizer_cuda_cache.py \
   tests/test_torch_optimizer_memory.py \
   tests/test_megatron_core_train_engine.py \
   tests/test_hybrid_worker_batch_protocol.py
