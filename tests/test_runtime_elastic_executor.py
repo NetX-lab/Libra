@@ -1,5 +1,9 @@
 import json
+from pathlib import Path
+import shlex
+import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -92,6 +96,83 @@ def _decision(cfg: AsyncRLConfig):
     assert decision.candidate_plan is not None
     decision.should_reconfigure = True
     return planner, decision
+
+
+@pytest.mark.parametrize('slots', [
+    {},
+    {'rollout0': {'host': 'a', 'gpus': [0]}},
+    {'rollout0': {'host': 'a', 'gpus': [0]}, 'rollout1': {'host': 'b', 'gpus': [1]}},
+    {'rollout0': {'host': 'a', 'gpus': [0]}, 'rollout1': {'host': 'a', 'gpus': [0]}},
+])
+@pytest.mark.parametrize('existing_replica', [False, True])
+def test_real_hybrid_join_requires_safely_lent_complete_single_host_slots(
+    monkeypatch, slots, existing_replica,
+):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    cfg = _config()
+    cfg.train_gpus, cfg.rollout_gpus = 4, 6
+    cfg.train_tp_size, cfg.train_dp_size = 2, 2
+    cfg.global_resource_planner.hybrid_worker_launch_enabled = True
+    executor = RuntimeElasticExecutor(config=cfg, planner=GlobalResourcePlanner.from_config(cfg))
+    core = {f'dp{i}': SimpleNamespace(role='core_training') for i in range(2)}
+    candidates = {f'rollout{i}': SimpleNamespace(role='hybrid_rollout') for i in range(4)}
+    active = ([SimpleNamespace(worker_id='old0', role='hybrid_training'),
+               SimpleNamespace(worker_id='old1', role='hybrid_training')]
+              if existing_replica else [])
+    active_before = [(worker.worker_id, worker.role) for worker in active]
+    replicas = {'existing': active} if active else {}
+    join = Mock(side_effect=AssertionError('unsafe physical allocation reached join'))
+    executor.elastic_pool = SimpleNamespace(
+        snapshot=lambda: {**core, **candidates}, replica_snapshot=lambda: replicas,
+        join_replica=join,
+    )
+    executor._cluster_swap_training_slots = slots
+    monkeypatch.setattr(executor, '_desired_hybrid_workers', lambda *_: 4 if active else 2)
+    capture = Mock(side_effect=AssertionError('unsafe physical allocation reached capture'))
+    monkeypatch.setattr(executor, '_capture_core_snapshot', capture)
+
+    actions = executor._reconfigure_training_pool(4, None, SimpleNamespace())
+
+    assert actions == ['join_replica_capacity_shortfall:1']
+    capture.assert_not_called()
+    join.assert_not_called()
+    assert [(worker.worker_id, worker.role) for worker in replicas.get('existing', [])] == active_before
+    assert not executor._pending_hybrid_joins
+
+
+def test_real_hybrid_join_groups_confirmed_slots_by_host_before_capture(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    cfg = _config()
+    cfg.train_gpus, cfg.rollout_gpus = 4, 4
+    cfg.train_tp_size, cfg.train_dp_size = 2, 2
+    cfg.global_resource_planner.hybrid_worker_launch_enabled = True
+    executor = RuntimeElasticExecutor(config=cfg, planner=GlobalResourcePlanner.from_config(cfg))
+    core = {f'dp{i}': SimpleNamespace(role='core_training') for i in range(2)}
+    candidates = {f'rollout{i}': SimpleNamespace(role='hybrid_rollout') for i in range(4)}
+    join = Mock(return_value=SimpleNamespace(generation=1))
+    executor.elastic_pool = SimpleNamespace(
+        snapshot=lambda: {**core, **candidates}, replica_snapshot=lambda: {}, join_replica=join,
+        activation_guard=lambda *_: nullcontext(),
+    )
+    executor._cluster_swap_training_slots = {
+        f'rollout{i}': {'host': 'a' if i % 2 == 0 else 'b', 'gpus': [i // 2]}
+        for i in range(4)
+    }
+    monkeypatch.setattr(executor, '_desired_hybrid_workers', lambda *_: 2)
+    capture = Mock()
+    monkeypatch.setattr(executor, '_capture_core_snapshot', capture)
+
+    actions = executor._reconfigure_training_pool(4, None, SimpleNamespace())
+
+    capture.assert_called_once()
+    assert join.call_args.args[1] == ('rollout0', 'rollout2')
+    assert any(action.startswith('join_replica_submitted:') for action in actions)
+    assert not any('shortfall' in action for action in actions)
 
 
 def test_runtime_executor_applies_rollout_reconfiguration():
@@ -377,6 +458,7 @@ def test_runtime_executor_does_not_rejoin_hybrids_after_target_is_reached():
     cfg.global_resource_planner.runtime_training_pool_target_gpus = 3
     cfg.global_resource_planner.runtime_training_pool_plan_only = False
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Pure scheduling-state simulation; no worker/backend.
         core_train_workers=["core0"],
         core_rollout_workers=["rollout0", "rollout1"],
         zero_sync_steps=0,
@@ -545,6 +627,7 @@ def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path
     # Exercise ownership/ordering without leaving a real shell/sleep process.
     process = Mock(pid=12345)
     process.poll.return_value = None
+    process.terminate.side_effect = lambda: setattr(process.poll, "return_value", 0)
     monkeypatch.setattr(
         "RL_Framework.infra.elastic.runtime_executor.subprocess.Popen",
         lambda *args, **kwargs: process,
@@ -554,6 +637,11 @@ def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path
 
     class FakeTrainEngine:
         current_version = 3
+        optimizer_revision = 3
+
+        def get_elastic_lane_state(self):
+            return {"data_parallel_rank": 0, "tensor_parallel_rank": 0,
+                    "pipeline_parallel_rank": 0, "context_parallel_rank": 0}
 
         def __init__(self):
             self.snapshots = []
@@ -567,9 +655,7 @@ def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path
             return self.current_version
 
         def get_elastic_state_snapshot_path(self, version):
-            path = tmp_path / f"rank0_v{version}.pt"
-            path.write_bytes(b"snapshot")
-            return path
+            return f"ehp://fake-state:12345/revision-{version}"
 
         def set_elastic_gradient_domain(self, domain):
             self.domain = domain
@@ -587,6 +673,18 @@ def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path
         def __init__(self, events, **kwargs):
             super().__init__(**kwargs)
             self.events = events
+
+        def _capture_core_snapshot(self):
+            # This test isolates prewarm ordering; simulate the collective
+            # capture of every configured core DP lane without real workers.
+            import json
+            path = tmp_path / "capture.json"
+            path.write_text(json.dumps({"format": "libra-ehp-lanes-v1", "optimizer_revision": 3,
+                                        "snapshot_id": "simulated-collective",
+                                        "lanes": {f"dp{i}": {"0": f"ehp://fake/dp{i}"}
+                                                  for i in range(self.config.train_dp_size)}}))
+            self._snapshot_manifests[3] = str(path)
+            return str(path)
 
         def _ensure_gradient_server(self):
             class Endpoint:
@@ -623,6 +721,7 @@ def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path
             return worker_id in self._hybrid_worker_meta
 
     cfg = _config()
+    cfg.global_resource_planner.hybrid_worker_task_dir = str(tmp_path / "tasks")
     cfg.global_resource_planner.runtime_reconfigure_training = True
     cfg.global_resource_planner.runtime_training_pool_plan_only = False
     cfg.global_resource_planner.runtime_training_pool_target_gpus = 4
@@ -638,6 +737,12 @@ def test_runtime_executor_adopts_prewarmed_training_worker_before_pause(tmp_path
         planner=planner,
         train_engine=train_engine,
         dispatcher=OrderedDispatcher(events),
+    )
+    # The fake prewarm process does not execute a physical rollout stop. Model
+    # the confirmed loan explicitly instead of relying on an unowned fallback.
+    monkeypatch.setattr(
+        'RL_Framework.infra.elastic.rollout_lending.lend_rollout',
+        lambda *_: {'rollout0': {'host': '', 'gpus': [0]}},
     )
 
     result = executor.execute(decision)
@@ -796,6 +901,7 @@ def test_runtime_executor_cluster_swap_returns_training_gpu_to_rollout():
     decision.candidate_plan.train_config.dp = 2
     decision.candidate_plan.rollout_config.tp_list = [1, 1]
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Pure scheduling-state simulation; no worker/backend.
         core_train_workers=["core0", "core1"],
         core_rollout_workers=["rollout0", "rollout1"],
         zero_sync_steps=0,
@@ -1157,6 +1263,7 @@ def test_runtime_executor_prewarms_rollout_before_dispatcher_pause():
             self.events.append(f"external_stop:{meta.instance_id}")
 
     cfg = _config()
+    cfg.global_resource_planner.vllm_stop_command_template = "test-owned-stop {instance_id}"
     cfg.global_resource_planner.runtime_manage_rollout_processes = True
     cfg.global_resource_planner.runtime_rollout_reconfigure_strategy = "prewarm"
     cfg.global_resource_planner.runtime_wait_rollout_process_start_ready = True
@@ -1238,6 +1345,7 @@ def test_runtime_executor_prewarm_falls_back_when_no_spare_capacity():
             self.events.append(f"external_stop:{meta.instance_id}")
 
     cfg = _config()
+    cfg.global_resource_planner.vllm_stop_command_template = "test-owned-stop {instance_id}"
     cfg.global_resource_planner.runtime_manage_rollout_processes = True
     cfg.global_resource_planner.runtime_rollout_reconfigure_strategy = "prewarm"
     cfg.global_resource_planner.runtime_prewarm_no_spare_fallback_strategy = "restart_all"
@@ -1445,3 +1553,105 @@ def test_dispatcher_reset_after_reconfigure_clears_old_rollout_state():
     assert stats.enqueued == 0
     assert stats.running == 0
     assert stats.accepted == 0
+
+
+@pytest.mark.parametrize('mode, replica_gpus', [
+    ('megatron_core', 1),
+    ('megatron_core', 2),
+    ('transport', 2),
+])
+def test_hybrid_worker_command_launches_mcore_in_own_process_group(mode, replica_gpus):
+    cfg = _config()
+    cfg.global_resource_planner.hybrid_worker_mode = mode
+    cfg.global_resource_planner.hybrid_worker_python = '/gpu env/bin/python'
+    executor = RuntimeElasticExecutor(config=cfg, planner=GlobalResourcePlanner.from_config(cfg))
+    executor.gradient_server = SimpleNamespace(
+        endpoint=SimpleNamespace(host='127.0.0.1', port=12345, authkey='auth'),
+        close=lambda: None,
+    )
+    try:
+        argv = shlex.split(executor._build_hybrid_worker_command(
+            worker_id='hybrid0', target_core_id='dp0', snapshot_path='/snapshot',
+            gpus=list(range(2, 2 + replica_gpus)), replica_id='hybrid-replica',
+            replica_world_size=replica_gpus,
+        ))
+    finally:
+        executor.close()
+
+    assert argv[0] == 'CUDA_VISIBLE_DEVICES=' + ','.join(str(gpu) for gpu in range(2, 2 + replica_gpus))
+    assert argv[1] == '/gpu env/bin/python'
+    if mode == 'megatron_core':
+        assert argv[2:6] == [
+            '-m', 'torch.distributed.run', '--standalone', f'--nproc_per_node={replica_gpus}',
+        ]
+        script_index = 6
+    else:
+        script_index = 2
+    assert argv[script_index].endswith('/scripts/elastic_hybrid_worker.py')
+    assert argv[argv.index('--worker-mode') + 1] == mode
+    assert argv[argv.index('--replica-world-size') + 1] == str(replica_gpus)
+    assert not any(arg.startswith(('RANK=', 'WORLD_SIZE=', 'MASTER_ADDR=', 'MASTER_PORT=')) for arg in argv)
+
+
+
+def test_hybrid_worker_command_reads_published_lane_endpoint(tmp_path, monkeypatch):
+    from RL_Framework.infra.elastic.gradient_ipc import GradientEndpoint
+    from RL_Framework.scripts import elastic_hybrid_worker as worker
+    from RL_Framework.trainer import async_rl_trainer as trainer_module
+
+    cfg = _config()
+    task_root = tmp_path / 'worker task space'
+    published_root = task_root
+    cfg.global_resource_planner.elastic_hybrid_planning_enabled = True
+    cfg.global_resource_planner.hybrid_worker_task_dir = str(task_root)
+    lane = dict(data_parallel_rank=1, tensor_parallel_rank=0,
+        pipeline_parallel_rank=0, context_parallel_rank=0)
+    engine = SimpleNamespace(
+        configure_elastic_training=lambda *args, **kwargs: None,
+        get_elastic_core_replica_ids=lambda: ['dp1'],
+        get_elastic_lane_state=lambda: lane,
+        enqueue_hybrid_gradient_payload=lambda payload: None,
+    )
+    endpoint = GradientEndpoint('core-host', 12345, 'lane-auth')
+    monkeypatch.setattr(trainer_module, 'ElasticGradientServer',
+        lambda **kwargs: SimpleNamespace(endpoint=endpoint, start=lambda: endpoint, close=lambda: None))
+    executor = RuntimeElasticExecutor(config=cfg, planner=GlobalResourcePlanner.from_config(cfg))
+    producer = object.__new__(trainer_module.AsyncRLTrainer)
+    producer.config, producer.train_engine = cfg, engine
+    producer.rank, producer.is_main_process = 3, True
+    producer.runtime_elastic_executor = executor
+    producer._elastic_membership_epochs = {}
+    try:
+        producer._init_nonblocking_elastic_core()
+        receipt = published_root / 'core_endpoints' / 'rank_3.json'
+        assert receipt.is_file()
+        argv = shlex.split(executor._build_hybrid_worker_command(
+            worker_id='hybrid0', target_core_id='dp1', snapshot_path='/snapshot', gpus=[2],
+        ))
+        script_index = next(i for i, arg in enumerate(argv) if arg.endswith('/elastic_hybrid_worker.py'))
+        monkeypatch.setattr(sys, 'argv', argv[script_index:])
+        args = worker.parse_args()
+        resolved = worker._endpoint_for_lane(args, engine)
+        assert resolved == json.loads(receipt.read_text())
+        assert (resolved['port'], resolved['authkey']) == (12345, 'lane-auth')
+        assert Path(args.gradient_endpoint_dir) == receipt.parent
+        receipt.unlink()
+        with pytest.raises(RuntimeError, match='no core gradient endpoint matches'):
+            worker._endpoint_for_lane(args, engine)
+    finally:
+        executor.close()
+
+
+@pytest.mark.parametrize("explicit_coord_id", [None, "explicit-transaction"])
+def test_peer_rank_state_keeps_the_selected_transaction_id(tmp_path, explicit_coord_id):
+    cfg = _config()
+    cfg.global_resource_planner.runtime_reconfiguration_coord_dir = str(tmp_path)
+    planner, decision = _decision(cfg)
+    executor = RuntimeElasticExecutor(config=cfg, planner=planner)
+    executor._active_runtime_coord_id = "active-transaction"
+    executor._lent_rollout = {"engines": [SimpleNamespace(instance_id="loan-a")]}
+    path = executor._write_peer_rank_reconfiguration_state(
+        decision.candidate_plan, phase="request", coord_id=explicit_coord_id)
+    record = json.loads(path.read_text())
+    assert record["coord_id"] == (explicit_coord_id or "active-transaction")
+    assert record["unavailable_rollout_ids"] == ["loan-a"]

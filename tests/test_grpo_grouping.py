@@ -1,8 +1,13 @@
 from itertools import islice
 from types import SimpleNamespace
+import asyncio
 
+import pytest
 import torch
 
+from RL_Framework.infra.execution.async_runner import AsyncTaskRunner, TaskResult
+from RL_Framework.infra.execution.batch_dispatcher import BatchTaskDispatcher, TaskInput
+from RL_Framework.infra.sync.staleness import StalenessManager
 from RL_Framework.trainer.async_rl_trainer import AsyncRLTrainer
 
 
@@ -92,3 +97,72 @@ def test_batch_collector_keeps_only_complete_groups_after_rejection_gap():
 
     assert [trajectory["grpo_group_id"] for trajectory in batch] == ["b"] * 4
     assert trainer.staleness_manager.consumed == 8
+
+
+@pytest.mark.parametrize('ready_results', [False, True])
+def test_collector_consumes_only_accepted_packets_with_real_timeout_accounting(monkeypatch, ready_results):
+    trainer = _trainer(n_samples=4)
+    trainer.config.max_head_offpolicyness = 3
+    trainer.config.enable_rollout_tracing = False
+    trainer.is_main_process = True
+    trainer._pending_grpo_groups = {}
+    trainer._consumed_grpo_group_ids = {'consumed'}
+    trainer.rollout_engine = object()
+    trainer._refresh_rollout_engine_from_manifest_for_task = lambda: None
+    manager = trainer.staleness_manager = StalenessManager(
+        trainer.train_engine, max_concurrent_rollouts=16, consumer_batch_size=4, max_staleness=3)
+
+    async def episode(engine, data, **kwargs):
+        if data.get('timeout'):
+            await asyncio.Future()
+        return {}
+
+    trainer.workflow = SimpleNamespace(run_episode=episode)
+    monkeypatch.setenv('ROLLOUT_TASK_TIMEOUT_S', '.001')
+    # One timeout never entered accepted. Successful duplicate members and a
+    # late result for a consumed group did, and must still release their credit.
+    tasks = [('incomplete', 0, False), ('incomplete', 1, False),
+             ('incomplete', 3, True), ('consumed', 0, False),
+             ('incomplete', 1, False), ('incomplete', 2, False)]
+    tasks += [('complete', index, False) for index in range(4)]
+
+    async def produce():
+        results = []
+        for task_id, (group_id, index, timeout) in enumerate(tasks):
+            manager.on_rollout_enqueued()
+            manager.on_rollout_submitted()
+            task = TaskInput(task_id, {'timeout': timeout}, version=3,
+                group_id=group_id, rollout_index=index)
+            results.append(await trainer._create_rollout_task(task)())
+        return results
+
+    packets = asyncio.run(produce())
+    assert packets[2]['status'] == 'failed' and packets[2]['failure_reason'] == 'task_timeout'
+    stats = manager.get_stats()
+    assert (stats.accepted, stats.running, stats.rejected, stats.enqueued) == (9, 0, 1, 0)
+    if ready_results:
+        runner = AsyncTaskRunner(max_queue_size=32)
+        dispatcher = BatchTaskDispatcher(runner, manager, trainer._create_rollout_task)
+        for task_id, packet in enumerate(packets):
+            dispatcher._pending_results[task_id] = TaskResult(packet, task_id, task_id, task_id)
+            dispatcher._active_task_ids.add(task_id)
+        dispatcher.active_submit_and_wait = lambda **kwargs: pytest.fail('Ready results must not submit work')
+        trainer.dispatcher = dispatcher
+    else:
+        remaining = list(packets)
+
+        def collect(**kwargs):
+            count = kwargs['batch_size']
+            chunk, remaining[:] = remaining[:count], remaining[count:]
+            return chunk
+
+        trainer.dispatcher = SimpleNamespace(active_submit_and_wait=collect)
+    batch = trainer._collect_complete_grpo_batch(iter(()), batch_size=4)
+    assert [member['grpo_group_id'] for member in batch] == ['complete'] * 4
+    assert [member['grpo_rollout_index'] for member in batch] == list(range(4))
+    assert set(trainer._pending_grpo_groups) == {'incomplete'}
+    assert len(trainer._pending_grpo_groups['incomplete']) == 3
+    assert packets[2]['status'] == 'failed'  # Failure notification is untouched.
+    stats = manager.get_stats()
+    assert (stats.accepted, stats.running, stats.rejected, stats.enqueued) == (0, 0, 1, 0)
+    assert manager.get_capacity() == 16

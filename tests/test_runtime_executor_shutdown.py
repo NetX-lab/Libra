@@ -3,6 +3,7 @@
 import json
 import threading
 from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from types import SimpleNamespace
 
 import pytest
@@ -66,7 +67,21 @@ def harness(tmp_path, monkeypatch):
         monkeypatch.setattr(executor, "_build_hybrid_worker_command", lambda **kw: "fake worker")
         monkeypatch.setattr(executor, "_cluster_swap_training_slot", lambda wid: {"host": "fake-host", "gpus": [0]})
         # Most tests isolate launch ordering. A separate test keeps the real poll.
-        monkeypatch.setattr(executor, "_wait_hybrid_worker_ready", lambda wid: None)
+        # Launch-order tests simulate a real installation and core-boundary ACK;
+        # dedicated readiness tests exercise actual files/identity/TP coverage.
+        receipt = {"acknowledged": True, "optimizer_revision": 0, "state_version": 0,
+                   "snapshot_id": "simulated-state"}
+        manifest = tmp_path / "capture.json"
+        manifest.write_text(json.dumps({"format": "libra-ehp-lanes-v1", "optimizer_revision": 0,
+                                        "snapshot_id": "simulated-state", "lanes": {"dp0": {"0": "ehp://fake/lane0"}}}))
+        monkeypatch.setattr(executor, "_snapshot_path_for_version", lambda version: str(manifest))
+        monkeypatch.setattr(executor, "_capture_core_snapshot", lambda: str(manifest))
+        monkeypatch.setattr(executor, "_wait_hybrid_worker_ready", lambda wid, **kw: dict(receipt))
+        monkeypatch.setattr(executor, "_queue_activation", lambda replica, ack: ack)
+        from RL_Framework.infra.elastic import rollout_lending
+        monkeypatch.setattr(rollout_lending, "wait_hybrid_stopped", lambda executor, wid, request_id=None: {
+            "worker_id": wid, "request_id": request_id, "exited": True,
+        })
         h = SimpleNamespace(executor=executor, pool=pool, processes=processes, popen=popen, path=tmp_path)
         instances.append(h)
         return h
@@ -152,7 +167,7 @@ def test_s3_popen_to_registration_is_atomic_with_close(harness, monkeypatch):
             assert created.wait(3)
             finished = runner.submit(close)
             assert closing.wait(3)
-            with pytest.raises(TimeoutError):
+            with pytest.raises(FutureTimeout):
                 finished.result(timeout=0.05)
         finally:
             resume.set()
@@ -252,7 +267,7 @@ def test_s8_cancelled_generation_cannot_launch_after_rejoin(harness, monkeypatch
     try:
         assert entered.wait(3)
         old.cancel()
-        newer = join(h, replica=replica, callback=lambda *args: None)
+        newer = join(h, replica=replica, callback=lambda *args: {"acknowledged": True, "state_version": 0, "optimizer_revision": 0})
         newer.result(timeout=3)
     finally:
         resume.set()
@@ -305,9 +320,9 @@ def test_readiness_poll_is_cancelled_without_waiting_for_timeout(harness, monkey
     entered = threading.Event()
     h.executor.config.global_resource_planner.hybrid_worker_ready_timeout_s = 3600
 
-    def wait(worker):
+    def wait(worker, **kwargs):
         entered.set()
-        RuntimeElasticExecutor._wait_hybrid_worker_ready(h.executor, worker)
+        return RuntimeElasticExecutor._wait_hybrid_worker_ready(h.executor, worker, **kwargs)
 
     monkeypatch.setattr(h.executor, "_wait_hybrid_worker_ready", wait)
     handle = join(h)
@@ -401,7 +416,7 @@ def test_close_failure_keeps_ownership_and_cleans_other_workers(harness):
 
 def test_prewarm_and_legacy_launch_are_fenced(harness):
     h = harness()
-    handle = join(h, callback=lambda *args: None)
+    handle = join(h, callback=lambda *args: {"acknowledged": True, "state_version": 0, "optimizer_revision": 0})
     handle.result(timeout=3)
     h.executor.close()
     with pytest.raises(JoinCancelledError):
@@ -417,9 +432,10 @@ def test_restart_committed_before_close_is_also_reaped(harness, monkeypatch):
     )
     entered, resume = threading.Event(), threading.Event()
 
-    def wait(worker):
+    def wait(worker, **kwargs):
         entered.set()
         assert resume.wait(3)
+        return {"acknowledged": True, "state_version": 0, "optimizer_revision": 0}
 
     monkeypatch.setattr(h.executor, "_wait_hybrid_worker_ready", wait)
     handle = join(h)
@@ -436,10 +452,10 @@ def test_restart_committed_before_close_is_also_reaped(harness, monkeypatch):
 
 def test_legacy_completed_join_generation_is_checked_at_launch(harness):
     h = harness()
-    old = join(h, callback=lambda *args: None)
+    old = join(h, callback=lambda *args: {"acknowledged": True, "state_version": 0, "optimizer_revision": 0})
     old.result(timeout=3)
     old.cancel()
-    join(h, callback=lambda *args: None).result(timeout=3)
+    join(h, callback=lambda *args: {"acknowledged": True, "state_version": 0, "optimizer_revision": 0}).result(timeout=3)
     assert h.executor._launch_hybrid_worker_after_join(old) is None
     assert not h.processes
 

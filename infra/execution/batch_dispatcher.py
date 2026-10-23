@@ -308,6 +308,12 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
         return selected
 
+    def peek_ready_data(self) -> list[Any]:
+        """Observe admitted results without consuming or resubmitting them."""
+        with self._result_cv:
+            ready = sorted(self._pending_results.values(), key=lambda result: result.create_time)
+            return [result.data for result in ready]
+
     def active_submit_and_wait(
         self,
         input_generator: Generator[TInput, None, None],

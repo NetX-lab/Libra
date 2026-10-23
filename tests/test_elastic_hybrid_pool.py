@@ -109,6 +109,7 @@ def test_non_blocking_join_returns_before_snapshot_fetch_finishes():
         return 12
 
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Standalone state-machine simulation, no engine.
         core_train_workers=["core0"],
         core_rollout_workers=["rollout0"],
         snapshot_fetcher=slow_fetch,
@@ -135,6 +136,7 @@ def test_non_blocking_join_returns_before_snapshot_fetch_finishes():
     assert worker.state_version == 12
     assert pool.gradient_domain.active_hybrid_ids() == ("rollout0",)
     pool.close()
+
 
 
 def test_transport_falls_back_to_local_clone_without_distributed_init():
@@ -260,6 +262,7 @@ def test_activation_barrier_keeps_join_non_blocking_until_worker_ready():
         assert release.wait(timeout=2.0)
 
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Standalone state-machine simulation, no engine.
         core_train_workers=["core0"],
         core_rollout_workers=["rollout0"],
         snapshot_fetcher=lambda *_args: 5,
@@ -286,6 +289,7 @@ def test_activation_barrier_keeps_join_non_blocking_until_worker_ready():
     pool.close()
 
 
+
 def test_complete_dp_replica_rejoins_non_blocking_and_activates_atomically():
     release = threading.Event()
 
@@ -295,6 +299,7 @@ def test_complete_dp_replica_rejoins_non_blocking_and_activates_atomically():
         return 23
 
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Standalone state-machine simulation, no engine.
         core_train_workers=["core0", "core1"],
         core_rollout_workers=["rollout0", "rollout1"],
         snapshot_fetcher=fetch,
@@ -324,6 +329,7 @@ def test_complete_dp_replica_rejoins_non_blocking_and_activates_atomically():
     pool.close()
 
 
+
 def test_dp_replica_join_failure_rolls_back_every_member():
     def fetch(worker_id, _target_core_id):
         if worker_id == "rollout1":
@@ -331,6 +337,7 @@ def test_dp_replica_join_failure_rolls_back_every_member():
         return 7
 
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Standalone state-machine simulation, no engine.
         core_train_workers=["core0"],
         core_rollout_workers=["rollout0", "rollout1"],
         snapshot_fetcher=fetch,
@@ -353,8 +360,10 @@ def test_dp_replica_join_failure_rolls_back_every_member():
     pool.close()
 
 
+
 def test_released_dp_replica_can_rejoin_with_a_new_generation():
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Standalone state-machine simulation, no engine.
         core_train_workers=["core0"],
         core_rollout_workers=["rollout0", "rollout1"],
         snapshot_fetcher=lambda *_args: 4,
@@ -376,6 +385,7 @@ def test_released_dp_replica_can_rejoin_with_a_new_generation():
     pool.close()
 
 
+
 def test_cancelled_join_cannot_become_active_after_grp_reversal():
     release = threading.Event()
 
@@ -384,6 +394,7 @@ def test_cancelled_join_cannot_become_active_after_grp_reversal():
         return 9
 
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Standalone state-machine simulation, no engine.
         core_train_workers=["core0"],
         core_rollout_workers=["rollout0"],
         snapshot_fetcher=fetch,
@@ -401,11 +412,13 @@ def test_cancelled_join_cannot_become_active_after_grp_reversal():
     pool.close()
 
 
+
 def test_failed_join_rolls_worker_back_to_rollout():
     def fetch(*_args):
         raise RuntimeError("snapshot unavailable")
 
     pool = ElasticHybridPool(
+        require_state_ack=False,  # Standalone state-machine simulation, no engine.
         core_train_workers=["core0"],
         core_rollout_workers=["rollout0"],
         snapshot_fetcher=fetch,
@@ -419,6 +432,7 @@ def test_failed_join_rolls_worker_back_to_rollout():
     assert worker.join_state == JoinState.FAILED
     assert worker.target_core_id is None
     pool.close()
+
 
 
 def test_required_isolated_domain_rejects_missing_elastic_group(monkeypatch):
@@ -489,3 +503,33 @@ def test_decoupled_domain_membership_changes_do_not_mutate_core_domain():
     ] == [1, 2, 3]
     assert domains.core_process_group == "fixed-megatron-dp"
     assert domains.hybrid_process_group == "elastic-side-channel"
+
+
+def test_unacknowledged_snapshot_never_activates():
+    pool = ElasticHybridPool(core_train_workers=['dp0'], hybrid_workers=['h'], snapshot_fetcher=lambda *_: 8)
+    try:
+        handle = pool.join_training('h', 'dp0', activation_barrier=lambda *_: None)
+        with pytest.raises(RuntimeError, match='ACK'):
+            handle.result(timeout=2)
+        assert pool.snapshot()['h'].role == ReplicaRole.HYBRID_ROLLOUT
+    finally:
+        pool.close()
+
+
+
+def test_actual_install_ack_can_catch_up_beyond_snapshot():
+    installed = threading.Event()
+    def activate(*_):
+        installed.wait(2)
+        return {'acknowledged': True, 'state_version': 11, 'optimizer_revision': 11}
+    pool = ElasticHybridPool(core_train_workers=['dp0'], hybrid_workers=['h'], snapshot_fetcher=lambda *_: 8)
+    try:
+        handle = pool.join_training('h', 'dp0', activation_barrier=activate)
+        time.sleep(.03)
+        assert not handle.done()
+        assert pool.gradient_domain.is_joining('h')
+        installed.set()
+        assert handle.result(timeout=2).state_version == 11
+    finally:
+        pool.close()
+

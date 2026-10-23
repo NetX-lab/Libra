@@ -34,7 +34,7 @@ def cuda_engine(monkeypatch):
     calls = []
     gradients = [DeviceGradient(calls), DeviceGradient(calls)]
     engine = MegatronCoreTrainEngine.__new__(MegatronCoreTrainEngine)
-    engine.rank, engine.current_version = 0, 1
+    engine.rank, engine.optimizer_revision = 0, 1
     engine._model_main_gradients = lambda: gradients
     engine.optimizer = SimpleNamespace(step=lambda: (calls.append('step') or (True, 0., 0)))
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
@@ -56,13 +56,13 @@ def test_first_cuda_hybrid_update_releases_after_copy_and_before_step(monkeypatc
     sources = (Source([1.25, 2.5]), Source([3., 4.]))
     engine.apply_elastic_gradient_update(sources, state_version=2)
     assert calls == ['copy', 'copy', 'enter', 'empty', 'exit', 'step']
-    assert engine.current_version == 2 and engine._hybrid_optimizer_cuda_cache_released
+    assert engine.optimizer_revision == 2 and engine._hybrid_optimizer_cuda_cache_released
     for gradient, source in zip(gradients, sources):
         assert torch.equal(gradient.tensor, source.tensor.bfloat16())
     assert not capsys.readouterr().out
     calls.clear()
     engine.apply_elastic_gradient_update(sources, state_version=3)
-    assert calls == ['copy', 'copy', 'step'] and engine.current_version == 3
+    assert calls == ['copy', 'copy', 'step'] and engine.optimizer_revision == 3
     assert not capsys.readouterr().out
 
 
@@ -77,11 +77,11 @@ def test_optimizer_exception_is_preserved_and_cache_release_can_retry(monkeypatc
     engine.optimizer.step = failed_step
     with pytest.raises(RuntimeError) as error:
         engine.apply_elastic_gradient_update((Source([1., 2.]), Source([3., 4.])), state_version=2)
-    assert error.value is failure and engine.current_version == 1
+    assert error.value is failure and engine.optimizer_revision == 1
     assert not getattr(engine, '_hybrid_optimizer_cuda_cache_released', False)
     engine.optimizer.step = lambda: (True, 0., 0)
     engine.apply_elastic_gradient_update((Source([1., 2.]), Source([3., 4.])), state_version=2)
-    assert calls.count('empty') == 2 and engine.current_version == 2
+    assert calls.count('empty') == 2 and engine.optimizer_revision == 2
 
 
 def test_rejected_optimizer_update_does_not_mark_cache_or_revision_complete(monkeypatch):
@@ -89,7 +89,7 @@ def test_rejected_optimizer_update_does_not_mark_cache_or_revision_complete(monk
     engine.optimizer.step = lambda: (False, 0., 0)
     with pytest.raises(FloatingPointError, match='rejected the update'):
         engine.apply_elastic_gradient_update((Source([1., 2.]), Source([3., 4.])), state_version=2)
-    assert calls.count('empty') == 1 and engine.current_version == 1
+    assert calls.count('empty') == 1 and engine.optimizer_revision == 1
     assert not getattr(engine, '_hybrid_optimizer_cuda_cache_released', False)
 
 
@@ -100,7 +100,7 @@ def test_cpu_gradients_keep_original_copy_dtype_and_optimizer_update(monkeypatch
     source = torch.tensor([1.25, -2.5], dtype=torch.float32)
     source_before = source.clone()
     weight = torch.tensor([10., 20.])
-    engine.current_version = 1
+    engine.optimizer_revision = 1
     engine._model_main_gradients = lambda: [gradient]
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: cuda_available)
     monkeypatch.setattr(torch.cuda, 'empty_cache', lambda: pytest.fail('CPU path released CUDA cache'))
@@ -114,7 +114,7 @@ def test_cpu_gradients_keep_original_copy_dtype_and_optimizer_update(monkeypatch
     assert torch.equal(source, source_before)
     assert torch.equal(gradient, source.bfloat16())
     assert torch.equal(weight, torch.tensor([10., 20.]) - source.bfloat16().float() * .1)
-    assert engine.current_version == 2
+    assert engine.optimizer_revision == 2
     assert not getattr(engine, '_hybrid_optimizer_cuda_cache_released', False)
 
 
@@ -122,4 +122,4 @@ def test_tensor_count_failure_happens_before_copy_or_cache_release(monkeypatch):
     engine, _gradients, calls = cuda_engine(monkeypatch)
     with pytest.raises(ValueError, match='tensor count mismatch'):
         engine.apply_elastic_gradient_update((Source([1., 2.]),), state_version=2)
-    assert calls == [] and engine.current_version == 1
+    assert calls == [] and engine.optimizer_revision == 1

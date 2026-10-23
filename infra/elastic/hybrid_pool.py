@@ -5,8 +5,8 @@ backend-neutral way:
 
 * the core TP/PP training topology stays fixed;
 * hybrid workers join/leave only in the inter-replica gradient domain;
-* joining workers first contribute zero-gradient placeholders, so core training
-  can keep stepping while their state is fetched and aligned;
+* joining workers contribute no samples until a state-installation ACK proves
+  that their parameters and optimizer are caught up;
 * gradient payloads are exchanged through a chunked RDMA-style data plane, with
   a torch.distributed implementation for CUDA/NCCL or CPU/Gloo tests.
 """
@@ -292,6 +292,7 @@ class InterReplicaGradientDomain:
         self._membership_epochs: dict[str, int] = {}
         self._joining: set[str] = set()
         self._membership_epoch = 0
+        self._consumed_payloads: set[tuple[str, int, int, int, int]] = set()
         self._lock = threading.RLock()
 
     @property
@@ -564,12 +565,15 @@ class InterReplicaGradientDomain:
             targets = dict(self._hybrid_targets)
             joining = set(self._joining)
             epochs = dict(self._membership_epochs)
+        seen = set()
         accepted = []
         for payload in hybrid_payloads:
             target = targets.get(payload.replica_id)
             if target not in effective or payload.replica_id in joining:
                 continue
             if payload.zero_placeholder:
+                if step >= 0:
+                    raise ValueError("active hybrid gradient cannot be a zero placeholder")
                 continue
             if target != payload.target_core_id:
                 raise ValueError(f"payload target mismatch for {payload.replica_id}")
@@ -577,6 +581,17 @@ class InterReplicaGradientDomain:
                 raise ValueError(f"payload replica world size mismatch for {payload.replica_id}")
             if payload.replica_rank != self.local_replica_rank:
                 continue
+            if (step >= 0 or weighted) and payload.membership_epoch != epochs.get(payload.replica_id, 0):
+                raise ValueError("stale hybrid membership epoch")
+            if step >= 0 and payload.step != step:
+                raise ValueError("stale hybrid training step")
+            if state_version >= 0 and payload.state_version != state_version:
+                raise ValueError("stale hybrid optimizer revision")
+            key = (payload.replica_id, payload.replica_rank, payload.step,
+                   payload.state_version, payload.membership_epoch)
+            if key in seen or (payload.step >= 0 and key in self._consumed_payloads):
+                raise ValueError("duplicate hybrid gradient payload")
+            seen.add(key)
             if len(payload.tensors) != len(effective[target]):
                 raise ValueError("hybrid payload tensor count mismatch")
             if any(a.shape != b.shape for a, b in zip(effective[target], payload.tensors)):
@@ -623,6 +638,11 @@ class InterReplicaGradientDomain:
                     base + extra.to(device=base.device, dtype=base.dtype) * scale
                     for base, extra in zip(effective[target], payload.tensors)
                 )
+        with self._lock:
+            self._consumed_payloads.update(k for k in seen if k[2] >= 0)
+            if step >= 0:
+                self._consumed_payloads = {k for k in self._consumed_payloads if k[2] >= step - 1}
+
         # In a real distributed launch each rank owns one core replica lane. The
         # transport call performs the RDMA/NCCL all-reduce. For local tests we
         # compute the same reduction explicitly across the in-memory core map.
@@ -704,6 +724,7 @@ class ElasticHybridPool:
         snapshot_fetcher: Callable[[str, str], int] | None = None,
         zero_sync_steps: int = 1,
         max_background_workers: int = 0,
+        require_state_ack: bool = True,
     ):
         if zero_sync_steps < 0:
             raise ValueError("zero_sync_steps cannot be negative")
@@ -711,6 +732,7 @@ class ElasticHybridPool:
         core_rollout_workers = tuple(core_rollout_workers)
         hybrid_workers = tuple(hybrid_workers)
         self.zero_sync_steps = zero_sync_steps
+        self.require_state_ack = bool(require_state_ack)
         self.snapshot_fetcher = snapshot_fetcher or self._default_snapshot_fetcher
         self.gradient_domain = gradient_domain or InterReplicaGradientDomain(
             core_replica_ids=core_train_workers
@@ -989,9 +1011,29 @@ class ElasticHybridPool:
         previous = getattr(self._activation_context, "join", None)
         self._activation_context.join = (identity, generation, replica, deadline)
         try:
-            callback(*args)
+            receipt = callback(*args)
+            deadline = self._activation_context.join[3]
+            check = self._assert_replica_join_current if replica else self._assert_join_current
+            check(identity, generation, deadline)
+            if self.require_state_ack:
+                if not isinstance(receipt, Mapping) or receipt.get("acknowledged") is not True:
+                    raise RuntimeError("Hybrid activation requires an actual state installation ACK")
+                if int(receipt.get("state_version", -1)) < int(args[-1]):
+                    raise RuntimeError("Hybrid activation ACK is older than the fetched state")
+                if int(receipt.get("optimizer_revision", -1)) != int(receipt["state_version"]):
+                    raise RuntimeError("Hybrid activation optimizer revision ACK mismatch")
+            return receipt, deadline
         finally:
             self._activation_context.join = previous
+
+    def handoff_activation_to_boundary(self) -> None:
+        """Release the cold deadline once the runtime takes over activation.
+
+        Called under activation_guard so the cold deadline and generation are
+        checked before the request enters the boundary queue.
+        """
+        identity, generation, replica, _ = self._activation_context.join
+        self._activation_context.join = (identity, generation, replica, None)
 
     @contextmanager
     def activation_guard(self, handle=None):
@@ -1024,7 +1066,7 @@ class ElasticHybridPool:
     ) -> ElasticWorker:
         deadline = (
             time.monotonic() + max(float(timeout_s), 0.0)
-            if timeout_s is not None
+            if timeout_s is not None and float(timeout_s) > 0
             else None
         )
         try:
@@ -1050,10 +1092,12 @@ class ElasticHybridPool:
                     state_version=version,
                 )
 
-            for _ in range(self.zero_sync_steps):
-                time.sleep(0)
+            # State installation is acknowledged by the activation callback;
+            # yielding the host thread does not synchronize optimizer updates.
 
             self._assert_join_current(worker_id, generation, deadline)
+            if activation_barrier is None and self.require_state_ack:
+                raise RuntimeError("Hybrid activation requires a state installation barrier")
             if activation_barrier is not None:
                 with self._lock:
                     self._assert_join_current(worker_id, generation, deadline)
@@ -1065,10 +1109,12 @@ class ElasticHybridPool:
                         state_version=version,
                         transition_generation=generation,
                     )
-                self._invoke_activation(
+                receipt, deadline = self._invoke_activation(
                     activation_barrier, (worker_id, target_core_id, version),
                     identity=worker_id, generation=generation, replica=False, deadline=deadline,
                 )
+                if isinstance(receipt, Mapping):
+                    version = int(receipt["state_version"])
                 self._assert_join_current(worker_id, generation, deadline)
 
             with self._lock:
@@ -1125,7 +1171,7 @@ class ElasticHybridPool:
     ) -> tuple[ElasticWorker, ...]:
         deadline = (
             time.monotonic() + max(float(timeout_s), 0.0)
-            if timeout_s is not None
+            if timeout_s is not None and float(timeout_s) > 0
             else None
         )
         try:
@@ -1157,10 +1203,12 @@ class ElasticHybridPool:
                         join_state=JoinState.ZERO_SYNC,
                         state_version=version,
                     )
-            for _ in range(self.zero_sync_steps):
-                time.sleep(0)
+            # State installation is acknowledged by the activation callback;
+            # yielding the host thread does not synchronize optimizer updates.
 
             self._assert_replica_join_current(replica_id, generation, deadline)
+            if replica_activation_barrier is None and activation_barrier is None and self.require_state_ack:
+                raise RuntimeError("Hybrid activation requires a state installation barrier")
             if replica_activation_barrier is not None:
                 with self._lock:
                     self._assert_replica_join_current(replica_id, generation, deadline)
@@ -1172,10 +1220,12 @@ class ElasticHybridPool:
                             state_version=version,
                             transition_generation=generation,
                         )
-                self._invoke_activation(
+                receipt, deadline = self._invoke_activation(
                     replica_activation_barrier, (replica_id, members, target_core_id, version),
                     identity=replica_id, generation=generation, replica=True, deadline=deadline,
                 )
+                if isinstance(receipt, Mapping):
+                    version = int(receipt["state_version"])
                 self._assert_replica_join_current(replica_id, generation, deadline)
             elif activation_barrier is not None:
                 with self._lock:
@@ -1188,12 +1238,19 @@ class ElasticHybridPool:
                             state_version=version,
                             transition_generation=generation,
                         )
+                installed_versions = []
                 for worker_id in members:
-                    self._invoke_activation(
+                    receipt, deadline = self._invoke_activation(
                         activation_barrier, (worker_id, target_core_id, version),
                         identity=replica_id, generation=generation, replica=True, deadline=deadline,
                     )
+                    if isinstance(receipt, Mapping):
+                        installed_versions.append(int(receipt["state_version"]))
                     self._assert_replica_join_current(replica_id, generation, deadline)
+                if installed_versions:
+                    if len(set(installed_versions)) != 1:
+                        raise RuntimeError("Hybrid replica members acknowledged different optimizer revisions")
+                    version = installed_versions[0]
 
             with self._lock:
                 self._assert_replica_join_current(replica_id, generation, deadline)
