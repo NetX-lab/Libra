@@ -14,6 +14,7 @@ import json
 import os
 import re
 import signal
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -35,6 +36,36 @@ def _write_json(path: Path, payload: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     tmp.replace(path)
+
+
+def _remote_stop_code(pid):
+    """Terminate the owned session and verify no live worker descendants remain."""
+    return f"""import os, signal, time
+pid = {int(pid)}
+def live():
+    result = []
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit():
+            continue
+        try:
+            fields = open('/proc/' + entry + '/stat').read().rsplit(')', 1)[1].split()
+            if (int(fields[2]) == pid or int(entry) == pid) and fields[0] != 'Z':
+                result.append(int(entry))
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            pass
+    return result
+for sig in (signal.SIGTERM, signal.SIGKILL):
+    for owned in live():
+        try: os.kill(owned, sig)
+        except ProcessLookupError: pass
+    deadline = time.monotonic() + 10
+    while live() and time.monotonic() < deadline:
+        time.sleep(.1)
+    if not live():
+        break
+if live():
+    raise RuntimeError('owned worker session still alive')
+"""
 
 
 class Controller:
@@ -76,7 +107,7 @@ class Controller:
                 command = str(request["command"])
                 log_path = self.task_dir / f"{worker_id}.controller.log"
                 remote_command = (
-                    f"nohup {command} >{log_path} 2>&1 & echo $!"
+                    f"nohup setsid sh -c {shlex.quote(command)} >{shlex.quote(str(log_path))} 2>&1 & echo $!"
                 )
                 env = os.environ.copy()
                 env.setdefault("INTERNAL_SSH_TIMEOUT", "30")
@@ -108,21 +139,44 @@ class Controller:
         handled = False
         for request_path in sorted(self.task_dir.glob(".stop_*.json")):
             worker_id = request_path.stem[len(".stop_") :]
-            request_path.unlink(missing_ok=True)
-            handled = True
-            record = self.remote_pids.pop(worker_id, None)
-            if record is None:
+            running = request_path.with_suffix(".running")
+            try:
+                request_path.replace(running)
+            except FileNotFoundError:
                 continue
-            host, pid = record
-            helper = str(Path(self.args.project_dir) / "scripts" / "internal_ssh.sh")
-            subprocess.run(
-                [helper, host, "--", f"kill {int(pid)} 2>/dev/null || true"],
-                env=os.environ.copy(),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=30,
-                check=False,
-            )
+            handled = True
+            request = _read_json(running)
+            request_id = request.get("request_id")
+            try:
+                # Withdraw launches that the controller has not claimed.
+                (self.task_dir / f".launch_{worker_id}.json").unlink(missing_ok=True)
+                record = self.remote_pids.get(worker_id)
+                if record is None:
+                    started = self.task_dir / f".launch_{worker_id}.started"
+                    if started.exists():
+                        raise RuntimeError("controller lost process ownership; refusing a stale PID")
+                host, pid = record if record is not None else (str(request.get("host", "")), -1)
+                if pid > 0:
+                    helper = str(Path(self.args.project_dir) / "scripts" / "internal_ssh.sh")
+                    code = _remote_stop_code(pid)
+                    proc = subprocess.run(
+                        [helper, host, "--", "python3 -c " + shlex.quote(code)],
+                        env=os.environ.copy(), capture_output=True, text=True,
+                        timeout=45, check=False,
+                    )
+                    if proc.returncode != 0:
+                        raise RuntimeError(f"remote worker did not exit rc={proc.returncode}: {proc.stderr[-500:]}")
+                self.remote_pids.pop(worker_id, None)
+                _write_json(self.task_dir / f".stop_{worker_id}.done", {
+                    "worker_id": worker_id, "host": host, "pid": pid,
+                    "request_id": request_id, "exited": True, "finished_at": time.time(),
+                })
+            except Exception as exc:
+                _write_json(self.task_dir / f".stop_{worker_id}.error", {
+                    "worker_id": worker_id, "request_id": request_id, "error": str(exc),
+                })
+            finally:
+                running.unlink(missing_ok=True)
         return handled
 
     def _stop_all_workers(self) -> None:

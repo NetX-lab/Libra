@@ -25,4 +25,41 @@ python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_rollout_engine.py \
   tests/test_cpu_offload_backend.py \
   tests/test_r2e_patch_harness.py \
-  tests/test_r2e_gym_workflow.py
+  tests/test_r2e_gym_workflow.py \
+  tests/test_optimizer_state.py \
+  tests/test_elastic_optimizer_state.py \
+  tests/test_ehp_dp_resharding.py \
+  tests/test_ehp_batch_partition.py \
+  tests/test_fixed_batch_gradients.py \
+  tests/test_grpo_sample_mean.py \
+  tests/test_hybrid_sample_statistics_data.py \
+  tests/test_elastic_gradient_idle_path.py \
+  tests/test_hybrid_optimizer_cuda_cache.py \
+  tests/test_torch_optimizer_memory.py \
+  tests/test_megatron_core_train_engine.py \
+  tests/test_hybrid_worker_batch_protocol.py \
+  tests/test_core_reconfiguration_protocol.py \
+  tests/test_core_subset_publication.py \
+  tests/test_ehp_membership_release.py \
+  tests/test_ehp_readiness_stop.py \
+  tests/test_hybrid_join_readiness_budget.py \
+  tests/test_hybrid_boundary_activation.py \
+  tests/test_hybrid_sample_statistics.py \
+  tests/test_hybrid_task_lifecycle.py \
+  tests/test_elastic_hybrid_pool.py \
+  tests/test_grp_decision_gates.py \
+  tests/test_rollout_lending.py \
+  tests/test_rollout_lifecycle.py \
+  tests/test_rollout_process.py \
+  tests/test_rollout_supply.py \
+  tests/test_runtime_boundary_integration.py \
+  tests/test_runtime_core_capabilities.py \
+  tests/test_runtime_elastic_executor.py \
+  tests/test_runtime_blue_green_gpu_ownership.py \
+  tests/test_runtime_repartition_eligibility.py \
+  tests/test_runtime_executor_shutdown.py \
+  tests/test_runtime_rollout_ownership.py \
+  tests/test_runtime_failed_snapshot_cleanup.py \
+  tests/test_scheduling_audit.py \
+  tests/test_publication_preserves_hybrids.py \
+  tests/test_grpo_grouping.py

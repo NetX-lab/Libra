@@ -1,4 +1,6 @@
 from types import SimpleNamespace
+import sys
+import weakref
 
 import pytest
 import torch
@@ -8,7 +10,7 @@ from RL_Framework.engine.megatron_core_train_engine import (
 )
 
 
-def test_merge_stats_uses_update_weighted_averages():
+def test_merge_stats_weights_losses_by_samples_and_grad_norm_by_updates():
     merged = MegatronCoreTrainEngine._merge_stats(
         [
             {
@@ -32,9 +34,9 @@ def test_merge_stats_uses_update_weighted_averages():
         ]
     )
 
-    assert merged["loss"] == pytest.approx(2.5)
-    assert merged["pg_loss"] == pytest.approx(3.5)
-    assert merged["kl"] == pytest.approx(0.25)
+    assert merged["loss"] == pytest.approx(2.0)
+    assert merged["pg_loss"] == pytest.approx(3.0)
+    assert merged["kl"] == pytest.approx(0.2)
     assert merged["grad_norm"] == pytest.approx(4.5)
     assert merged["reward_mean"] == pytest.approx(1.5)
 
@@ -148,3 +150,85 @@ def test_initialize_elastic_domain_creates_distinct_local_synchronized_group(
         }
     ]
     assert engine._elastic_gradient_group_ranks == (0, 8, 16, 24)
+
+
+def test_recompute_releases_logits_before_next_forward_and_preserves_logprobs(monkeypatch):
+    engine = MegatronCoreTrainEngine.__new__(MegatronCoreTrainEngine)
+    engine.train_tp_size = 1
+    weights = torch.arange(49, dtype=torch.float32).reshape(7, 7) / 10
+    rows = [dict(input_ids=torch.tensor([[0, 2, 3, 1]]), logprobs=torch.zeros(1, 4)),
+        dict(input_ids=torch.tensor([[4, 1, 5, 6]]), logprobs=torch.zeros(1, 4))]
+    outputs, modes = [], []
+    def forward(batch):
+        assert all(output() is None for output in outputs)
+        logits = weights[batch['input_ids']]
+        outputs.append(weakref.ref(logits))
+        return logits
+    monkeypatch.setattr(engine, '_forward', forward)
+    monkeypatch.setattr(engine, '_set_train_mode', modes.append)
+    monkeypatch.setattr(engine, '_iter_recompute_micro_batches',
+        lambda trajectories: (dict(input_ids=row['input_ids'], trajectories=[row]) for row in trajectories))
+    engine.recompute_logprobs(rows)
+    assert all(output() is None for output in outputs)
+    assert modes == [False, True]
+    for row in rows:
+        expected = torch.log_softmax(weights[row['input_ids']][:, :-1], dim=-1)
+        expected = expected.gather(-1, row['input_ids'][:, 1:, None]).squeeze(-1)
+        torch.testing.assert_close(row['logprobs'][:, 1:], expected)
+        assert row['logprobs'][0, 0] == 0
+
+
+
+def test_grpo_releases_backward_outputs_before_next_microbatch_and_optimizer(monkeypatch):
+    monkeypatch.setitem(sys.modules, 'megatron.core.distributed',
+        SimpleNamespace(finalize_model_grads=lambda _: None))
+    engine = MegatronCoreTrainEngine.__new__(MegatronCoreTrainEngine)
+    engine.train_tp_size = 1
+    engine.clip_epsilon, engine.kl_coef = .2, .1
+    engine.current_version, engine.optimizer_revision = 3, 0
+    initial = torch.arange(49, dtype=torch.float32).reshape(7, 7) / 10
+    parameter = torch.nn.Parameter(initial.clone())
+    reference = torch.nn.Parameter(initial.clone())
+    optimizer = torch.optim.SGD([parameter], lr=.01)
+    reference_optimizer = torch.optim.SGD([reference], lr=.01)
+    rows = [dict(input_ids=torch.tensor([[0, 2, 3, 1]])),
+        dict(input_ids=torch.tensor([[4, 1, 5, 6]]))]
+    def batches(trajectories):
+        for row in trajectories:
+            yield dict(input_ids=row['input_ids'], old_logprobs=torch.full((1, 4), -2.),
+                loss_mask=torch.tensor([[0., 1., 1., 1.]]), advantages=torch.tensor([.7]),
+                rewards=torch.tensor([1.]), trajectories=[row])
+    references = []
+    def forward(batch):
+        assert all(output() is None for output in references)
+        logits = parameter[batch['input_ids']]
+        references.append(weakref.ref(logits))
+        return logits
+    gradients = []
+    def step():
+        assert all(output() is None for output in references)
+        gradients.append(parameter.grad.clone())
+        optimizer.step()
+        return True, parameter.grad.norm(), 0
+    def scale_loss(value):
+        assert all(output() is None for output in references)
+        return value
+    engine.model = []
+    engine.optimizer = SimpleNamespace(scale_loss=scale_loss, step=step)
+    monkeypatch.setattr(engine, '_iter_micro_batches', batches)
+    monkeypatch.setattr(engine, '_forward', forward)
+    monkeypatch.setattr(engine, '_zero_grad', lambda: optimizer.zero_grad(set_to_none=True))
+    monkeypatch.setattr(engine, '_elastic_core_loss_scale', lambda: 1.)
+    monkeypatch.setattr(engine, '_apply_elastic_inter_replica_gradients', lambda: None)
+    monkeypatch.setattr(engine, '_reduce_stats', lambda stats: stats)
+    engine.grpo_update(rows, ppo_epochs=2)
+    for gradient in gradients:
+        reference_optimizer.zero_grad(set_to_none=True)
+        for batch in batches(rows):
+            loss, _ = engine._loss(batch, reference[batch['input_ids']])
+            (loss / len(rows)).backward()
+        torch.testing.assert_close(gradient, reference.grad)
+        reference_optimizer.step()
+    torch.testing.assert_close(parameter, reference)
+    assert engine.optimizer_revision == 2
+    assert all(output() is None for output in references)
