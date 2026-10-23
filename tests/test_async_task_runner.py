@@ -1,5 +1,9 @@
 import asyncio
+from contextlib import contextmanager
+import queue
 import threading
+
+import pytest
 
 from RL_Framework.infra.execution.async_runner import AsyncTaskRunner
 
@@ -108,8 +112,9 @@ def test_cancel_queued_tasks_never_starts_them_after_pause():
     runner = AsyncTaskRunner()
     runner.initialize()
     try:
-        runner.pause()
-        runner.submit(mark_started, task_id=10)
+        with _hold_event_loop(runner):
+            runner.submit(mark_started, task_id=10)
+            runner.pause()
 
         cancelled = runner.cancel_queued()
 
@@ -117,5 +122,51 @@ def test_cancel_queued_tasks_never_starts_them_after_pause():
         assert not started.wait(0.1)
         assert runner.get_queue_sizes() == (0, 0)
         runner.wait_until_idle(timeout=1.0)
+    finally:
+        runner.destroy()
+
+
+@contextmanager
+def _hold_event_loop(runner):
+    entered, release = threading.Event(), threading.Event()
+
+    def block():
+        entered.set()
+        release.wait(5.)
+
+    runner._loop.call_soon_threadsafe(block)
+    assert entered.wait(1.)
+    try:
+        yield
+    finally:
+        release.set()
+
+
+
+def test_explicit_drain_runs_inputs_accepted_before_pause():
+    runner = AsyncTaskRunner()
+    runner.initialize()
+    try:
+        # Freeze the real event loop before submission so these inputs are
+        # accepted but deterministically have not started when pause occurs.
+        with _hold_event_loop(runner):
+            runner.submit(_return_value, 'first', task_id=7)
+            runner.submit(_return_value, 'second', task_id=8)
+            runner.pause()
+            with pytest.raises(queue.Full, match='paused'):
+                runner.submit(_return_value, 'rejected', task_id=9)
+            assert runner.input_queue.qsize() == 2
+            assert runner._active_task_ids == {7, 8}
+
+        runner.wait_until_idle(timeout=1.)
+        assert {row.data for row in runner.wait(count=2, timeout=1.)} == {'first', 'second'}
+        assert runner.paused.is_set()
+        assert not runner._draining.is_set()
+        assert not runner._active_task_ids and runner.input_queue.empty()
+        with pytest.raises(queue.Full, match='paused'):
+            runner.submit(_return_value, 'still rejected', task_id=9)
+        runner.resume()
+        runner.submit(_return_value, 'after resume', task_id=9)
+        assert runner.wait(count=1, timeout=1.)[0].data == 'after resume'
     finally:
         runner.destroy()

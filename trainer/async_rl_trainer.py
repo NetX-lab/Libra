@@ -569,7 +569,11 @@ class AsyncRLTrainer:
                     return selected
                 continue
             if self.staleness_manager is not None:
-                self.staleness_manager.on_batch_consumed(len(raw_batch))
+                accepted_count = sum(
+                    isinstance(trajectory, dict) and trajectory.get("status") != "failed"
+                    for trajectory in raw_batch
+                )
+                self.staleness_manager.on_batch_consumed(accepted_count)
             for trajectory in raw_batch:
                 if trajectory.get("status") == "failed":
                     continue
@@ -951,7 +955,7 @@ class AsyncRLTrainer:
 
             weight_sync_time = 0.0
             rollout_sync_drain = None
-            if self.config.sync_interval > 0 and step > 0 and step % self.config.sync_interval == 0:
+            if self.config.sync_interval > 0 and (step + 1) % self.config.sync_interval == 0:
                 self._trace_train_phase(step, "weight_sync_start")
                 if self.dispatcher is not None:
                     drain_started = time.time()
@@ -1115,7 +1119,7 @@ class AsyncRLTrainer:
         if interval <= 0 or lead_steps <= 0:
             return None
         remainder = step % interval
-        steps_until_sync = 0 if step > 0 and remainder == 0 else interval - remainder
+        steps_until_sync = interval - remainder
         if steps_until_sync > lead_steps:
             return None
         prefetch_batches = max(1, steps_until_sync)
@@ -1319,8 +1323,6 @@ class AsyncRLTrainer:
         if not control_dir_value:
             raise ValueError("NCCL weight synchronization requires rollout_weight_sync_control_dir")
         control_dir = Path(control_dir_value).resolve()
-        if self.is_main_process:
-            control_dir.mkdir(parents=True, exist_ok=True)
 
         import socket
 
@@ -1351,30 +1353,47 @@ class AsyncRLTrainer:
             ),
             "created_at": time.time(),
         }
+        preparation_error = None
         if self.is_main_process:
-            for instance_id in offsets:
-                (control_dir / f"ack_{instance_id}_{target_version}.json").unlink(
-                    missing_ok=True
+            try:
+                from RL_Framework.infra.sync.publication_session import prepare_nccl_session
+
+                request.update(
+                    prepare_nccl_session(self, offsets),
+                    snapshot_id=uuid.uuid4().hex,
+                    optimizer_revision=int(self.train_engine.optimizer_revision),
                 )
-                (control_dir / f"error_{instance_id}_{target_version}.json").unlink(
-                    missing_ok=True
-                )
-            self._write_json_atomic(control_dir / "reload_request.json", request)
+                control_dir.mkdir(parents=True, exist_ok=True)
+                for instance_id in offsets:
+                    (control_dir / f"ack_{instance_id}_{target_version}.json").unlink(
+                        missing_ok=True
+                    )
+                    (control_dir / f"error_{instance_id}_{target_version}.json").unlink(
+                        missing_ok=True
+                    )
+                self._write_json_atomic(control_dir / "reload_request.json", request)
+            except Exception as exc:
+                preparation_error = f"{type(exc).__name__}: {exc}"
+        preparation = [preparation_error]
+        if dist.is_initialized():
+            dist.broadcast_object_list(preparation, src=0, group=getattr(self, "control", None))
+        if preparation[0]:
+            raise RuntimeError(f"Rollout publication preparation failed: {preparation[0]}")
 
         from RL_Framework.infra.sync.nccl_weight_sync import (
             NcclReloadSpec,
             send_weights,
         )
 
-        weights = self.train_engine.stream_rollout_weights()
         started = time.perf_counter()
         transferred_bytes = 0
         transport_keepalive: list[object] = []
-        if self.is_main_process:
-            def record_tensor(_name: str, size_bytes: int) -> None:
-                nonlocal transferred_bytes
-                transferred_bytes += size_bytes
 
+        def record_tensor(_name: str, size_bytes: int) -> None:
+            nonlocal transferred_bytes
+            transferred_bytes += size_bytes
+
+        def send_export(weights):
             send_weights(
                 weights,
                 NcclReloadSpec(
@@ -1387,6 +1406,7 @@ class AsyncRLTrainer:
                         getattr(self.config, "rollout_weight_sync_timeout_s", 1200.0)
                     ),
                     chunk_bytes=request["nccl_chunk_bytes"],
+                    session_id=request["nccl_session_id"],
                     rate_limit_gbps=float(
                         getattr(self.config, "rollout_nccl_rate_limit_gbps", 0.0)
                     ),
@@ -1394,55 +1414,67 @@ class AsyncRLTrainer:
                 on_tensor=record_tensor,
                 keepalive=transport_keepalive,
             )
-        else:
-            # The export itself contains Megatron TP/EP collectives.
-            for _name, tensor in weights:
-                del tensor
 
+        from RL_Framework.infra.sync.collective_export import stream_export_with_consensus
+        stream_export_with_consensus(
+            self.train_engine.stream_rollout_weights,
+            is_sender=self.is_main_process, send=send_export,
+            group=getattr(self, "control", None),
+        )
+
+        failure = None
         if self.is_main_process:
-            timeout = float(getattr(self.config, "rollout_weight_sync_timeout_s", 1200.0))
-            deadline = time.monotonic() + timeout
-            pending = set(offsets)
-            while pending and time.monotonic() < deadline:
-                failures = {
-                    instance_id: (control_dir / f"error_{instance_id}_{target_version}.json").read_text(
-                        encoding="utf-8"
-                    )
-                    for instance_id in pending
-                    if (control_dir / f"error_{instance_id}_{target_version}.json").exists()
-                }
-                if failures:
-                    raise RuntimeError(f"vLLM NCCL reload failed: {failures}")
-                pending = {
-                    instance_id
-                    for instance_id in pending
-                    if not (control_dir / f"ack_{instance_id}_{target_version}.json").exists()
-                }
-                if pending:
-                    time.sleep(
-                        float(
-                            getattr(
-                                self.config,
-                                "rollout_weight_sync_poll_interval_s",
-                                0.05,
+            try:
+                timeout = float(getattr(self.config, "rollout_weight_sync_timeout_s", 1200.0))
+                deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
+                pending = set(offsets)
+                while pending and time.monotonic() < deadline:
+                    failures = {
+                        instance_id: (control_dir / f"error_{instance_id}_{target_version}.json").read_text(
+                            encoding="utf-8"
+                        )
+                        for instance_id in pending
+                        if (control_dir / f"error_{instance_id}_{target_version}.json").exists()
+                    }
+                    if failures:
+                        raise RuntimeError(f"vLLM NCCL reload failed: {failures}")
+                    pending = {
+                        instance_id
+                        for instance_id in pending
+                        if not (control_dir / f"ack_{instance_id}_{target_version}.json").exists()
+                    }
+                    if pending:
+                        time.sleep(
+                            float(
+                                getattr(
+                                    self.config,
+                                    "rollout_weight_sync_poll_interval_s",
+                                    0.05,
+                                )
                             )
                         )
-                    )
-            if pending:
-                raise TimeoutError(f"Timed out waiting for NCCL reload: {sorted(pending)}")
-            self._record_rollout_weight_version(
-                target_version=target_version,
-                checkpoint_path="",
-                instance_ids=list(offsets),
-            )
-            print(
-                f"Direct NCCL rollout refresh complete: version={target_version}, "
-                f"world_size={world_size}, model_bytes={transferred_bytes}, "
-                f"fanout_bytes={transferred_bytes * (world_size - 1)}, "
-                f"seconds={time.perf_counter() - started:.3f}",
-                flush=True,
-            )
-            transport_keepalive.clear()
+                if pending:
+                    raise TimeoutError(f"Timed out waiting for NCCL reload: {sorted(pending)}")
+                self._record_rollout_weight_version(
+                    target_version=target_version,
+                    checkpoint_path="",
+                    instance_ids=list(offsets),
+                )
+                print(
+                    f"Direct NCCL rollout refresh complete: version={target_version}, "
+                    f"world_size={world_size}, model_bytes={transferred_bytes}, "
+                    f"fanout_bytes={transferred_bytes * (world_size - 1)}, "
+                    f"seconds={time.perf_counter() - started:.3f}",
+                    flush=True,
+                )
+                transport_keepalive.clear()
+            except Exception as exc:
+                failure = f"{type(exc).__name__}: {exc}"
+        outcome = [failure]
+        if dist.is_initialized():
+            dist.broadcast_object_list(outcome, src=0, group=getattr(self, "control", None))
+        if outcome[0]:
+            raise RuntimeError(f"Rollout publication failed: {outcome[0]}")
         if dist.is_initialized():
             dist.barrier()
         self._record_weight_sync_phase("sync_complete")

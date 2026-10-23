@@ -147,16 +147,17 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
 
                 with self._reconfigure_lock:
-                    # pause() can race the small window between dequeue and
-                    # submit. Recheck under the same lock used by
-                    # cancel_queued() so an unsent request never crosses the
-                    # weight-sync boundary.
-                    if self.runner.paused.is_set():
-                        self.staleness_manager.on_rollouts_cancelled(enqueued=1)
-                        with self._result_cv:
-                            self._active_task_ids.discard(task_input.task_id)
-                            self._result_cv.notify_all()
-                        continue
+                    # Keep the selected task owned by the pending queue until
+                    # commit, so cancel_queued() can still return its identity
+                    # if pause wins the race for this lock.
+                    with self._input_cv:
+                        if (
+                            not self._pending_inputs
+                            or self._pending_inputs[0] is not task_input
+                            or self.runner.paused.is_set()
+                        ):
+                            continue
+                        self._pending_inputs.popleft()
                     task_fn = self.task_factory(task_input)
 
                     try:
@@ -191,7 +192,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 break
 
     def _get_next_task_for_submission(self) -> TInput | None:
-        """Get next task for submission."""
+        """Wait for a candidate, retaining queue ownership until commit."""
         with self._input_cv:
             while not self._shutdown_event.is_set():
                 self._check_thread_exception()
@@ -202,7 +203,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                     and self.staleness_manager.get_capacity() > 0
                     and self._pending_inputs
                 ):
-                    return self._pending_inputs.popleft()
+                    return self._pending_inputs[0]
 
 
                 self._input_cv.wait(timeout=0.5)

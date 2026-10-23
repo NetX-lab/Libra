@@ -104,6 +104,7 @@ class MegatronCoreTrainEngine:
         self.world_size = int(os.getenv("WORLD_SIZE", "1"))
         self.is_main_process = self.rank == 0
         self.current_version = 0
+        self.optimizer_revision = 0
 
         self.bridge = None
         self.provider = None
@@ -533,6 +534,7 @@ class MegatronCoreTrainEngine:
             update_successful, grad_norm, _ = self.optimizer.step()
             if not update_successful:
                 raise FloatingPointError("Megatron optimizer rejected the update")
+            self.optimizer_revision += 1
             merged = self._merge_stats(local_stats)
             if isinstance(grad_norm, torch.Tensor):
                 merged["grad_norm"] = float(grad_norm.detach().item())

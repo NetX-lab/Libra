@@ -36,6 +36,8 @@ class AsyncTaskRunner(Generic[T]):
 
         self.exiting = threading.Event()
         self.paused = threading.Event()
+        self._draining = threading.Event()
+        self._admission_lock = threading.Lock()
 
 
         self.input_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
@@ -62,6 +64,7 @@ class AsyncTaskRunner(Generic[T]):
         """Initialize."""
         self.exiting.clear()
         self.paused.clear()
+        self._draining.clear()
         self._loop_ready = threading.Event()
 
         self.thread = threading.Thread(
@@ -183,11 +186,9 @@ class AsyncTaskRunner(Generic[T]):
 
         try:
             while not exit_event.is_set():
-                # Pausing blocks new dispatcher submissions. Tasks already
-                # accepted by this runner must still be started and reaped so
-                # callers can drain the rollout pipeline before restarting
-                # serving processes for a weight update.
-                if not pause_event.is_set():
+                # Explicit drain starts accepted inputs. Ordinary pause keeps
+                # them available for cancel_queued().
+                if not pause_event.is_set() or self._draining.is_set():
                     self._drain_pending_inputs(running_tasks, input_queue)
 
 
@@ -316,33 +317,33 @@ class AsyncTaskRunner(Generic[T]):
     ) -> int:
         """Submit."""
 
-        with self._thread_exception_lock:
-            if self._thread_exception is not None:
-                raise RuntimeError(f"AsyncTaskRunner is unusable: {self._thread_exception}")
+        with self._admission_lock:
+            if self.paused.is_set():
+                raise queue.Full("runner admission is paused")
+            with self._thread_exception_lock:
+                if self._thread_exception is not None:
+                    raise RuntimeError(f"AsyncTaskRunner is unusable: {self._thread_exception}")
 
-
-        with self._active_task_ids_lock:
-            if task_id in self._active_task_ids:
-                raise ValueError(f"duplicate task ID: {task_id}")
-            self._active_task_ids.add(task_id)
-
-
-        fn_kwargs = {k: v for k, v in kwargs.items() if k != 'task_id'}
-
-        task_input = {
-            "async_fn": async_fn,
-            "args": args,
-            "kwargs": fn_kwargs,
-            "task_id": task_id,
-            "create_time": time.monotonic_ns(),
-        }
-
-        try:
-            self.input_queue.put_nowait(task_input)
-        except queue.Full:
             with self._active_task_ids_lock:
-                self._active_task_ids.discard(task_id)
-            raise queue.Full("input queue is full")
+                if task_id in self._active_task_ids:
+                    raise ValueError(f"duplicate task ID: {task_id}")
+                self._active_task_ids.add(task_id)
+
+            fn_kwargs = {k: v for k, v in kwargs.items() if k != 'task_id'}
+            task_input = {
+                "async_fn": async_fn,
+                "args": args,
+                "kwargs": fn_kwargs,
+                "task_id": task_id,
+                "create_time": time.monotonic_ns(),
+            }
+
+            try:
+                self.input_queue.put_nowait(task_input)
+            except queue.Full:
+                with self._active_task_ids_lock:
+                    self._active_task_ids.discard(task_id)
+                raise queue.Full("input queue is full")
 
         self._signal_new_input()
         return task_id
@@ -387,11 +388,13 @@ class AsyncTaskRunner(Generic[T]):
 
     def pause(self):
         """Pause."""
-        self.paused.set()
+        with self._admission_lock:
+            self.paused.set()
 
     def resume(self):
         """Resume."""
-        self.paused.clear()
+        with self._admission_lock:
+            self.paused.clear()
         self._signal_new_input()
 
     def cancel_queued(self, timeout: float = 2.0) -> list[int]:
@@ -426,22 +429,27 @@ class AsyncTaskRunner(Generic[T]):
     def wait_until_idle(self, timeout: float = 3600.0) -> None:
         """Wait until every task accepted before pause has completed."""
         deadline = time.monotonic() + timeout
-        while True:
-            with self._thread_exception_lock:
-                if self._thread_exception is not None:
-                    raise RuntimeError(
-                        f"AsyncTaskRunner error: {self._thread_exception}"
+        self._draining.set()
+        self._signal_new_input()
+        try:
+            while True:
+                with self._thread_exception_lock:
+                    if self._thread_exception is not None:
+                        raise RuntimeError(
+                            f"AsyncTaskRunner error: {self._thread_exception}"
+                        )
+                with self._active_task_ids_lock:
+                    active_count = len(self._active_task_ids)
+                if active_count == 0 and self.input_queue.empty():
+                    return
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "Timed out draining rollout tasks before weight reload: "
+                        f"active={active_count}, queued={self.input_queue.qsize()}"
                     )
-            with self._active_task_ids_lock:
-                active_count = len(self._active_task_ids)
-            if active_count == 0 and self.input_queue.empty():
-                return
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    "Timed out draining rollout tasks before weight reload: "
-                    f"active={active_count}, queued={self.input_queue.qsize()}"
-                )
-            time.sleep(0.05)
+                time.sleep(0.05)
+        finally:
+            self._draining.clear()
 
     def get_queue_sizes(self) -> tuple[int, int]:
         """Get queue sizes."""

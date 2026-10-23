@@ -71,7 +71,7 @@ def test_sync_drain_prefetch_limit_uses_two_then_one_batch():
     assert trainer._sync_aware_rollout_limit(step=2, batch_size=4) is None
     assert trainer._sync_aware_rollout_limit(step=3, batch_size=4) == 8
     assert trainer._sync_aware_rollout_limit(step=4, batch_size=4) == 4
-    assert trainer._sync_aware_rollout_limit(step=5, batch_size=4) == 4
+    assert trainer._sync_aware_rollout_limit(step=5, batch_size=4) is None
     assert trainer._sync_aware_rollout_limit(step=6, batch_size=4) is None
 
 
@@ -86,6 +86,9 @@ def test_dispatcher_rechecks_pause_after_dequeue_before_submit():
 
         def submit(self, _fn, *, task_id):
             self.submitted.append(task_id)
+
+        def cancel_queued(self):
+            return []
 
     runner = _Runner()
     manager = StalenessManager(
@@ -113,5 +116,10 @@ def test_dispatcher_rechecks_pause_after_dequeue_before_submit():
     dispatcher._commit_loop()
 
     assert runner.submitted == []
+    assert manager.get_stats().enqueued == 1
+    assert manager.get_stats().cancelled == 0
+    assert dispatcher.cancel_queued()['task_ids'] == [7]
     assert manager.get_stats().enqueued == 0
+    assert manager.get_stats().cancelled == 1
+    assert dispatcher.cancel_queued()['task_ids'] == []
     assert manager.get_stats().cancelled == 1
