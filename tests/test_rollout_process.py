@@ -13,6 +13,36 @@ import pytest
 
 from RL_Framework.config import AsyncRLConfig
 from RL_Framework.infra.elastic import rollout_process as placement
+from RL_Framework.infra.elastic.runtime_executor import RuntimeElasticExecutor, ManagedRolloutProcess
+
+
+def test_default_full_launcher_keeps_serving_worker_recompute_and_exact_gpu_contract(monkeypatch):
+    monkeypatch.delenv('VLLM_SERVER_MODULE', raising=False)
+    monkeypatch.delenv('LIBRA_KV_STORAGE_PATH', raising=False)
+    monkeypatch.setenv('LIBRA_CAPTURE_BEHAVIOR', '1')
+    monkeypatch.setenv('RANK', '2')
+    monkeypatch.setenv('MASTER_ADDR', 'training-only')
+    monkeypatch.setenv('TORCHELASTIC_WORKER_GROUP', 'training')
+    executor = object.__new__(RuntimeElasticExecutor)
+    executor.config = AsyncRLConfig(model_path='/not-loaded', train_gpus=2, rollout_gpus=2, n_total_gpus=4)
+    executor.config.heterogeneous_rollout.scheduling.cmlfq_kv_backend = 'recompute'
+    executor.config.rollout_weight_sync_control_dir = '/fyp/run/control'
+    instance = NS(instance_id='current', tp=2, host='rollout-node', gpus=[2, 3])
+    command = executor._build_vllm_command(instance, 9000)
+    args = shlex.split(command)
+    assert args[:2] == ['env', 'CUDA_VISIBLE_DEVICES=2,3']
+    assert 'RL_Framework.scripts.restartable_vllm_server' in args
+    assert 'RL_Framework.scripts.vllm_hot_reload_api_server' in args
+    assert args[args.index('--worker-extension-cls') + 1] == 'RL_Framework.vllm_hot_reload.InplaceReloadWorkerExtension'
+    assert args[args.index('--instance-id') + 1] == 'current'
+    assert '--kv-transfer-config' not in args
+    meta = ManagedRolloutProcess('current', command, 0, [2, 3], 9000, host='rollout-node', tp=2)
+    env = executor._rollout_launch_env(meta)
+    assert env['CUDA_VISIBLE_DEVICES'] == env['PLANNED_CUDA_VISIBLE_DEVICES'] == '2,3'
+    assert env['LIBRA_CAPTURE_BEHAVIOR'] == '1' and env['LIBRA_EXPECTED_TP_SIZE'] == '2'
+    assert env['LIBRA_INSTANCE_ID'] == 'current'
+    assert 'LIBRA_KV_STORAGE_PATH' not in env
+    assert 'RANK' not in env and 'MASTER_ADDR' not in env and 'TORCHELASTIC_WORKER_GROUP' not in env
 
 
 def test_remote_command_targets_current_allocation_and_preserves_gpu_ids(monkeypatch):
@@ -20,12 +50,14 @@ def test_remote_command_targets_current_allocation_and_preserves_gpu_ids(monkeyp
         assert argv == ['scontrol', 'show', 'hostnames', 'node[1-2]']
         return NS(stdout='node1\nnode2\n')
     monkeypatch.setattr(placement.subprocess, 'run', query)
-    env = dict(SLURM_JOB_ID='123', SLURM_JOB_NODELIST='node[1-2]', SLURMD_NODENAME='node1')
+    env = dict(SLURM_JOB_ID='123', SLURM_JOB_NODELIST='node[1-2]',
+               SLURMD_NODENAME='node1', SLURM_GPUS_ON_NODE='4')
     command = placement.slurm_command('exec python serve.py', 'node2', [2, 3], env, step_name='owned')
     args = shlex.split(command)
     assert args[args.index('--jobid') + 1] == '123'
     assert args[args.index('--nodelist') + 1] == 'node2'
-    assert '--overlap' in args and not any(arg.startswith('--gpus') for arg in args)
+    assert '--overlap' in args and '--gres=gpu:4' in args
+    assert not any(arg.startswith('--gpus=') for arg in args)
     assert 'CUDA_VISIBLE_DEVICES=2,3' in args and 'PLANNED_CUDA_VISIBLE_DEVICES=2,3' in args
     assert args[-3:] == ['bash', '-c', 'exec python serve.py']
     with pytest.raises(RuntimeError, match='not one unambiguous node'):
@@ -48,7 +80,8 @@ def test_launch_remote_tracks_ownership_and_uses_a_dedicated_local_session(tmp_p
         return NS(pid=123)
     monkeypatch.setattr(placement.subprocess, 'Popen', popen)
     meta = NS(instance_id='current', host='node2', gpus=[0, 1], command='serve')
-    proc = placement.launch_rollout_process(meta, dict(SLURM_JOB_ID='77', SLURMD_NODENAME='node1'), control_dir=tmp_path)
+    proc = placement.launch_rollout_process(meta,
+        dict(SLURM_JOB_ID='77', SLURMD_NODENAME='node1', SLURM_GPUS_ON_NODE='4'), control_dir=tmp_path)
     assert seen[0][1]['start_new_session'] is True
     assert 'RL_Framework.infra.elastic.rollout_process' in seen[0][0]
     assert proc._libra_rollout_owner['job_id'] == '77'
@@ -77,6 +110,39 @@ def test_remote_stop_cancels_only_receipted_step_and_zero_waits_for_verified_exi
     with pytest.raises(RuntimeError, match='does not match'):
         placement.stop_rollout_process(proc, timeout=0)
     assert commands == [['scancel', '--signal=TERM', '77.9']]
+
+
+@pytest.mark.parametrize('exited', [True, False])
+def test_remote_cancel_error_requires_verified_exit(tmp_path, monkeypatch, exited):
+    path = tmp_path / 'owned.json'
+    record = dict(token='token', job_id='77', step_id='9', status='running')
+    path.write_text(json.dumps(record))
+    owner = dict(remote=True, token='token', job_id='77', state_path=str(path), step_name='owned')
+    proc = NS(_libra_rollout_owner=owner, poll=lambda: None)
+    error = subprocess.CalledProcessError(225, ['scancel', '--signal=TERM', '77.9'],
+        stderr='scancel: error: Kill job error on job step id 77: Invalid job id specified\n')
+    stopped = []
+    monkeypatch.setenv('SLURM_JOB_ID', '77')
+    monkeypatch.setattr(placement, 'stop_owned_session', lambda proc, timeout: stopped.append(proc))
+
+    def run(argv, **kwargs):
+        if argv[0] == 'scancel':
+            assert argv == error.cmd
+            if exited:
+                path.write_text(json.dumps(dict(record, status='exited', owned_processes_exited=True)))
+            raise error
+        assert argv[0] == 'squeue'
+        return NS(stdout='77.9|owned\n')
+
+    monkeypatch.setattr(placement.subprocess, 'run', run)
+    if exited:
+        placement.stop_rollout_process(proc, timeout=.01)
+        assert stopped == [proc]
+    else:
+        with pytest.raises(subprocess.CalledProcessError) as failure:
+            placement.stop_rollout_process(proc, timeout=.01)
+        assert failure.value is error
+        assert not stopped
 
 
 def test_owned_stop_covers_nested_descendant_sessions(tmp_path):
@@ -148,8 +214,24 @@ def test_remote_adopted_pid_is_verified_and_stopped_on_target_allocation_node(mo
         return NS(stdout=json.dumps(dict(instance_id='wanted', port=9000, job_id='777', owned_processes_exited=True)))
     monkeypatch.setattr(placement.subprocess, 'run', run)
     meta = NS(pid=999, host='rollout', instance_id='wanted', port=9000, gpus=[0, 1])
-    receipt = placement.stop_adopted_rollout(meta, dict(SLURM_JOB_ID='777', SLURMD_NODENAME='train'), timeout=0)
+    receipt = placement.stop_adopted_rollout(meta,
+        dict(SLURM_JOB_ID='777', SLURMD_NODENAME='train', SLURM_GPUS_ON_NODE='4'), timeout=0)
     assert receipt['owned_processes_exited'] and len(calls) == 1
+
+
+def test_remote_adopted_stop_failure_keeps_child_stderr_visible(monkeypatch, capfd):
+    monkeypatch.setattr(placement, 'allocation_nodes', lambda env: ['train', 'rollout'])
+    monkeypatch.setattr(placement, '_verify_adopted_identity',
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError('not local launcher')))
+    child = shlex.join([sys.executable, '-c',
+        'import sys; sys.stderr.write("remote adopted stop failed\\n"); sys.exit(1)'])
+    monkeypatch.setattr(placement, 'slurm_command', lambda *args, **kwargs: child)
+    meta = NS(pid=999, host='rollout', instance_id='wanted', port=9000, gpus=[0, 1])
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        placement.stop_adopted_rollout(meta,
+            dict(SLURM_JOB_ID='777', SLURMD_NODENAME='train'))
+    assert error.value.returncode == 1
+    assert 'remote adopted stop failed' in capfd.readouterr().err
 
 
 def test_verified_local_srun_registry_pid_authorizes_unique_remote_service_lookup(monkeypatch):
@@ -164,7 +246,8 @@ def test_verified_local_srun_registry_pid_authorizes_unique_remote_service_looku
         return NS(stdout=json.dumps(dict(instance_id='wanted', port=9000, job_id='777', owned_processes_exited=True)))
     monkeypatch.setattr(placement.subprocess, 'run', run)
     meta = NS(pid=111, host='rollout', instance_id='wanted', port=9000, gpus=[0])
-    assert placement.stop_adopted_rollout(meta, dict(SLURM_JOB_ID='777', SLURMD_NODENAME='train'))['owned_processes_exited']
+    assert placement.stop_adopted_rollout(meta,
+        dict(SLURM_JOB_ID='777', SLURMD_NODENAME='train', SLURM_GPUS_ON_NODE='4'))['owned_processes_exited']
 
 
 def test_local_adopted_service_stops_only_verified_tree_and_preserves_other_instance(tmp_path, monkeypatch):
@@ -197,4 +280,24 @@ def test_remote_adopted_exit_without_matching_owner_receipt_is_rejected(monkeypa
         dict(instance_id='another', port=9000, job_id='777', owned_processes_exited=True))))
     meta = NS(pid=999, host='rollout', instance_id='wanted', port=9000, gpus=[0])
     with pytest.raises(RuntimeError, match='differs from the requested owner'):
-        placement.stop_adopted_rollout(meta, dict(SLURM_JOB_ID='777', SLURMD_NODENAME='train'))
+        placement.stop_adopted_rollout(meta,
+            dict(SLURM_JOB_ID='777', SLURMD_NODENAME='train', SLURM_GPUS_ON_NODE='4'))
+
+
+def test_owned_session_stops_process_group_members_after_launcher_exits(tmp_path):
+    child_pid = tmp_path / 'child.pid'
+    script = ('import pathlib,subprocess,sys; '
+              'p=subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"]); '
+              f'pathlib.Path({str(child_pid)!r}).write_text(str(p.pid))')
+    proc = subprocess.Popen([sys.executable, '-c', script], start_new_session=True)
+    proc.wait(timeout=3)
+    pid = int(child_pid.read_text())
+    try:
+        placement.stop_owned_session(proc, timeout=.05)
+        record = placement._process_record(pid)
+        assert record is None or record['state'] == 'Z'
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass

@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import time
+import traceback
 from pathlib import Path
 
 import torch
@@ -64,28 +65,44 @@ def _load_payload_file(path: Path, *, worker_id: str, target_core_id: str, args)
     )
 
 
+def worker_identity(data=None):
+    """Reject a task from another launch before installing or computing."""
+    identity = {}
+    for field in ("run_id", "generation", "launch_owner"):
+        launched = os.environ.get("LIBRA_HYBRID_" + field.upper(), "")
+        if not launched:
+            continue
+        if field == "generation":
+            launched = int(launched)
+        if isinstance(data, dict) and data.get(field) != launched:
+            raise ValueError(f"Hybrid task {field} differs from its launched worker")
+        identity[field] = launched
+    return identity
+
+
 def _touch_ready(task_dir: Path, worker_id: str, snapshot_path: str, receipt=None):
     task_dir.mkdir(parents=True, exist_ok=True)
     rank = int(os.environ.get("RANK", "0"))
     ready = task_dir / f"{worker_id}.rank_{rank}.ready"
     contents = f"snapshot={snapshot_path}\npid={os.getpid()}\nrank={rank}\n"
-    if receipt:
-        contents += "".join(f"{key}={value}\n" for key, value in receipt.items())
+    details = {**(receipt or {}), **worker_identity()}
+    contents += "".join(f"{key}={value}\n" for key, value in details.items())
     temporary = ready.with_suffix(f".tmp.{os.getpid()}")
     temporary.write_text(contents, encoding="utf-8")
     temporary.replace(ready)
-    if rank == 0:
-        summary = task_dir / f"{worker_id}.ready"
-        temporary = summary.with_suffix(f".tmp.{os.getpid()}")
-        temporary.write_text(contents, encoding="utf-8")
-        temporary.replace(summary)
+
+
+def _install_state_and_prepare(args, engine, snapshot):
+    receipt = engine.load_elastic_state_snapshot(
+        snapshot, target_core_id=args.target_core_id,
+        replica_rank=int(os.environ.get("RANK", "0")))
+    engine.prepare_elastic_gradient_communication()
+    return receipt
 
 
 def _initialize_megatron_worker(args):
     if not args.config:
         raise ValueError("--config is required for --worker-mode megatron_core")
-    backend = str(getattr(torch, "__name__", ""))
-    del backend
     from RL_Framework.config import AsyncRLConfig
     from RL_Framework.engine.train_factory import create_train_engine
 
@@ -116,8 +133,10 @@ def _initialize_megatron_worker(args):
     for key in ("tp", "pp", "cp", "ep"):
         if int(actual[f"train_{key}"]) != int(getattr(config, f"train_{key}_size", 1)):
             raise RuntimeError(f"Hybrid factory changed the requested {key} model parallelism")
-    if not args.initialize_only:
-        engine.load_elastic_state_snapshot(args.snapshot_path, target_core_id=args.target_core_id, replica_rank=int(os.environ.get("RANK", "0")))
+    if args.initialize_only:
+        engine.prepare_elastic_gradient_communication()
+    else:
+        _install_state_and_prepare(args, engine, args.snapshot_path)
     engine.hybrid_lockstep_gradient_sync = bool(getattr(config.global_resource_planner, "hybrid_lockstep_gradient_sync", True))
     return engine
 
@@ -200,22 +219,27 @@ def main():
         for task_path in tasks:
             try:
                 data = torch.load(task_path, map_location="cpu", weights_only=False)
+                if isinstance(data, dict):
+                    worker_identity(data)
                 if isinstance(data, dict) and data.get("shutdown"):
                     task_path.rename(task_path.with_suffix(task_path.suffix + ".done"))
                     return
                 if engine is not None and isinstance(data, dict) and data.get("install_state"):
-                    snapshot = str(data["snapshot_path"])
-                    receipt = engine.load_elastic_state_snapshot(snapshot, target_core_id=args.target_core_id, replica_rank=int(os.environ.get("RANK", "0")))
+                    installed_snapshot = str(data["snapshot_path"])
+                    receipt = _install_state_and_prepare(args, engine, installed_snapshot)
+                    snapshot = installed_snapshot
                     _touch_ready(task_dir, args.worker_id, snapshot, receipt)
                     if torch.distributed.is_initialized():
                         torch.distributed.barrier()
                     if int(os.environ.get("RANK", "0")) == 0:
                         task_path.rename(task_path.with_suffix(task_path.suffix + ".done"))
+                    if torch.distributed.is_initialized():
+                        torch.distributed.barrier()
                     continue
                 if engine is not None and isinstance(data, dict) and "trajectories" in data:
                     task_snapshot = str(data.get("snapshot_path", ""))
                     if task_snapshot and task_snapshot != str(snapshot):
-                        engine.load_elastic_state_snapshot(task_snapshot, target_core_id=args.target_core_id, replica_rank=int(os.environ.get("RANK", "0")))
+                        _install_state_and_prepare(args, engine, task_snapshot)
                         snapshot = task_snapshot
                     engine.recompute_logprobs(data["trajectories"])
                     payload = engine.compute_elastic_gradient_payload(data["trajectories"], worker_id=args.replica_id or args.worker_id, target_core_id=args.target_core_id, step=int(data["step"]), state_version=int(data["state_version"]), membership_epoch=int(data["membership_epoch"]), global_sample_count=int(data.get("global_sample_count", 0)))
@@ -224,6 +248,8 @@ def main():
                 if payload is not None:
                     expect_update = bool(engine is not None and getattr(engine, "hybrid_lockstep_gradient_sync", True))
                     update = client.send(payload, expect_update=expect_update)
+                    if expect_update and update is None:
+                        raise RuntimeError("Hybrid did not receive its required post-AllReduce update")
                     if update is not None:
                         if update.replica_id != payload.replica_id or update.step != payload.step or update.membership_epoch != payload.membership_epoch or update.state_version != payload.state_version + 1:
                             raise RuntimeError("received mismatched post-AllReduce update")
@@ -232,9 +258,22 @@ def main():
                     torch.distributed.barrier()
                 if int(os.environ.get("RANK", "0")) == 0:
                     task_path.rename(task_path.with_suffix(task_path.suffix + ".done"))
-            except Exception as exc:
-                task_path.with_suffix(task_path.suffix + ".error").write_text(str(exc), encoding="utf-8")
-                task_path.rename(task_path.with_suffix(task_path.suffix + ".failed"))
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+            except Exception:
+                # Only the lane that retires the input writes the diagnostic.
+                try:
+                    task_path.rename(task_path.with_suffix(task_path.suffix + ".failed"))
+                except OSError:
+                    pass
+                else:
+                    try:
+                        task_path.with_suffix(task_path.suffix + ".error").write_text(
+                            traceback.format_exc(), encoding="utf-8")
+                    except Exception:
+                        pass
+                # torchrun reports the original failure and stops the other lanes.
+                raise
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ def _executor(tmp_path, **options):
     engine.config = SimpleNamespace(global_resource_planner=SimpleNamespace(**cfg))
     engine._hybrid_worker_meta = {}
     engine._hybrid_worker_processes = {}
+    engine._hybrid_task_contexts = {}
     engine._closing = threading.Event()
     engine._lifecycle_lock = threading.RLock()
     engine._hybrid_resource_guard = lambda *args, **kwargs: nullcontext()
@@ -190,6 +191,7 @@ def test_hybrid_factory_partitions_core_dp2_into_one_complete_model_replica(monk
                              global_resource_planner=SimpleNamespace(hybrid_lockstep_gradient_sync=True))
     observed = []
     engine = SimpleNamespace(initialize=lambda **kwargs: None, world_size=2,
+                             prepare_elastic_gradient_communication=lambda: observed.append("prepared"),
                              get_parallel_state=lambda: dict(train_tp=2, train_pp=1, train_cp=1, train_ep=1, train_dp=1))
     def factory(cfg):
         observed.append((cfg.train_tp_size, cfg.train_dp_size, cfg.train_gpus, cfg.learning_rate))
@@ -201,7 +203,7 @@ def test_hybrid_factory_partitions_core_dp2_into_one_complete_model_replica(monk
     monkeypatch.setenv('WORLD_SIZE', '2')
     result = _initialize_megatron_worker(SimpleNamespace(config='current-core-config.yaml', initialize_only=True))
     assert result is engine
-    assert observed == [(2, 1, 2, 1e-6)]
+    assert observed == [(2, 1, 2, 1e-6), "prepared"]
     monkeypatch.setenv('WORLD_SIZE', '4')
     with pytest.raises(ValueError, match='one complete model replica'):
         _initialize_megatron_worker(SimpleNamespace(config='current-core-config.yaml', initialize_only=True))
