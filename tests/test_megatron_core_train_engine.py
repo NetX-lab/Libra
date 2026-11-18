@@ -284,7 +284,7 @@ def _compare_vocab_shards(rank, rendezvous, bounded):
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="requires two CPU ranks")
 @pytest.mark.parametrize("bounded", [False, True], ids=["native", "bounded"])
 def test_tensor_parallel_logprobs_and_local_gradients_match_unsharded_vocab(tmp_path, bounded):
-    torch.multiprocessing.start_processes(
+    torch.multiprocessing.spawn(
         _compare_vocab_shards, args=(f"file://{tmp_path / 'rendezvous'}", bounded),
-        nprocs=2, start_method="fork",
+        nprocs=2,
     )
