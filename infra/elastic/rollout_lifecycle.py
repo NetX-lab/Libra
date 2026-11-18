@@ -1,6 +1,8 @@
 """Training-boundary coordination for rollout GPUs lent to EHP."""
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch.distributed as dist
 
 
@@ -24,11 +26,12 @@ def apply_availability(trainer, unavailable):
     previous = set(getattr(trainer, "_rollout_unavailable_ids", ()))
     trainer._rollout_unavailable_ids = set(unavailable)
     scheduler = getattr(trainer.rollout_engine, "scheduler", None)
-    for handle in getattr(scheduler, "_instances", []):
-        if handle.instance_id in trainer._rollout_unavailable_ids:
-            handle.is_ready = False
-        elif handle.instance_id in previous:
-            handle.is_ready = True
+    with getattr(scheduler, "_lock", nullcontext()):
+        for handle in getattr(scheduler, "_instances", []):
+            if handle.instance_id in trainer._rollout_unavailable_ids:
+                handle.is_ready = False
+            elif handle.instance_id in previous:
+                handle.is_ready = True
 
 
 def restore_for_publication(trainer):

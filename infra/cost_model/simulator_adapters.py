@@ -500,6 +500,12 @@ class HybridSimulatorCostModel:
             )
             return seconds, details
 
+    def evaluate_elastic_training(
+        self, core: TrainParallelConfig, B_global: int, group_size: int,
+        hybrids: int, lengths: int | list[int],
+    ) -> tuple[float, dict]:
+        return self.analytic.evaluate_elastic_training(core, B_global, group_size, hybrids, lengths)
+
     def evaluate_rollout_instance(
         self,
         tp: int,
@@ -516,23 +522,13 @@ class HybridSimulatorCostModel:
     def evaluate_rollout_segment(
         self,
         tp: int,
-        *,
-        num_requests: int,
-        total_prompt_tokens: int,
-        total_gen_tokens: int,
-        max_seq: int,
+        requests: list[RequestInfo],
     ) -> tuple[float, dict]:
         # A command-backed Vidur invocation per O(L^2) DP transition would make
         # planning unusable. Use the calibrated analytic operator model for all
         # segment transitions, then validate the recovered cluster once through
         # the configured external backend in the outer optimizer.
-        seconds, details = self.analytic.evaluate_rollout_segment(
-            tp,
-            num_requests=num_requests,
-            total_prompt_tokens=total_prompt_tokens,
-            total_gen_tokens=total_gen_tokens,
-            max_seq=max_seq,
-        )
+        seconds, details = self.analytic.evaluate_rollout_instance(tp, requests)
         details = dict(details)
         details["backend"] = "analytic"
         if self.rollout_backend != "analytic":

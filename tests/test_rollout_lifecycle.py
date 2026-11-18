@@ -297,7 +297,7 @@ def test_repartition_publication_uses_new_topology_before_client_reopen():
             {"instance_id": "old-engine-b", "tp_degree": 2},
         ]),
         config=SimpleNamespace(heterogeneous_rollout=SimpleNamespace(instances=[
-            SimpleNamespace(instance_id="new-engine", tp=4),
+            SimpleNamespace(instance_id="new-engine", tp=4, host="new", port=8000),
         ])),
     )
     world_size, offsets = AsyncRLTrainer._nccl_rollout_topology(state)

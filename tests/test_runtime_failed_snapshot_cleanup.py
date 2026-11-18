@@ -225,7 +225,7 @@ def test_partial_cancel_stop_failure_tracks_all_removed_loaders(runtime, monkeyp
     assert cancelled == [0, 1]
     assert len(executor._retired_hybrid_joins) == 2
     assert not engine.released
-    assert executor._snapshot_stop_pending == {'rollout0'}
+    assert executor._snapshot_stop_pending == {'rollout0', 'rollout1'}
 
 
 def test_cold_loader_does_not_request_repeated_cleanup_boundaries(runtime):

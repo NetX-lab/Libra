@@ -6,7 +6,7 @@ import copy
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from RL_Framework.config import AsyncRLConfig
 from RL_Framework.infra.cost_model.global_resource_planner import (
@@ -57,7 +57,12 @@ class PreflightPlanner:
         self.planner = planner or GlobalResourcePlanner.from_config(self.config)
         self.apply_best_candidate = apply_best_candidate
 
-    def run(self, history: Iterable[dict[str, Any]]) -> PreflightPlannerResult:
+    def run(
+        self,
+        history: Iterable[dict[str, Any]],
+        *,
+        allocation_hosts: Sequence[str] | None = None,
+    ) -> PreflightPlannerResult:
         batch = list(history)
         original = {
             "plan_interval": self.planner.plan_interval,
@@ -97,7 +102,9 @@ class PreflightPlanner:
         applied_plan = self._select_plan(decision)
         applied = applied_plan is not None
         if applied_plan is not None:
-            self.planner.apply_plan_to_config(applied_plan, self.config)
+            self.planner.apply_plan_to_config(
+                applied_plan, self.config, allocation_hosts=allocation_hosts,
+            )
             # Persist the proof that startup allocation was decided by GRP.
             # The trainer checks this before constructing any training engine.
             self.config.global_resource_planner.initial_allocation_applied = True

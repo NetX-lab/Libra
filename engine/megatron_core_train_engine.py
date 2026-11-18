@@ -866,6 +866,45 @@ class MegatronCoreTrainEngine:
                     gradients.append(grad)
         return gradients
 
+    def prepare_elastic_gradient_communication(self) -> int:
+        """Prepare each real NCCL bucket group once before Hybrid activation."""
+        if not dist.is_available() or not dist.is_initialized() or not torch.cuda.is_available():
+            return 0
+        device = torch.device(self._device())
+        if device.type != "cuda":
+            return 0
+        warmed = getattr(self, "_hybrid_gradient_communication_groups", [])
+        self._hybrid_gradient_communication_groups = warmed
+        groups = []
+        for model in self.model:
+            buckets = list(getattr(model, "bucket_groups", ()))
+            buckets += list(getattr(model, "expert_parallel_bucket_groups", ()))
+            for bucket in buckets:
+                group = (bucket.intra_distributed_optimizer_instance_group
+                         if bucket.ddp_config.use_distributed_optimizer
+                         else bucket.data_parallel_group)
+                if group is None:
+                    raise ValueError("Hybrid gradient bucket has no explicit process group")
+                if any(group is known for known in groups):
+                    continue
+                if str(dist.get_backend(group)).lower() == "nccl":
+                    groups.append(group)
+        pending = [group for group in groups if not any(group is known for known in warmed)]
+        if not pending:
+            return 0
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()
+            scalar = torch.zeros((), dtype=torch.float32, device=device)
+            try:
+                for group in pending:
+                    dist.all_reduce(scalar, group=group, async_op=False)
+                    torch.cuda.synchronize(device)
+                    # Cache only completed collectives, including singleton DP.
+                    warmed.append(group)
+            finally:
+                del scalar
+        return len(pending)
+
     def compute_elastic_gradient_payload(
         self, trajectories: list[dict[str, Any]], *, worker_id: str,
         target_core_id: str, step: int, state_version: int, membership_epoch: int,

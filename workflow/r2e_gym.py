@@ -202,8 +202,10 @@ class R2EGymWorkflow:
             raise SamplingEvidenceError("Initial prompt leaves no safe generation budget")
         probabilities, masks = [0.0] * initial_length, [0] * initial_length
         prompt_id = str(data.get("prompt_id", f"{data.get('repo_name', 'repo')}:{data.get('commit_hash', '')}"))
+        begin_async = getattr(engine, "begin_cmlfq_request_when_available", None)
         begin = getattr(engine, "begin_cmlfq_request", None)
-        request_id = begin(prompt_id, initial_length) if callable(begin) else ""
+        request_id = (await begin_async(prompt_id, initial_length) if callable(begin_async)
+                      else begin(prompt_id, initial_length) if callable(begin) else "")
         tool_returns, current_text, final_completion = [], prompt_text, ""
         final_turn = 0
         sample_revision = None
@@ -298,15 +300,13 @@ class R2EGymWorkflow:
                     reward=metrics["reward"],
                 )
                 tool_returns.append(event)
-                route = getattr(engine, "route_cmlfq_tool_return", None)
+                route = getattr(engine, "record_cmlfq_tool_return", None) or getattr(
+                    engine, "route_cmlfq_tool_return", None)
                 if request_id and callable(route):
                     route(request_id, event, total_output)
             total_output = len(ids) - initial_length
             for event in tool_returns:
-                event["remaining_length"] = (
-                    generated_tokens - event["generated_token_position"] if exact
-                    else total_output - event["token_position"]
-                )
+                event["remaining_length"] = max(0, generated_tokens - event["generated_token_position"])
             output_length = sum(masks)
             if not exact:
                 ids = ids[:self.max_seq_length]
@@ -338,7 +338,7 @@ class R2EGymWorkflow:
                 probabilities, dtype=torch.float32).unsqueeze(0)
             finish = getattr(engine, "finish_cmlfq_request", None)
             if request_id and callable(finish):
-                finish(request_id, total_output)
+                finish(request_id, total_output, generated_tokens=generated_tokens)
             return trajectory
         except BaseException:
             # Cancellation must retire CMLFQ state too, or idle waits can hang.
@@ -457,7 +457,8 @@ class R2EGymWorkflow:
                         )
                         feedback_tokens = len(self._encode(feedback))
                         generated_tokens += feedback_tokens
-                        route_tool_return = getattr(engine, "route_cmlfq_tool_return", None)
+                        route_tool_return = getattr(engine, "record_cmlfq_tool_return", None) or getattr(
+                            engine, "route_cmlfq_tool_return", None)
                         if request_id and callable(route_tool_return):
                             route_tool_return(
                                 request_id,

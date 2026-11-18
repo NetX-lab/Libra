@@ -3,8 +3,8 @@
 import json
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +14,7 @@ from RL_Framework.config import AsyncRLConfig
 from RL_Framework.engine.megatron_core_train_engine import MegatronCoreTrainEngine
 from RL_Framework.infra.elastic.hybrid_pool import (
     ElasticHybridPool,
+    GradientPayload,
     InterReplicaGradientDomain,
     JoinCancelledError,
 )
@@ -298,6 +299,45 @@ def test_m9_active_replica_retains_its_membership_epoch(make_harness):
     assert h.peer._prepare_elastic_training_step(1) == ["replica0"]
     assert record(h) == original
     assert h.engine.elastic_gradient_domain.membership_state()["membership_epochs"]["replica0"] == original["membership_epoch"]
+
+
+def test_1913443_reapplied_runtime_state_restores_step10_gradient_epochs(make_harness, monkeypatch):
+    h = make_harness("13f79e4cac264319b6f1897c204e5e9a")
+    epochs = {"ehp_replica_rollout2": 4, "ehp_replica_rollout4": 3}
+    h.directory.mkdir(parents=True, exist_ok=True)
+    for replica, epoch in epochs.items():
+        (h.directory / f"{replica}.json").write_text(json.dumps(dict(
+            worker_id=replica, target_core_id="dp0", role="hybrid_training",
+            membership_epoch=epoch, run_id=h.peer._elastic_membership_run_id)))
+    h.engine.rank, h.engine.train_tp_size = 1, 2
+    h.engine.train_pp_size = h.engine.train_cp_size = 1
+    # Keep the real domain construction; this CPU reproduction has no NCCL group.
+    monkeypatch.setattr(h.engine, "initialize_elastic_communication_domain", lambda: None)
+    monkeypatch.setattr(h.engine, "_elastic_communication_domains", lambda: None)
+    h.engine.optimizer_revision = 9
+    h.peer._prepare_elastic_training_step(9)
+    assert h.peer._elastic_membership_epochs == epochs
+
+    # Consumed fields from job 1913443 applied coord b52a821b43da4ede8df73729a93a78bb.
+    h.peer._apply_training_reconfiguration_state(dict(
+        enabled=True, plan_only=False, core_replica_ids=["dp0"],
+        hybrid_targets={replica: "dp0" for replica in epochs},
+        active_hybrid_ids=list(epochs), activate_hybrids=True))
+    h.engine.optimizer_revision = 10
+    h.peer._prepare_elastic_training_step(10)
+    h.engine.set_elastic_batch_partition(8, 16, {replica: 4 for replica in epochs})
+
+    assert h.engine.elastic_gradient_domain.membership_state()["membership_epochs"] == epochs
+    payloads = [GradientPayload(
+            replica_id=replica, target_core_id="dp0", tensors=(torch.ones(1),),
+            replica_rank=1, replica_world_size=2, step=10, state_version=10,
+            membership_epoch=epoch, sample_count=4, global_sample_count=16)
+        for replica, epoch in epochs.items()]
+    with pytest.raises(ValueError, match="membership epoch"):
+        h.engine.enqueue_hybrid_gradient_payload(replace(payloads[0], membership_epoch=2))
+    for payload in payloads:
+        h.engine.enqueue_hybrid_gradient_payload(payload)
+    assert {payload.replica_id for payload in h.engine._pending_hybrid_gradients} == set(epochs)
 
 
 def test_m10_partial_release_preserves_other_replica(make_harness, monkeypatch):

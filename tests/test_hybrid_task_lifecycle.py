@@ -15,8 +15,10 @@ def _executor(tmp_path):
         hybrid_worker_stop_timeout_s=.1))
     executor._lifecycle_lock = threading.RLock()
     executor._hybrid_worker_processes = {}
+    executor._hybrid_task_contexts = {}
     canonical = ManagedHybridWorkerProcess('h', 'dp0', 'worker', 123, 'snapshot', host='node')
     member = ManagedHybridWorkerProcess('member', 'dp0', 'worker', -1, 'snapshot', host='node', replica_id='h')
+    canonical.launch_owner = member.launch_owner = 'current-launch'
     executor._hybrid_worker_meta = {'h': canonical, 'member': member}
     return executor
 
@@ -38,6 +40,7 @@ def test_normal_return_waits_for_actual_task_completion_before_detach(tmp_path):
     executor._stop_snapshot_loader = lambda *_: None
     task = tmp_path / 'h.step_14.pt'
     task.write_text('already consumed by Core, still applying on Hybrid')
+    executor.record_hybrid_task_assignment('h', dict(launch_owner='current-launch', step=14), task)
     finished = threading.Event()
     thread = threading.Thread(target=lambda: (executor._release_all_hybrid_workers(reason='planner'), finished.set()))
     thread.start()
@@ -56,6 +59,7 @@ def test_failed_or_missing_completion_is_not_success(tmp_path):
     executor = _executor(tmp_path)
     executor.config.global_resource_planner.hybrid_update_timeout_s = .05
     task = tmp_path / 'h.step_14.pt'; task.touch()
+    executor.record_hybrid_task_assignment('h', dict(launch_owner='current-launch', step=14), task)
     with pytest.raises(TimeoutError, match='completion'):
         executor.wait_for_hybrid_training_tasks('member')
     assert task.exists() and not (tmp_path / 'h.step_14.pt.done').exists()
@@ -64,6 +68,7 @@ def test_failed_or_missing_completion_is_not_success(tmp_path):
 def test_worker_failure_while_waiting_propagates_without_completion(tmp_path):
     executor = _executor(tmp_path)
     task = tmp_path / 'h.step_14.pt'; task.touch()
+    executor.record_hybrid_task_assignment('h', dict(launch_owner='current-launch', step=14), task)
     worker = threading.Timer(.02, lambda: task.rename(str(task) + '.failed'))
     worker.start()
     try:
@@ -78,6 +83,7 @@ def test_confirmed_exit_retires_only_old_owner_tasks_without_faking_done(tmp_pat
     from RL_Framework.infra.elastic import rollout_lending
     executor = _executor(tmp_path)
     task = tmp_path / 'h.step_14.pt'; task.write_text('membership_epoch=7;state_version=14')
+    executor.record_hybrid_task_assignment('h', dict(launch_owner='current-launch', step=14), task)
     other = tmp_path / 'other.step_14.pt'; other.touch()
     (tmp_path / 'h.step_13.pt.done').touch()
     observed = []
@@ -98,6 +104,7 @@ def test_failed_stop_retains_pending_task_for_owned_retry(tmp_path, monkeypatch)
     from RL_Framework.infra.elastic import rollout_lending
     executor = _executor(tmp_path)
     task = tmp_path / 'h.step_14.pt'; task.touch()
+    executor.record_hybrid_task_assignment('h', dict(launch_owner='current-launch', step=14), task)
     def fail(*args, **kwargs):
         raise TimeoutError('old process has not exited')
     monkeypatch.setattr(rollout_lending, 'wait_hybrid_stopped', fail)
@@ -113,8 +120,9 @@ def test_local_exit_also_retires_unfinished_task(tmp_path, monkeypatch):
     proc = object()
     executor._hybrid_worker_processes = {'h': proc, 'member': proc}
     task = tmp_path / 'h.step_14.pt'; task.touch()
+    executor.record_hybrid_task_assignment('h', dict(launch_owner='current-launch', step=14), task)
     exited = []
-    def stop(owned):
+    def stop(owned, timeout):
         assert owned is proc and task.exists()
         exited.append(True)
     monkeypatch.setattr(process_lifecycle, 'stop_local_worker', stop)

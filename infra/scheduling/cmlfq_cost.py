@@ -78,10 +78,36 @@ class CMLFQRoutingCosts:
         if self.rollout_model is None:
             return "recompute", math.inf
         # No measured transfer cost => use the supported recompute path.
+        return "recompute", self.prefill_seconds(target["tp_degree"], context)
+
+    def prefill_seconds(self, tp: int, context: int) -> float:
+        """Common cold-cache baseline; no cache residency is queried online."""
+        if self.rollout_model is None:
+            return 0.0
         model = self.rollout_model
         chunk = max(1, int(model.L_chunk))
-        full, tail = divmod(context, chunk)
-        seconds = full * model.compute_prefill_step_time(1, chunk, target["tp_degree"])
-        if tail:
-            seconds += model.compute_prefill_step_time(1, tail, target["tp_degree"])
-        return "recompute", seconds
+        return max(0, context) / chunk * model.compute_prefill_step_time(1, chunk, tp)
+
+    def completion_seconds(self, tp: int, bin_name: str, remaining: float,
+                           context: int, other_requests: int = 0) -> float:
+        """Finish a representative cohort, with this request joining last.
+
+        Known load has no exact token progress. Other admitted traces use this
+        residual length as an explicit approximation; their prefill is treated
+        as already paid. Only this request's cold-cache prefill remains.
+        """
+        count = max(0, int(other_requests)) + 1
+        prefill = self.prefill_seconds(tp, context)
+        if self.decode_ms.get(str(tp), {}).get(bin_name) is not None:
+            return self.decode_seconds(tp, bin_name, remaining, context) * count + prefill
+        if self.rollout_model is None:
+            return math.inf
+        if self.rollout_model.check_oom(math.ceil(context + remaining), tp):
+            return math.inf
+        elapsed = self.rollout_model.compute_instance_makespan_from_totals(
+            num_requests=count,
+            total_prompt_tokens=count * max(0, context),
+            total_gen_tokens=count * max(0, math.ceil(remaining)),
+            tp=tp,
+        )
+        return elapsed - (count - 1) * prefill
