@@ -14,6 +14,10 @@ from RL_Framework.infra.scheduling.cmlfq_scheduler import (
 )
 
 
+class NoAvailableRolloutError(RuntimeError):
+    """All services are temporarily withdrawn during a resource transition."""
+
+
 @dataclass
 class CostRoutingDecision(CMLFQMigrationDecision):
     source_instance_index: int = -1
@@ -21,6 +25,7 @@ class CostRoutingDecision(CMLFQMigrationDecision):
     execution_path: str = "stay"
     decode_seconds: float = 0.0
     migration_seconds: float = 0.0
+    prefill_seconds: float = 0.0
 
 
 class CMLFQCostScheduler(CMLFQScheduler):
@@ -80,6 +85,8 @@ class CMLFQCostScheduler(CMLFQScheduler):
             if target is None and self._enable_fallback:
                 target = self._try_select(rule["fallback_tp_degrees"], counts)
             if target is None:
+                if self._instances and not any(handle.is_ready for handle in self._instances):
+                    raise NoAvailableRolloutError("all rollout services are withdrawn")
                 self._stats.failed_routes += 1
                 return SchedulingResult(-1, 0, bucket, False, "no_available_instance")
             actual = self.bucket_for_tp(target.tp_degree)
@@ -94,7 +101,7 @@ class CMLFQCostScheduler(CMLFQScheduler):
                                     reason, prompt_id=prompt_id)
 
     def on_tool_return(self, request_id: str, tool_result: Any,
-                       generated_tokens: int = 0) -> CostRoutingDecision:
+                       generated_tokens: int = 0, *, preview: bool = True) -> CostRoutingDecision | None:
         with self._lock:
             state = self._request_states.get(request_id)
             if state is None:
@@ -107,12 +114,24 @@ class CMLFQCostScheduler(CMLFQScheduler):
             state.generated_tokens = generated_tokens
             state.collected_return_states.append(self._tool_registry.extract(tool_result))
             state.tool_return_token_positions.append(generated_tokens)
+            state.tool_return_generated_positions.append(
+                tool_result.get("generated_token_position") if isinstance(tool_result, dict) else None
+            )
             self._pending_cost_routes.add(request_id)
-            return self._choose(request_id)
+            if not preview:
+                return None
+            try:
+                return self._choose(request_id)
+            except NoAvailableRolloutError:
+                # Keep the tool observation and pending intent. The next
+                # generation waits asynchronously for publication to reopen.
+                return CostRoutingDecision(False, "await_available", state.current_bucket)
 
     def _choose(self, request_id: str, context_tokens: int | None = None) -> CostRoutingDecision:
         state = self._request_states[request_id]
         source = self.get_instance_handle(state.current_instance_index)
+        if not any(handle.is_ready for handle in self._instances):
+            raise NoAvailableRolloutError("all rollout services are withdrawn")
         context = (self._input_lengths[request_id] + state.generated_tokens
                    if context_tokens is None else context_tokens)
         stay = CostRoutingDecision(
@@ -124,24 +143,36 @@ class CMLFQCostScheduler(CMLFQScheduler):
             state.prompt_id, state.collected_return_states, self._bucket_thresholds,
         )
         if not distribution:
-            if not source.is_ready:
-                raise RuntimeError("current instance unavailable and no residual distribution")
-            return stay
+            if source.is_ready:
+                return stay
+            # Recompute carries the full transcript, so no tree evidence is
+            # needed to continue a trace after its previous service is lent.
+            ready = [handle for handle in self._instances if handle.is_ready]
+            target = min(ready, key=lambda handle: (handle.active_requests, handle.index))
+            return CostRoutingDecision(
+                True, "source_withdrawn", state.current_bucket,
+                target_bucket=self.bucket_for_tp(target.tp_degree),
+                source_instance_index=source.index, target_instance_index=target.index,
+                execution_path="recompute",
+            )
         global_counts = self._get_global_active_counts()
         choices = []
         for handle in self._instances:
             same = handle.index == source.index
             if not handle.is_ready:
                 continue
-            if not same and self._max_queue_length > 0 and self._active_count(
+            if source.is_ready and not same and self._max_queue_length > 0 and self._active_count(
                 handle, global_counts
             ) >= self._max_queue_length:
                 continue
-            decode = sum(
-                probability * self.routing_costs.decode_seconds(
-                    handle.tp_degree, name, remaining, context,
+            other_requests = max(0, self._active_count(handle, global_counts) - int(same))
+            generation = sum(
+                probability * self.routing_costs.completion_seconds(
+                    handle.tp_degree, name, remaining, context, other_requests,
                 ) for name, probability, remaining in distribution
             )
+            prefill = self.routing_costs.prefill_seconds(handle.tp_degree, context)
+            decode = generation - prefill
             path, movement = "stay", 0.0
             if not same:
                 if source.index not in self._topology or handle.index not in self._topology:
@@ -150,23 +181,27 @@ class CMLFQCostScheduler(CMLFQScheduler):
                     self._topology[source.index], self._topology[handle.index], context,
                     source.is_ready and self._transfer_supported(source.index, handle.index),
                 )
-            total = decode + movement
+                # The completion estimate already includes the target's
+                # recompute prefill, for staying and moving alike.
+                movement -= prefill
+            total = generation + movement
             if not math.isfinite(total) or total < 0:
                 continue
             # Stable ties prefer staying, then the least-loaded instance.
             choices.append((total, not same, self._active_count(handle, global_counts),
-                            handle.index, decode, movement, path))
+                            handle.index, decode, movement, path, prefill))
         if not choices:
             if not source.is_ready:
                 raise RuntimeError("no available instance with a finite routing cost")
             return stay
-        _, _, _, index, decode, movement, path = min(choices)
+        _, _, _, index, decode, movement, path, prefill = min(choices)
         target = self.get_instance_handle(index)
         return CostRoutingDecision(
             index != source.index, "distribution_cost", state.current_bucket,
             target_bucket=self.bucket_for_tp(target.tp_degree),
             source_instance_index=source.index, target_instance_index=index,
             execution_path=path, decode_seconds=decode, migration_seconds=movement,
+            prefill_seconds=prefill,
         )
 
     def execute_migration(self, request_id: str, decision: CMLFQMigrationDecision):
@@ -184,7 +219,8 @@ class CMLFQCostScheduler(CMLFQScheduler):
             if request_id in self._reservations:
                 raise RuntimeError("concurrent generation for the same request")
             state = self._request_states[request_id]
-            if request_id in self._pending_cost_routes:
+            if (request_id in self._pending_cost_routes
+                    or not self.get_instance_handle(state.current_instance_index).is_ready):
                 decision = self._choose(request_id, context_tokens)
             else:
                 decision = CostRoutingDecision(
@@ -228,12 +264,12 @@ class CMLFQCostScheduler(CMLFQScheduler):
             self._input_lengths.pop(request_id, None)
             super().cancel_request(request_id)
 
-    def finish_request(self, request_id: str, total_output_tokens: int):
+    def finish_request(self, request_id: str, total_output_tokens: int, *, generated_tokens: int | None = None):
         with self._lock:
             self.rollback_generation(request_id)
             self._pending_cost_routes.discard(request_id)
             self._input_lengths.pop(request_id, None)
-            super().finish_request(request_id, total_output_tokens)
+            super().finish_request(request_id, total_output_tokens, generated_tokens=generated_tokens)
 
     @classmethod
     def from_config(cls, hetero_config: Any):

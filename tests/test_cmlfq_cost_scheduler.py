@@ -2,9 +2,12 @@
 
 import asyncio
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 
@@ -18,6 +21,8 @@ from RL_Framework.infra.scheduling.cmlfq_prefix_tree import CausalPrefixTree, Tr
 from RL_Framework.infra.scheduling.cmlfq_scheduler import CMLFQMigrationDecision, CMLFQScheduler
 from RL_Framework.infra.scheduling.cmlfq_tool_state import DefaultToolStateExtractor
 from RL_Framework.infra.scheduling.factory import SchedulerFactory
+from RL_Framework.infra.cost_model.model import RolloutCostModel
+from RL_Framework.infra.elastic.rollout_lifecycle import apply_availability
 
 
 BUCKETS = {
@@ -54,7 +59,92 @@ def scheduler(lengths=(1000, 10000), **kwargs):
     return s
 
 
+def rollout_availability(scheduler):
+    owner = SimpleNamespace(rollout_engine=SimpleNamespace(scheduler=scheduler))
+    return lambda unavailable: apply_availability(owner, unavailable)
+
+
 class TestDistributionCostRouting(unittest.TestCase):
+    def test_completion_rejects_a_request_that_exceeds_instance_kv_capacity(self):
+        model = RolloutCostModel(
+            num_params=1, d_model=1, n_layers=1, n_kv_heads=1, head_dim=1,
+            dtype_bytes=1, flops_peak=1000, mem_bw=1000, mem_capacity=20,
+            tp_comm_overhead=0, prefill_mfu=1, act_workspace_bytes=0, kv_frag_rate=0,
+        )
+        routing = CMLFQRoutingCosts(rollout_model=model)
+        # TP1 has room for nine KV tokens; this request needs twenty.
+        self.assertTrue(math.isinf(routing.completion_seconds(1, "short", 10, 10)))
+
+    def test_known_load_can_move_a_trace_to_a_slower_idle_service(self):
+        s = scheduler(lengths=(10000,))
+        s.routing_costs.decode_ms = {"1": {"long": 2000}, "4": {"long": 2500}}
+        s.routing_costs.migrations[0]["recompute_ms"] = 100
+        request = s.schedule(100, "p").request_id
+        s.schedule(100, "other")
+        # Staying waits behind one equal representative workload: 4s.
+        # The idle service needs 2.5s generation plus .1s movement.
+        decision = s.on_tool_return(request, EVENT, 900)
+        self.assertTrue(decision.should_migrate)
+        self.assertEqual(decision.target_instance_index, 1)
+
+    def test_recompute_prefill_is_charged_once_on_the_target(self):
+        s = scheduler(lengths=(10000,))
+        s.routing_costs.decode_ms = {"1": {"long": 2000}, "4": {"long": 1000}}
+        s.routing_costs.migrations = []
+        s.routing_costs.rollout_model = RolloutCostModel(
+            num_params=1, d_model=1, n_layers=1, n_kv_heads=1, head_dim=1,
+            dtype_bytes=1, flops_peak=1000, mem_bw=1000, mem_capacity=1e9,
+            tp_comm_overhead=0, prefill_mfu=1, prefill_chunk_size=100,
+        )
+        request = s.schedule(100, "p").request_id
+        decision = s.on_tool_return(request, EVENT, 0)
+        # Both choices include prefill; migration pays no second target prefill.
+        self.assertTrue(decision.should_migrate)
+        self.assertAlmostEqual(decision.prefill_seconds, 10.6)
+        self.assertAlmostEqual(decision.migration_seconds, 0)
+
+    def test_online_tree_excludes_feedback_from_remaining_generated_tokens(self):
+        s = scheduler(lengths=())
+        engine = HeterogeneousRolloutEngine(scheduler=s)
+        request = engine.begin_cmlfq_request("p", 100)
+        first = dict(EVENT, payload_tokens=1000, generated_token_position=20)
+        second = dict(EVENT, payload_tokens=2000, generated_token_position=50)
+        engine.route_cmlfq_tool_return(request, first, 1020)
+        engine.route_cmlfq_tool_return(request, second, 3050)
+        engine.finish_cmlfq_request(request, 3100, generated_tokens=100)
+        tree = s.prefix_tree
+        states = [DefaultToolStateExtractor().extract(e) for e in (first, second)]
+        self.assertEqual(tree.lookup("p", states[:1]).remaining_lengths, [80])
+        self.assertEqual(tree.lookup("p", states).remaining_lengths, [50])
+        self.assertEqual(tree.lookup("p", []).remaining_lengths, [100])
+
+    def test_legacy_tree_lengths_remain_readable_but_are_not_decode_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "old-tree.json"
+            s = scheduler(lengths=(10000,))
+            s.prefix_tree.save(str(path))
+            raw = json.loads(path.read_text())
+            raw["version"] = 2
+            raw.pop("remaining_unit", None)
+            path.write_text(json.dumps(raw))
+            restored = CausalPrefixTree()
+            restored.load(str(path))
+            self.assertEqual(restored.lookup("p", [STATE]).mean_remaining_length, 10000)
+            self.assertEqual(restored.residual_distribution("p", [STATE], s._bucket_thresholds), [])
+            restored.insert(Trajectory("p", [STATE], [75], 100))
+            self.assertEqual(restored.residual_distribution("p", [STATE], s._bucket_thresholds),
+                             [("short", 1, 75)])
+
+    def test_withdrawn_source_without_distribution_recomputes_on_survivor(self):
+        s = scheduler(lengths=())
+        request = s.schedule(100, "unseen").request_id
+        rollout_availability(s)({"s"})
+        decision = s.reserve_generation(request)
+        self.assertEqual(decision.target_instance_index, 1)
+        self.assertEqual(decision.execution_path, "recompute")
+        s.commit_generation(request, decision)
+        self.assertEqual(s.get_request_route(request).instance_index, 1)
+
     def test_distribution_changes_decision_when_legacy_mean_and_p90_disagree(self):
         s = scheduler(lengths=(1000, 1000, 1000, 15000))
         node = s.prefix_tree.lookup("p", [STATE])
@@ -197,6 +287,23 @@ class TestDistributionCostRouting(unittest.TestCase):
 
 
 class TestBackendIntegration(unittest.IsolatedAsyncioTestCase):
+    async def test_workflow_cost_is_evaluated_when_the_next_generation_is_reserved(self):
+        engine = self.engine(lambda request: self.response(), transfer=False)
+        rid = engine.begin_cmlfq_request("p", 100)
+        costs = engine.scheduler.routing_costs
+        try:
+            with patch.object(costs, "completion_seconds", wraps=costs.completion_seconds) as estimate:
+                record = getattr(engine, "record_cmlfq_tool_return", engine.route_cmlfq_tool_return)
+                record(rid, EVENT, 900)
+                self.assertEqual(estimate.call_count, 0)
+                rollout_availability(engine.scheduler)({"s"})
+                result = await engine.generate("transcript", request_id=rid)
+                self.assertEqual(result["_schedule_info"]["instance_index"], 1)
+                self.assertGreater(estimate.call_count, 0)
+        finally:
+            engine.cancel_cmlfq_request(rid)
+            await engine.close()
+
     def engine(self, handler, transfer=True):
         s = scheduler(lengths=(10000,))
         engine = HeterogeneousRolloutEngine(scheduler=s)
@@ -224,6 +331,34 @@ class TestBackendIntegration(unittest.IsolatedAsyncioTestCase):
         return {"remote_engine_id": "s", "remote_request_id": "export-1",
                 "remote_host": "host-a", "remote_port": 5600,
                 "remote_block_ids": [[1, 2]], "tp_size": 1}
+
+    async def test_continuation_waits_through_empty_loan_switch_until_survivor_reopens(self):
+        seen = []
+        def handler(request):
+            seen.append(request.url.host)
+            return self.response()
+        engine = self.engine(handler, transfer=False)
+        rid = engine.begin_cmlfq_request("p", 100)
+        set_unavailable = rollout_availability(engine.scheduler)
+        set_unavailable({"s", "l"})
+        pending = None
+        try:
+            engine.route_cmlfq_tool_return(rid, EVENT, 900)
+            pending = asyncio.create_task(engine.generate("full transcript", request_id=rid))
+            await asyncio.sleep(.01)
+            self.assertFalse(pending.done())
+            self.assertEqual(seen, [])
+            set_unavailable({"s"})
+            result = await asyncio.wait_for(pending, 1)
+            self.assertEqual(result["_schedule_info"]["instance_index"], 1)
+            self.assertEqual(result["_schedule_info"]["execution_path"], "recompute")
+            self.assertEqual(seen, ["host-b"])
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+            engine.cancel_cmlfq_request(rid)
+            await engine.close()
 
     async def test_transfer_http_wire_and_commit_after_target_success(self):
         seen = []

@@ -185,12 +185,14 @@ class R2EGymWorkflow:
                 f"{data.get('repo_name', 'repo')}:{data.get('commit_hash', '')}",
             )
         )
+        begin_async = getattr(engine, "begin_cmlfq_request_when_available", None)
         begin_cmlfq = getattr(engine, "begin_cmlfq_request", None)
-        cmlfq_request_id = (
-            begin_cmlfq(prompt_id, len(prompt_tokens))
-            if callable(begin_cmlfq)
-            else ""
-        )
+        if callable(begin_async):
+            cmlfq_request_id = await begin_async(prompt_id, len(prompt_tokens))
+        else:
+            cmlfq_request_id = begin_cmlfq(prompt_id, len(prompt_tokens)) if callable(begin_cmlfq) else ""
+        record_tool_return = getattr(engine, "record_cmlfq_tool_return", None)
+        route_tool_return = record_tool_return or getattr(engine, "route_cmlfq_tool_return", None)
 
         current_text = prompt_text
         final_turn = 0
@@ -274,12 +276,12 @@ class R2EGymWorkflow:
                     "status": "success" if metrics["reward"] >= self.stop_reward else "failure",
                     "payload_tokens": len(feedback_tokens),
                     "token_position": generated_tokens,
+                    "generated_token_position": sum(len(tokens) for tokens, _, mask in segments if mask),
                     "turn": turn,
                     "reward": metrics["reward"],
                 }
                 tool_returns.append(tool_event)
 
-                route_tool_return = getattr(engine, "route_cmlfq_tool_return", None)
                 if cmlfq_request_id and callable(route_tool_return):
                     route_tool_return(cmlfq_request_id, tool_event, generated_tokens)
 
@@ -314,7 +316,10 @@ class R2EGymWorkflow:
 
         finish_cmlfq = getattr(engine, "finish_cmlfq_request", None)
         if cmlfq_request_id and callable(finish_cmlfq):
-            finish_cmlfq(cmlfq_request_id, total_output_tokens)
+            if callable(record_tool_return):
+                finish_cmlfq(cmlfq_request_id, total_output_tokens, generated_tokens=output_len)
+            else:
+                finish_cmlfq(cmlfq_request_id, total_output_tokens)
 
         full_completion = self.tokenizer.decode(all_input_ids, skip_special_tokens=True)
         reward = metrics["reward"] if self.patch_harness else self.reward_fn(
