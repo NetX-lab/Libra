@@ -13,15 +13,18 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 from RL_Framework.engine.megatron_core_checkpointing import (
     MegatronDistributedCheckpointManager,
 )
-from RL_Framework.engine.optimizer_memory import bound_default_torch_adam_memory
 from RL_Framework.engine.device_utils import set_device
+from RL_Framework.engine.logprob_compat import install as install_bounded_logprob
+from RL_Framework.engine.optimizer_memory import bound_default_torch_adam_memory
+from RL_Framework.workflow.behavior import (
+    _validate_probability, is_decoupled, validate_anchor_rows, validate_behavior_rows,
+)
 from RL_Framework.infra.elastic import (
     GradientPayload,
     GradientUpdate,
@@ -66,7 +69,11 @@ class MegatronCoreTrainEngine:
         use_cpu_initialization: bool = False,
         recompute_num_layers: int = 1,
         sync_path: str = "./logs/async_rl_weights",
+        grpo_objective: str = "legacy",
     ):
+        if grpo_objective not in {"legacy", "decoupled"}:
+            raise ValueError(f"Unknown grpo_objective: {grpo_objective}")
+        self.grpo_objective = grpo_objective
         self.train_backend = "megatron_core"
         self.model_path = model_path
         self.learning_rate = learning_rate
@@ -75,6 +82,8 @@ class MegatronCoreTrainEngine:
         self.micro_batch_size = micro_batch_size
         self.recompute_micro_batch_size = max(1, int(recompute_micro_batch_size))
         self.train_tp_size = train_tp_size
+        if train_tp_size > 1:
+            install_bounded_logprob(self)
         self.train_pp_size = train_pp_size
         self.train_cp_size = train_cp_size
         self.train_ep_size = train_ep_size
@@ -111,9 +120,9 @@ class MegatronCoreTrainEngine:
         self.optimizer_revision = 0
         self._elastic_state_server = None
         self._elastic_snapshot_urls = {}
+        self._elastic_batch_partition = None
         self._elastic_expected_state_version = 0
         self._elastic_seen_payloads = set()
-        self._elastic_batch_partition = None
 
         self.bridge = None
         self.provider = None
@@ -270,10 +279,16 @@ class MegatronCoreTrainEngine:
                 self.model,
                 use_gloo_process_groups=True,
             )
-            bound_default_torch_adam_memory(self.optimizer,
+            bounded_groups = bound_default_torch_adam_memory(self.optimizer,
                 release_main_gradients=(getattr(self, 'use_distributed_optimizer', False)
                     and not getattr(self, 'grad_reduce_in_fp32', False)
                     and not getattr(self, 'optimizer_cpu_offload', False)))
+            if bounded_groups and self.is_main_process:
+                print(
+                    "MCORE_INIT_PHASE native_torch_adam_foreach_disabled "
+                    f"groups={bounded_groups}",
+                    flush=True,
+                )
             if self.is_main_process:
                 print("MCORE_INIT_PHASE optimizer_build_complete", flush=True)
         if self.is_main_process:
@@ -442,11 +457,12 @@ class MegatronCoreTrainEngine:
                 (0, pad_width),
                 value=0,
             )
-            trajectory["logprobs"] = F.pad(
-                trajectory["logprobs"],
-                (0, pad_width),
-                value=0.0,
-            )
+            if not is_decoupled(self) or "logprobs" in trajectory:
+                trajectory["logprobs"] = F.pad(
+                    trajectory["logprobs"],
+                    (0, pad_width),
+                    value=0.0,
+                )
             trajectory["loss_mask"] = F.pad(
                 trajectory["loss_mask"],
                 (0, pad_width),
@@ -494,6 +510,9 @@ class MegatronCoreTrainEngine:
                 (0, pad_width),
                 value=0.0,
             )
+        if "behavior_logprobs" in micro_batch:
+            micro_batch["behavior_logprobs"] = F.pad(
+                micro_batch["behavior_logprobs"], (0, pad_width), value=0.0)
         if "loss_mask" in micro_batch:
             micro_batch["loss_mask"] = F.pad(
                 micro_batch["loss_mask"],
@@ -503,24 +522,33 @@ class MegatronCoreTrainEngine:
         return micro_batch
 
     def recompute_logprobs(self, trajectories: list[dict[str, Any]]):
+        decoupled = is_decoupled(self)
+        if decoupled:
+            validate_behavior_rows(trajectories)
+        revision = int(getattr(self, "optimizer_revision", 0))
         self._set_train_mode(False)
-        with torch.no_grad():
-            for micro_batch in self._iter_recompute_micro_batches(trajectories):
-                logits = self._forward(micro_batch)
-                action_log_probs = self._action_log_probs(
-                    logits,
-                    micro_batch["input_ids"],
-                ).cpu()
-                del logits
-                for row, trajectory in zip(
-                    action_log_probs,
-                    micro_batch["trajectories"],
-                ):
-                    updated = torch.zeros_like(trajectory["logprobs"])
-                    length = min(row.shape[0], updated.shape[1] - 1)
-                    updated[:, 1 : 1 + length] = row[:length].unsqueeze(0)
-                    trajectory["logprobs"] = updated
-        self._set_train_mode(True)
+        try:
+            with torch.no_grad():
+                for micro_batch in self._iter_recompute_micro_batches(trajectories):
+                    logits = self._forward(micro_batch)
+                    action_log_probs = self._action_log_probs(logits, micro_batch["input_ids"]).cpu()
+                    del logits
+                    for row, trajectory in zip(action_log_probs, micro_batch["trajectories"]):
+                        updated = (torch.zeros(trajectory["input_ids"].shape, dtype=torch.float32)
+                                   if decoupled else torch.zeros_like(trajectory["logprobs"]))
+                        length = min(row.shape[0], updated.shape[1] - 1)
+                        if decoupled and trajectory["loss_mask"][:, 1 + length:].any():
+                            raise ValueError("Anchor recomputation omitted an active action token")
+                        updated[:, 1 : 1 + length] = row[:length].unsqueeze(0)
+                        trajectory["logprobs"] = updated
+                        if decoupled:
+                            _validate_probability(trajectory, "logprobs")
+                            trajectory["anchor_optimizer_revision"] = revision
+            if decoupled:
+                if int(self.optimizer_revision) != revision:
+                    raise RuntimeError("Optimizer revision changed during anchor recomputation")
+        finally:
+            self._set_train_mode(True)
 
     def grpo_update(
         self,
@@ -529,6 +557,10 @@ class MegatronCoreTrainEngine:
     ) -> dict[str, float]:
         from megatron.core.distributed import finalize_model_grads
 
+        if is_decoupled(self):
+            if ppo_epochs != 1:
+                raise ValueError("Decoupled PPO requires ppo_epochs=1")
+            validate_anchor_rows(trajectories, self.optimizer_revision)
         epoch_stats: list[dict[str, float]] = []
         for _ in range(ppo_epochs):
             micro_batches = list(self._iter_micro_batches(trajectories))
@@ -554,8 +586,7 @@ class MegatronCoreTrainEngine:
                 raise FloatingPointError("Megatron optimizer rejected the update")
             self.optimizer_revision += 1
             merged = self._merge_stats(local_stats + (hybrid_stats or []))
-            # Hybrid contributes samples, not extra Core optimizer updates or
-            # additional weight in the existing DP gradient-norm statistic.
+            # Hybrid adds samples to this update, not additional Core norm observations.
             merged["n_updates"] = sum(float(item.get("n_updates", 1.0)) for item in local_stats)
             if isinstance(grad_norm, torch.Tensor):
                 merged["grad_norm"] = float(grad_norm.detach().item())
@@ -810,7 +841,6 @@ class MegatronCoreTrainEngine:
             raise ValueError("invalid fixed global batch partition")
         self._elastic_batch_partition = (int(local_sample_count), int(global_sample_count), dict(hybrid_sample_counts))
 
-
     def _elastic_core_loss_scale(self):
         partition = self._elastic_batch_partition
         if partition is None:
@@ -820,7 +850,6 @@ class MegatronCoreTrainEngine:
         # operation, then remove its duplicate copies in the elastic SUM.
         world = max(1, self.get_data_parallel_world_size())
         return local_count * world / total_count
-
 
     def set_elastic_active_gradient_timeout(self, timeout_s: float) -> None:
         self._elastic_active_gradient_timeout_s = max(0.0, float(timeout_s))
@@ -845,6 +874,8 @@ class MegatronCoreTrainEngine:
         from megatron.core.distributed import finalize_model_grads
         if int(state_version) != self.optimizer_revision:
             raise ValueError("hybrid task optimizer revision does not match installed state")
+        if is_decoupled(self):
+            validate_anchor_rows(trajectories, state_version)
         micro_batches = list(self._iter_micro_batches(trajectories))
         self._zero_grad()
         self._set_train_mode(True)
@@ -852,17 +883,20 @@ class MegatronCoreTrainEngine:
         for micro_batch in micro_batches:
             loss, stats = self._loss(micro_batch, self._forward(micro_batch))
             self.optimizer.scale_loss(loss * (len(micro_batch["trajectories"]) / max(len(trajectories), 1))).backward()
+            del loss
             local_stats.append(stats)
         finalize_model_grads(self.model)
-        return GradientPayload(
+        tensors = tuple(grad.detach().cpu() for grad in self._model_main_gradients())
+        payload = GradientPayload(
             replica_id=worker_id, target_core_id=target_core_id,
-            tensors=tuple(grad.detach().cpu() for grad in self._model_main_gradients()),
+            tensors=tensors,
             replica_rank=int(os.environ.get("RANK", "0")),
             replica_world_size=int(os.environ.get("WORLD_SIZE", "1")),
             step=int(step), state_version=int(state_version), membership_epoch=int(membership_epoch),
             sample_count=len(trajectories), global_sample_count=int(global_sample_count),
             stats=self._merge_stats(local_stats),
         )
+        return payload
 
     def apply_elastic_gradient_update(self, tensors: tuple[torch.Tensor, ...], *, state_version: int) -> None:
         local = self._model_main_gradients()
@@ -962,9 +996,7 @@ class MegatronCoreTrainEngine:
         for chunk, state in zip(self.model, payload["model"]):
             chunk.load_state_dict(state, strict=True)
         from RL_Framework.engine.optimizer_state import optimizer_state_load_context
-        # DP-zero restoration reaches the same MCore 0.14 low-level tensor
-        # setter as model-space restoration. Keep the real step supplied by
-        # common metadata visible while it installs master/Adam tensors.
+        # Keep MCore's real optimizer step visible while restoring master/Adam tensors.
         with optimizer_state_load_context(self.optimizer):
             self.optimizer.load_state_dict(payload["optimizer"])
             parameter_state = payload.get("distributed_optimizer")
@@ -1009,7 +1041,6 @@ class MegatronCoreTrainEngine:
         if uri is not None:
             self._elastic_state_server.release(uri)
 
-
     def load_elastic_state_snapshot(self, snapshot_path, *, target_core_id=None, replica_rank=None):
         from RL_Framework.infra.elastic.state_transfer import receive_live_state
         uri = snapshot_path
@@ -1041,11 +1072,12 @@ class MegatronCoreTrainEngine:
     def _iter_recompute_micro_batches(self, trajectories: list[dict[str, Any]]):
         for start in range(0, len(trajectories), self.recompute_micro_batch_size):
             rows = trajectories[start : start + self.recompute_micro_batch_size]
-            yield self._pad_micro_batch(rows)
+            yield self._pad_micro_batch(rows, require_anchor=False)
 
     def _pad_micro_batch(
         self,
         trajectories: list[dict[str, Any]],
+        *, require_anchor: bool = True,
     ) -> dict[str, Any]:
         device = self._device()
         max_length = max(int(item["input_ids"].shape[-1]) for item in trajectories)
@@ -1056,32 +1088,43 @@ class MegatronCoreTrainEngine:
             dtype=torch.long,
             device=device,
         )
-        old_logprobs = torch.zeros(
-            (batch_size, max_length),
-            dtype=torch.float32,
-            device=device,
-        )
-        loss_mask = torch.zeros_like(old_logprobs)
+        decoupled = is_decoupled(self)
+        old_logprobs = (torch.zeros((batch_size, max_length), dtype=torch.float32, device=device)
+                        if require_anchor else None)
+        behavior_logprobs = torch.zeros_like(old_logprobs) if require_anchor and decoupled else None
+        loss_mask = torch.zeros((batch_size, max_length), dtype=torch.float32, device=device)
         rewards = torch.zeros(batch_size, dtype=torch.float32, device=device)
         advantages = torch.zeros_like(rewards)
         for index, trajectory in enumerate(trajectories):
             length = int(trajectory["input_ids"].shape[-1])
             input_ids[index, :length] = trajectory["input_ids"][0].to(device)
-            old_logprobs[index, :length] = trajectory["logprobs"][0].to(device)
+            if require_anchor:
+                if decoupled:
+                    _validate_probability(trajectory, "logprobs", contents=False)
+                    _validate_probability(trajectory, "behavior_logprobs", contents=False)
+                values = trajectory["logprobs"].detach()
+                old_logprobs[index, :values.shape[1]] = values[0].to(device)
+                if decoupled:
+                    values = trajectory["behavior_logprobs"].detach()
+                    behavior_logprobs[index, :values.shape[1]] = values[0].to(device)
             loss_mask[index, :length] = trajectory["loss_mask"][0].to(device)
             rewards[index] = trajectory["rewards"].reshape(-1)[0].to(device)
             advantages[index] = trajectory.get(
                 "advantages",
                 trajectory["rewards"],
             ).reshape(-1)[0].to(device)
-        return {
+        result = {
             "input_ids": input_ids,
-            "old_logprobs": old_logprobs,
             "loss_mask": loss_mask,
             "rewards": rewards,
             "advantages": advantages,
             "trajectories": trajectories,
         }
+        if require_anchor:
+            result["old_logprobs"] = old_logprobs
+            if decoupled:
+                result["behavior_logprobs"] = behavior_logprobs
+        return result
 
     def _forward(self, micro_batch: dict[str, Any]) -> torch.Tensor:
         micro_batch = self._pad_micro_batch_for_sequence_parallel(micro_batch)
@@ -1105,9 +1148,13 @@ class MegatronCoreTrainEngine:
         self,
         logits: torch.Tensor,
         input_ids: torch.Tensor,
+        action_positions: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         local_logits = logits[:, :-1, :]
         targets = input_ids[:, 1:]
+        if action_positions is not None:
+            local_logits = local_logits[action_positions]
+            targets = targets[action_positions]
         if self.train_tp_size == 1:
             return torch.gather(
                 F.log_softmax(local_logits.float(), dim=-1),
@@ -1121,11 +1168,6 @@ class MegatronCoreTrainEngine:
         dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=tp_group)
         shifted = local_logits.float() - local_max.unsqueeze(-1)
         denominator = torch.exp(shifted).sum(dim=-1)
-        denominator = dist_nn.all_reduce(
-            denominator,
-            op=dist.ReduceOp.SUM,
-            group=tp_group,
-        )
         local_vocab = local_logits.shape[-1]
         vocab_start = (
             parallel_state.get_tensor_model_parallel_rank() * local_vocab
@@ -1139,11 +1181,11 @@ class MegatronCoreTrainEngine:
             local_targets.unsqueeze(-1),
         ).squeeze(-1)
         selected = selected.masked_fill(~local_mask, 0.0)
-        selected = dist_nn.all_reduce(
-            selected,
-            op=dist.ReduceOp.SUM,
-            group=tp_group,
-        )
+        # Each rank differentiates the same full-vocabulary logprob. Only the
+        # forward values are reduced; backward is local to each vocab shard.
+        with torch.no_grad():
+            dist.all_reduce(denominator, op=dist.ReduceOp.SUM, group=tp_group)
+            dist.all_reduce(selected, op=dist.ReduceOp.SUM, group=tp_group)
         return selected - local_max - torch.log(denominator)
 
     def _loss(
@@ -1151,40 +1193,42 @@ class MegatronCoreTrainEngine:
         micro_batch: dict[str, Any],
         logits: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        action_log_probs = self._action_log_probs(
-            logits,
-            micro_batch["input_ids"],
-        )
-        old_logprobs = micro_batch["old_logprobs"][:, 1:]
         loss_mask = micro_batch["loss_mask"][:, 1:]
-        advantages = micro_batch["advantages"]
-        log_ratio = action_log_probs - old_logprobs
+        action_positions = loss_mask.nonzero(as_tuple=True)
+        action_rows = action_positions[0]
+        current = self._action_log_probs(logits, micro_batch["input_ids"], action_positions)
+        anchor = micro_batch["old_logprobs"].detach()[:, 1:][action_positions]
+        advantages = micro_batch["advantages"][action_rows]
+        action_counts = loss_mask.sum(dim=-1).clamp_min(1.0)[action_rows]
+        decoupled = is_decoupled(self)
+        if decoupled:
+            behavior = micro_batch["behavior_logprobs"].detach()[:, 1:][action_positions]
+            weights = torch.exp(anchor - behavior)
+        else:
+            weights = loss_mask[action_positions]
+        log_ratio = current - anchor
         ratio = torch.exp(log_ratio.clamp(min=-20.0, max=20.0))
-        clipped_ratio = torch.clamp(
-            ratio,
-            1.0 - self.clip_epsilon,
-            1.0 + self.clip_epsilon,
-        )
-        pg_loss = torch.maximum(
-            -advantages.unsqueeze(1) * ratio,
-            -advantages.unsqueeze(1) * clipped_ratio,
-        )
-        # A trajectory is one sample of the fixed global batch. Its weight
-        # must not depend on its token count or on the elastic microbatch split.
-        count = loss_mask.sum(dim=-1).clamp(min=1.0)
-        pg_loss = ((pg_loss * loss_mask).sum(dim=-1) / count).mean()
-        # Positive second-order approximation of KL(old_policy || new_policy).
-        kl_per_token = (ratio - 1.0) - log_ratio
-        kl = ((kl_per_token * loss_mask).sum(dim=-1) / count).mean()
-        loss = pg_loss + self.kl_coef * kl
-        return loss, {
-            "loss": float(loss.detach()),
-            "pg_loss": float(pg_loss.detach()),
-            "kl": float(kl.detach()),
-            "reward_sum": float(micro_batch["rewards"].sum()),
-            "n_samples": float(micro_batch["rewards"].numel()),
-            "n_updates": 1.0,
-        }
+        clipped = ratio.clamp(1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon)
+        weights_per_trajectory = weights / action_counts
+        sample_count = loss_mask.shape[0]
+        pg_per_action = torch.maximum(-advantages * ratio, -advantages * clipped)
+        kl_per_action = (ratio - 1.0) - log_ratio
+        pg = (weights_per_trajectory * pg_per_action).sum() / sample_count
+        kl = (weights_per_trajectory * kl_per_action).sum() / sample_count
+        loss = pg + self.kl_coef * kl
+        if decoupled:
+            checks = torch.stack((torch.isfinite(current).all() & (current <= 1e-6).all(),
+                torch.isfinite(weights).all() & (weights > 0).all(), torch.isfinite(loss)))
+            # One combined host read before backward; no diagnostic reductions.
+            for valid, message in zip(checks.tolist(), (
+                    "Active current logprobs must be finite and nonpositive",
+                    "Raw anchor/behavior importance ratios overflowed or underflowed",
+                    "Decoupled PPO loss is nonfinite")):
+                if not valid:
+                    raise FloatingPointError(message)
+        return loss, dict(loss=loss.detach(), pg_loss=pg.detach(), kl=kl.detach(),
+            reward_sum=micro_batch["rewards"].sum().detach(),
+            n_samples=float(micro_batch["rewards"].numel()), n_updates=1.0)
 
     def _reduce_stats(self, stats: dict[str, float]) -> dict[str, float]:
         updates = float(stats["n_updates"])
@@ -1210,19 +1254,23 @@ class MegatronCoreTrainEngine:
         dist.all_reduce(values, op=dist.ReduceOp.SUM, group=group)
         global_updates = values[5].clamp(min=1.0)
         global_samples = values[4].clamp(min=1.0)
-        return {
-            "loss": float(values[0] / global_samples),
-            "pg_loss": float(values[1] / global_samples),
-            "kl": float(values[2] / global_samples),
-            "reward_sum": float(values[3]),
-            "n_samples": float(values[4]),
-            "n_updates": float(values[5]),
-            "reward_mean": float(values[3] / values[4].clamp(min=1.0)),
-            "grad_norm": float(values[6] / global_updates),
-        }
+        result = dict(zip(
+            ("loss", "pg_loss", "kl", "reward_sum", "n_samples", "n_updates", "reward_mean", "grad_norm"),
+            torch.stack((values[0] / global_samples, values[1] / global_samples,
+                values[2] / global_samples, values[3], values[4], values[5],
+                values[3] / global_samples, values[6] / global_updates)).tolist(),
+        ))
+        return result
 
     @staticmethod
     def _merge_stats(stats: list[dict[str, float]]) -> dict[str, float]:
+        stats = [dict(item) for item in stats]
+        pending = [(index, key, value) for index, item in enumerate(stats)
+                   for key, value in item.items() if isinstance(value, torch.Tensor)]
+        if pending:
+            values = torch.stack([value.detach().float() for _, _, value in pending]).cpu().tolist()
+            for (index, key, _), value in zip(pending, values):
+                stats[index][key] = value
         if not stats:
             return {
                 "loss": 0.0,
@@ -1236,7 +1284,7 @@ class MegatronCoreTrainEngine:
         updates = sum(float(item.get("n_updates", 1.0)) for item in stats)
         samples = sum(float(item.get("n_samples", 0.0)) for item in stats)
         reward_sum = sum(float(item.get("reward_sum", 0.0)) for item in stats)
-        return {
+        result = {
             "loss": sum(
                 float(item["loss"]) * float(item.get("n_samples", 0.0))
                 for item in stats
@@ -1259,6 +1307,7 @@ class MegatronCoreTrainEngine:
                 for item in stats
             ) / max(updates, 1.0),
         }
+        return result
 
     def _zero_grad(self) -> None:
         for model_chunk in self.model:
@@ -1299,7 +1348,6 @@ class MegatronCoreTrainEngine:
                     # finalized local shard before gathering back into it.
                     local = flat[rank * width:(rank + 1) * width].clone()
                     dist.all_gather_into_tensor(flat, local, group=group)
-
 
     def _apply_elastic_inter_replica_gradients(self) -> list[dict[str, float]]:
         pending = getattr(self, "_pending_hybrid_gradients", [])
@@ -1349,7 +1397,7 @@ class MegatronCoreTrainEngine:
         if weighted and world > 1:
             for grad in local:
                 grad.div_(world)
-        consumed_before = set(self.elastic_gradient_domain._consumed_payloads)
+        hybrid_stats = []
         reduced = self.elastic_gradient_domain.reduce_core_gradients(
             core_gradients={core_id: local}, hybrid_payloads=pending,
             core_sample_counts={core_id: partition[1]} if weighted else None,
@@ -1357,14 +1405,8 @@ class MegatronCoreTrainEngine:
             step=self._elastic_training_step,
             state_version=self._elastic_expected_state_version,
             in_place=True,
+            accepted_hybrid_stats=hybrid_stats,
         )
-        # The reducer owns acceptance and lane routing. Only identities newly
-        # consumed by this successful reduction may contribute sample metrics.
-        consumed = self.elastic_gradient_domain._consumed_payloads - consumed_before
-        hybrid_stats = [payload.stats for payload in pending
-                        if (payload.replica_id, payload.replica_rank, payload.step,
-                            payload.state_version, payload.membership_epoch) in consumed
-                        and payload.stats]
         for (_, grad), reduced_grad in zip(
             params_and_grads,
             reduced[core_id],

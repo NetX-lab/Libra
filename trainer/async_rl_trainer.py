@@ -25,7 +25,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-from RL_Framework.config import AsyncRLConfig, HeterogeneousInstanceConfig
+from RL_Framework.config import AsyncRLConfig, HeterogeneousInstanceConfig, validate_grpo_objective
 from RL_Framework.infra.elastic.batch_partition import (
     complete_group_sample_counts, partition_complete_grpo_groups,
 )
@@ -44,6 +44,7 @@ from RL_Framework.infra.observability.history_collector import HistoryDataCollec
 from RL_Framework.infra.observability.phase_tracer import PhaseTracer
 from RL_Framework.infra.sync.staleness import StalenessManager
 from RL_Framework.infra.sync.weight_sync import WeightSyncFactory
+from RL_Framework.workflow.behavior import SamplingEvidenceError
 
 
 @dataclass
@@ -184,6 +185,12 @@ class AsyncRLTrainer:
             }
             for _ in range(probe_count)
         ]
+        if getattr(self.config, "grpo_objective", "legacy") == "decoupled":
+            # Synthetic rows belong only to the memory preflight. Real training
+            # trajectories must carry their original sampler evidence.
+            for trajectory in trajectories:
+                trajectory["loss_mask"][:, 0] = 0
+                trajectory["behavior_logprobs"] = torch.zeros_like(trajectory["logprobs"])
 
         if self.is_main_process:
             print(
@@ -223,8 +230,19 @@ class AsyncRLTrainer:
         if self.is_main_process:
             print("[GRP memory preflight] passed", flush=True)
 
+    def _configure_training_objective(self, workflow):
+        validate_grpo_objective(self.config)
+        if getattr(self.config, "grpo_objective", "legacy") != "decoupled":
+            return
+        from RL_Framework.workflow.r2e_gym import R2EGymWorkflow
+
+        if not isinstance(workflow, R2EGymWorkflow):
+            raise ValueError("decoupled GRPO currently requires R2EGymWorkflow")
+        workflow.configure_objective("decoupled", seed=self.config.seed)
+
     def setup(self, workflow):
         """Setup."""
+        self._configure_training_objective(workflow)
         self.workflow = workflow
 
         planner_cfg = getattr(self.config, "global_resource_planner", None)
@@ -412,6 +430,7 @@ class AsyncRLTrainer:
         staleness_manager = self.staleness_manager
         train_engine = self.train_engine
         max_staleness = self.config.max_head_offpolicyness
+        exact_sampling = getattr(self.config, "grpo_objective", "legacy") == "decoupled"
 
         async def _execute():
             try:
@@ -436,9 +455,15 @@ class AsyncRLTrainer:
                 trajectory["grpo_rollout_index"] = task_input.rollout_index
 
 
-                current_version = train_engine.get_version()
-                traj_version = trajectory.get("versions", torch.tensor([task_input.version]))
-                version_val = traj_version.min().item()
+                if exact_sampling:
+                    current_version = train_engine.optimizer_revision
+                    version_val = trajectory.get("sample_revision")
+                    if type(version_val) is not int or not 0 <= version_val <= current_version:
+                        raise SamplingEvidenceError("Invalid actual sampling revision")
+                else:
+                    current_version = train_engine.get_version()
+                    traj_version = trajectory.get("versions", torch.tensor([task_input.version]))
+                    version_val = traj_version.min().item()
                 staleness = current_version - version_val
 
                 if staleness <= max_staleness:
@@ -470,6 +495,10 @@ class AsyncRLTrainer:
                 }
             except Exception as e:
                 staleness_manager.on_rollout_rejected()
+                if exact_sampling or isinstance(e, SamplingEvidenceError):
+                    if self.dispatcher is not None:
+                        self.dispatcher.report_fatal_error(e)
+                    raise
                 if self.is_main_process:
                     print(f"ERROR: Rollout task_id={task_input.task_id} failed: {e}")
                 return None
@@ -860,6 +889,10 @@ class AsyncRLTrainer:
                 data_gen, local_batch_size, active_hybrid_ids,
             )
             self._trace_train_phase(step, "collect_batch_done", batch_size=len(batch))
+
+            if getattr(self.config, "grpo_objective", "legacy") == "decoupled":
+                # Padding, advantages and anchors belong to this training view.
+                batch = [dict(row) for row in batch]
 
             align_trajectories = getattr(
                 self.train_engine,
@@ -2975,6 +3008,7 @@ class AsyncRLTrainer:
             torch.save(
                 {
                     "trajectories": trajectories,
+                    "grpo_objective": getattr(self.config, "grpo_objective", "legacy"),
                     "step": int(step),
                     "state_version": state_version,
                     "membership_epoch": int(state.get("membership_epoch", 0)),

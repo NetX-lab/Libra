@@ -146,6 +146,17 @@ def _gradient_client(args, endpoint_data):
     return ElasticGradientClient(endpoint)
 
 
+def _prepare_training_task(engine, data):
+    """Check the task's policy contract before recomputing its local anchor."""
+    objective = getattr(engine, "grpo_objective", "legacy")
+    if data.get("grpo_objective", "legacy") != objective:
+        raise ValueError("Hybrid task and worker have different GRPO objectives")
+    if objective == "decoupled":
+        if int(data["state_version"]) != engine.optimizer_revision:
+            raise ValueError("Hybrid anchor requires the task's installed optimizer revision")
+    engine.recompute_logprobs(data["trajectories"])
+
+
 def main():
     args = parse_args()
     snapshot = args.snapshot_path
@@ -217,7 +228,7 @@ def main():
                     if task_snapshot and task_snapshot != str(snapshot):
                         engine.load_elastic_state_snapshot(task_snapshot, target_core_id=args.target_core_id, replica_rank=int(os.environ.get("RANK", "0")))
                         snapshot = task_snapshot
-                    engine.recompute_logprobs(data["trajectories"])
+                    _prepare_training_task(engine, data)
                     payload = engine.compute_elastic_gradient_payload(data["trajectories"], worker_id=args.replica_id or args.worker_id, target_core_id=args.target_core_id, step=int(data["step"]), state_version=int(data["state_version"]), membership_epoch=int(data["membership_epoch"]), global_sample_count=int(data.get("global_sample_count", 0)))
                 else:
                     payload = _load_payload_file(task_path, worker_id=args.worker_id, target_core_id=args.target_core_id, args=args)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import os
 import random
 from typing import TYPE_CHECKING, Any, Callable
@@ -51,6 +52,8 @@ class R2EGymWorkflow:
         top_p: float = 1.0,
         n_samples: int = 1,
         patch_harness: R2EPatchExecutionHarness | R2ESingularityPatchHarness | None = None,
+        grpo_objective: str = "legacy",
+        run_seed: int = 0,
     ):
         self.reward_fn = reward_fn
         self.tokenizer = tokenizer
@@ -67,6 +70,21 @@ class R2EGymWorkflow:
         self.top_p = top_p
         self.n_samples = n_samples
         self.patch_harness = patch_harness
+        self.configure_objective(grpo_objective, seed=run_seed)
+
+    def configure_objective(self, objective: str, *, seed: int = 0):
+        """Select the sampling probabilities needed by the training objective."""
+        if objective not in {"legacy", "decoupled"}:
+            raise ValueError(f"Unknown grpo_objective: {objective}")
+        if type(seed) is not int:
+            raise TypeError("run_seed must be an integer")
+        if objective == "decoupled" and (
+            not math.isfinite(self.temperature) or self.temperature <= 0
+            or not math.isfinite(self.top_p) or not 0 < self.top_p <= 1
+        ):
+            raise ValueError("Decoupled R2E sampling requires positive temperature and valid top_p")
+        self.grpo_objective = objective
+        self.run_seed = seed
 
     def _encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text or "", add_special_tokens=False)
@@ -172,175 +190,173 @@ class R2EGymWorkflow:
         version: int = 0,
         rollout_index: int = 0,
     ) -> dict[str, torch.Tensor]:
+        from RL_Framework.workflow.behavior import (
+            SamplingEvidenceError, ValidatedBehaviorTrace, validate_behavior_trace,
+        )
+
+        exact = self.grpo_objective == "decoupled"
         prompt_text = self._build_initial_prompt(data)
-        prompt_tokens = self._encode(prompt_text)
-        segments: list[tuple[list[int], list[float], int]] = [
-            (prompt_tokens, [0.0] * len(prompt_tokens), 0)
-        ]
-        tool_returns: list[dict[str, Any]] = []
-
-        prompt_id = str(
-            data.get(
-                "prompt_id",
-                f"{data.get('repo_name', 'repo')}:{data.get('commit_hash', '')}",
-            )
-        )
-        begin_cmlfq = getattr(engine, "begin_cmlfq_request", None)
-        cmlfq_request_id = (
-            begin_cmlfq(prompt_id, len(prompt_tokens))
-            if callable(begin_cmlfq)
-            else ""
-        )
-
-        current_text = prompt_text
+        ids = self._encode(prompt_text)
+        initial_length = len(ids)
+        if exact and (not ids or initial_length + 17 > self.max_seq_length):
+            raise SamplingEvidenceError("Initial prompt leaves no safe generation budget")
+        probabilities, masks = [0.0] * initial_length, [0] * initial_length
+        prompt_id = str(data.get("prompt_id", f"{data.get('repo_name', 'repo')}:{data.get('commit_hash', '')}"))
+        begin = getattr(engine, "begin_cmlfq_request", None)
+        request_id = begin(prompt_id, initial_length) if callable(begin) else ""
+        tool_returns, current_text, final_completion = [], prompt_text, ""
         final_turn = 0
-        final_completion = ""
-
+        sample_revision = None
+        generated_tokens = 0
         try:
             for turn in range(self.max_turns):
+                if exact and len(ids) + 17 > self.max_seq_length:
+                    break
                 final_turn = turn
-                used_tokens = sum(len(tokens) for tokens, _, _ in segments)
-                generation_prompt, generation_prompt_tokens = self._fit_generation_prompt(current_text)
-                max_tokens_this_turn = self._generation_budget(
-                    prompt_tokens=generation_prompt_tokens,
-                    used_sequence_tokens=used_tokens,
-                    turn=turn,
+                prompt_ids = list(ids) if exact else None
+                generation_prompt, prompt_length = (
+                    (self.tokenizer.decode(prompt_ids, skip_special_tokens=False), len(prompt_ids))
+                    if exact else self._fit_generation_prompt(current_text)
+                )
+                limit = self._generation_budget(
+                    prompt_tokens=prompt_length, used_sequence_tokens=len(ids), turn=turn,
                     reserve_feedback_tokens=128 if turn < self.max_turns - 1 else 0,
                 )
-                generate_kwargs = {
-                    "prompt_id": prompt_id,
-                    "prompt": generation_prompt,
-                    "max_new_tokens": max_tokens_this_turn,
-                    "temperature": self.temperature,
-                    "top_p": self.top_p,
-                    "n": 1,
-                    # Exact count from the fitter; skips engine estimation.
-                    "input_tokens": generation_prompt_tokens,
-                    # Issue generation has an explicit closing delimiter.
-                    "stop": [] if self.patch_harness else ["[/ISSUE]"],
-                    "include_stop_str_in_output": True,
-                    "seed": int.from_bytes(
-                        hashlib.sha256(
-                            f"{prompt_id}:{version}:{rollout_index}:{turn}".encode()
-                        ).digest()[:8],
-                        "big",
-                    ) % (2**31 - 1),
-                }
-                if cmlfq_request_id:
-                    generate_kwargs.update({
-                        "request_id": cmlfq_request_id,
-                        "prompt_id": prompt_id,
-                    })
-                response = await engine.generate(**generate_kwargs)
-
-                output_text = response["text"]
-                output_tokens = self._encode(output_text)
-                output_logprobs = response.get("logprobs", [])
-                if not output_logprobs or len(output_logprobs) != len(output_tokens):
-                    output_logprobs = [0.0] * len(output_tokens)
-                output_tokens, output_logprobs = self._clip_tokens_to_sequence_budget(
-                    output_tokens,
-                    output_logprobs,
-                    used_sequence_tokens=used_tokens,
+                seed = (
+                    self.sampling_seed(data, version=version, rollout_index=rollout_index, turn=turn)
+                    if exact else int.from_bytes(hashlib.sha256(
+                        f"{prompt_id}:{version}:{rollout_index}:{turn}".encode()).digest()[:8],
+                        "big") % (2**31 - 1)
                 )
-                output_text = self.tokenizer.decode(output_tokens, skip_special_tokens=True)
-                final_completion = output_text
+                kwargs = dict(
+                    prompt_id=prompt_id, prompt=generation_prompt,
+                    max_new_tokens=limit, input_tokens=prompt_length,
+                    temperature=self.temperature, top_p=self.top_p, n=1,
+                    stop=[] if self.patch_harness else ["[/ISSUE]"],
+                    seed=seed,
+                )
+                if exact:
+                    kwargs.update(prompt_token_ids=prompt_ids, capture_behavior=True,
+                        include_stop_str_in_output=True)
+                if request_id:
+                    kwargs["request_id"] = request_id
+                response = await engine.generate(**kwargs)
+                if exact:
+                    sampled = response.get("behavior_trace")
+                    if not isinstance(sampled, ValidatedBehaviorTrace):
+                        sampled = validate_behavior_trace(
+                            response, prompt_ids, seed=seed, temperature=self.temperature,
+                            top_p=self.top_p, output_limit=limit,
+                        )
+                    output_tokens, output_logprobs = sampled["output_token_ids"], sampled["logprobs"]
+                    final_completion = response["text"]
+                else:
+                    output_tokens = self._encode(response["text"])
+                    output_logprobs = response.get("logprobs", [])
+                    if not output_logprobs or len(output_logprobs) != len(output_tokens):
+                        output_logprobs = [0.0] * len(output_tokens)
+                    output_tokens, output_logprobs = self._clip_tokens_to_sequence_budget(
+                        output_tokens, output_logprobs, used_sequence_tokens=len(ids),
+                    )
+                    final_completion = self.tokenizer.decode(output_tokens, skip_special_tokens=True)
                 if output_tokens:
-                    segments.append((output_tokens, output_logprobs, 1))
-
-                metrics = await self._score(output_text, data)
+                    revision = response.get("sample_revision")
+                    if exact and (type(revision) is not int or revision < 0):
+                        raise SamplingEvidenceError("Action omitted a valid actual sampling revision")
+                    if type(revision) is int:
+                        sample_revision = revision if sample_revision is None else min(sample_revision, revision)
+                ids.extend(output_tokens)
+                generated_tokens += len(output_tokens)
+                probabilities.extend(output_logprobs)
+                masks.extend([1] * len(output_tokens))
+                metrics = await self._score(final_completion, data)
                 if turn >= self.max_turns - 1 or metrics["reward"] >= self.stop_reward:
                     break
-
-                feedback = (
-                    f"### Patch execution\n{metrics['execution']}\nRevise the patch."
-                    if self.patch_harness else format_validator_feedback(metrics)
+                feedback = self._format_feedback(metrics)
+                feedback_tokens = self._encode("\n" + feedback + "\n" if exact else feedback)
+                if exact:
+                    if len(ids) + len(feedback_tokens) + 17 > self.max_seq_length:
+                        break
+                else:
+                    feedback_tokens, _ = self._clip_tokens_to_sequence_budget(
+                        feedback_tokens, [0.0] * len(feedback_tokens), used_sequence_tokens=len(ids),
+                    )
+                    if not feedback_tokens:
+                        break
+                    feedback = self.tokenizer.decode(feedback_tokens, skip_special_tokens=True)
+                    current_text += final_completion + "\n" + feedback + "\n"
+                ids.extend(feedback_tokens)
+                probabilities.extend([0.0] * len(feedback_tokens))
+                masks.extend([0] * len(feedback_tokens))
+                total_output = len(ids) - initial_length
+                event = dict(
+                    tool_type="r2e_patch_executor" if self.patch_harness else "r2e_issue_validator",
+                    output=feedback,
+                    status="success" if metrics["reward"] >= self.stop_reward else "failure",
+                    payload_tokens=len(feedback_tokens), token_position=total_output, turn=turn,
+                    generated_token_position=generated_tokens,
+                    reward=metrics["reward"],
                 )
-                feedback_tokens = self._encode(feedback)
-                used_after_output = sum(len(tokens) for tokens, _, _ in segments)
-                feedback_tokens, feedback_logprobs = self._clip_tokens_to_sequence_budget(
-                    feedback_tokens,
-                    [0.0] * len(feedback_tokens),
-                    used_sequence_tokens=used_after_output,
+                tool_returns.append(event)
+                route = getattr(engine, "route_cmlfq_tool_return", None)
+                if request_id and callable(route):
+                    route(request_id, event, total_output)
+            total_output = len(ids) - initial_length
+            for event in tool_returns:
+                event["remaining_length"] = (
+                    generated_tokens - event["generated_token_position"] if exact
+                    else total_output - event["token_position"]
                 )
-                if not feedback_tokens:
-                    break
-                feedback = self.tokenizer.decode(feedback_tokens, skip_special_tokens=True)
-                segments.append((feedback_tokens, feedback_logprobs, 0))
-                generated_tokens = sum(len(tokens) for tokens, _, _ in segments[1:])
-                tool_event = {
-                    "tool_type": "r2e_patch_executor" if self.patch_harness else "r2e_issue_validator",
-                    "output": feedback,
-                    "status": "success" if metrics["reward"] >= self.stop_reward else "failure",
-                    "payload_tokens": len(feedback_tokens),
-                    "token_position": generated_tokens,
-                    "turn": turn,
-                    "reward": metrics["reward"],
-                }
-                tool_returns.append(tool_event)
-
-                route_tool_return = getattr(engine, "route_cmlfq_tool_return", None)
-                if cmlfq_request_id and callable(route_tool_return):
-                    route_tool_return(cmlfq_request_id, tool_event, generated_tokens)
-
-                current_text += output_text + "\n" + feedback + "\n"
+            output_length = sum(masks)
+            if not exact:
+                ids = ids[:self.max_seq_length]
+                probabilities = probabilities[:self.max_seq_length]
+                masks = masks[:self.max_seq_length]
+            completion = final_completion if exact else (
+                final_completion or self.tokenizer.decode(ids, skip_special_tokens=True))
+            reward = metrics["reward"] if self.patch_harness else self.reward_fn(
+                prompt=prompt_text, completion=completion,
+                target_issue=data.get("target_issue", data.get("task_text", "")),
+                expected_output_json=data.get("expected_output_json"),
+                modified_files=data.get("modified_files"),
+            )
+            if exact and not output_length:
+                raise SamplingEvidenceError("Consumed action mask/count must include sampled tokens")
+            ids_tensor = torch.tensor(ids, dtype=torch.long).unsqueeze(0)
+            trajectory = dict(
+                input_ids=ids_tensor, attention_mask=torch.ones_like(ids_tensor),
+                loss_mask=torch.tensor(masks, dtype=torch.long).unsqueeze(0),
+                rewards=torch.tensor([reward], dtype=torch.float32),
+                versions=torch.tensor([version], dtype=torch.long), input_len=initial_length,
+                output_len=output_length, total_output_tokens=total_output, prompt_id=prompt_id,
+                sequence_length=len(ids),
+                tool_returns=tool_returns, cmlfq_request_id=request_id, n_turns=final_turn + 1,
+            )
+            if sample_revision is not None:
+                trajectory["sample_revision"] = sample_revision
+            trajectory["behavior_logprobs" if exact else "logprobs"] = torch.tensor(
+                probabilities, dtype=torch.float32).unsqueeze(0)
+            finish = getattr(engine, "finish_cmlfq_request", None)
+            if request_id and callable(finish):
+                finish(request_id, total_output)
+            return trajectory
         except BaseException:
-            # BaseException: CancelledError (task cancellation) must also
-            # release the C-MLFQ request state, otherwise the leaked entry
-            # wedges wait_until_idle until timeout.
-            cancel_cmlfq = getattr(engine, "cancel_cmlfq_request", None)
-            if cmlfq_request_id and callable(cancel_cmlfq):
-                cancel_cmlfq(cmlfq_request_id)
+            # Cancellation must retire CMLFQ state too, or idle waits can hang.
+            cancel = getattr(engine, "cancel_cmlfq_request", None)
+            if request_id and callable(cancel):
+                cancel(request_id)
             raise
 
-        all_input_ids: list[int] = []
-        all_logprobs: list[float] = []
-        all_loss_masks: list[int] = []
-        for toks, lps, mask_val in segments:
-            all_input_ids.extend(toks)
-            all_logprobs.extend(lps)
-            all_loss_masks.extend([mask_val] * len(toks))
-        assert len(all_input_ids) == len(all_logprobs) == len(all_loss_masks)
-        if len(all_input_ids) > self.max_seq_length:
-            all_input_ids = all_input_ids[:self.max_seq_length]
-            all_logprobs = all_logprobs[:self.max_seq_length]
-            all_loss_masks = all_loss_masks[:self.max_seq_length]
+    def sampling_seed(self, data, *, version, rollout_index, turn):
+        prompt_id = str(data.get("prompt_id", f"{data.get('repo_name', 'repo')}:{data.get('commit_hash', '')}"))
+        identity = f"{self.run_seed}:{prompt_id}:{version}:{rollout_index}:{turn}"
+        return int.from_bytes(hashlib.sha256(identity.encode()).digest()[:8], "big") % (2**31 - 1)
 
-        output_len = sum(len(toks) for toks, _, mask in segments if mask == 1)
-        total_output_tokens = sum(len(toks) for toks, _, _ in segments[1:])
-        for tool_event in tool_returns:
-            position = int(tool_event.get("token_position", total_output_tokens))
-            tool_event["remaining_length"] = max(0, total_output_tokens - position)
-
-        finish_cmlfq = getattr(engine, "finish_cmlfq_request", None)
-        if cmlfq_request_id and callable(finish_cmlfq):
-            finish_cmlfq(cmlfq_request_id, total_output_tokens)
-
-        full_completion = self.tokenizer.decode(all_input_ids, skip_special_tokens=True)
-        reward = metrics["reward"] if self.patch_harness else self.reward_fn(
-            prompt=prompt_text,
-            completion=final_completion or full_completion,
-            target_issue=data.get("target_issue", data.get("task_text", "")),
-            expected_output_json=data.get("expected_output_json"),
-            modified_files=data.get("modified_files"),
+    def _format_feedback(self, metrics):
+        return (
+            f"### Patch execution\n{metrics['execution']}\nRevise the patch."
+            if self.patch_harness else format_validator_feedback(metrics)
         )
-
-        seq_tensor = torch.tensor(all_input_ids, dtype=torch.long)
-        return {
-            "input_ids": seq_tensor.unsqueeze(0),
-            "attention_mask": torch.ones_like(seq_tensor).unsqueeze(0),
-            "logprobs": torch.tensor(all_logprobs, dtype=torch.float32).unsqueeze(0),
-            "loss_mask": torch.tensor(all_loss_masks, dtype=torch.long).unsqueeze(0),
-            "rewards": torch.tensor([reward], dtype=torch.float32),
-            "versions": torch.tensor([version], dtype=torch.long),
-            "input_len": len(prompt_tokens),
-            "output_len": max(0, output_len),
-            "total_output_tokens": int(total_output_tokens),
-            "prompt_id": prompt_id,
-            "tool_returns": tool_returns,
-            "cmlfq_request_id": cmlfq_request_id,
-            "n_turns": final_turn + 1,
-        }
 
     async def evaluate(
         self,
@@ -421,7 +437,6 @@ class R2EGymWorkflow:
                             "prompt_id": prompt_id,
                             "input_tokens": prompt_len,
                             "stop": [] if self.patch_harness else ["[/ISSUE]"],
-                            "include_stop_str_in_output": True,
                         }
                         if request_id:
                             generate_kwargs["request_id"] = request_id

@@ -87,6 +87,17 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                     f"background thread error: {self._thread_exception}"
                 ) from self._thread_exception
 
+    def report_fatal_error(self, exc: Exception):
+        """Stop admission and wake callers after a task reports invalid evidence."""
+        self._set_thread_exception(exc)
+        self.runner.pause()
+        # Do not hold the exception lock while taking either condition lock:
+        # waiting callers check that exception while holding the conditions.
+        with self._input_cv:
+            self._input_cv.notify_all()
+        with self._result_cv:
+            self._result_cv.notify_all()
+
     def _has_runner_capacity(self) -> bool:
         """Has runner capacity."""
         return (

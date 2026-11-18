@@ -4,6 +4,7 @@ import weakref
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from RL_Framework.engine.megatron_core_train_engine import (
     MegatronCoreTrainEngine,
@@ -49,7 +50,7 @@ def test_loss_uses_non_negative_ppo_kl_approximation(monkeypatch):
     monkeypatch.setattr(
         engine,
         "_action_log_probs",
-        lambda logits, input_ids: new_logprobs,
+        lambda logits, input_ids, positions: new_logprobs[positions],
     )
     micro_batch = {
         "input_ids": torch.tensor([[1, 2, 3]]),
@@ -232,3 +233,58 @@ def test_grpo_releases_backward_outputs_before_next_microbatch_and_optimizer(mon
     torch.testing.assert_close(parameter, reference)
     assert engine.optimizer_revision == 2
     assert all(output() is None for output in references)
+
+
+def _compare_vocab_shards(rank, rendezvous, bounded):
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    try:
+        engine = (MegatronCoreTrainEngine(model_path="unused", train_tp_size=2)
+                  if bounded else MegatronCoreTrainEngine.__new__(MegatronCoreTrainEngine))
+        engine._parallel_state = lambda: SimpleNamespace(
+            get_tensor_model_parallel_group=lambda: dist.group.WORLD,
+            get_tensor_model_parallel_rank=lambda: rank,
+        )
+        engine.grpo_objective = "decoupled"
+        engine.clip_epsilon, engine.kl_coef = .2, .1
+        logits = torch.tensor([[[1., 2., 3., 4.], [4., 2., -1., 0.], [0., 0., 0., 0.]]],
+                              requires_grad=True)
+        targets = torch.tensor([[0, 1, 3]])
+        engine.train_tp_size = 1
+        reference = engine._action_log_probs(logits, targets)
+        reference.sum().backward()
+        engine.train_tp_size = 2
+        vocab_shard = slice(rank * 2, (rank + 1) * 2)
+        local_logits = logits.detach()[..., vocab_shard].contiguous().requires_grad_()
+        result = engine._action_log_probs(local_logits, targets)
+        result.sum().backward()
+        torch.testing.assert_close(result, reference)
+        torch.testing.assert_close(local_logits.grad, logits.grad[..., vocab_shard])
+
+        masked_logits = logits.detach().clone()
+        masked_logits[0, 1].fill_(float("nan"))
+        masked_logits.requires_grad_()
+        local_masked_logits = masked_logits.detach()[..., vocab_shard].contiguous().requires_grad_()
+        logprobs = torch.tensor([[0., reference[0, 0].item(), float("nan")]])
+        batch = dict(input_ids=targets, old_logprobs=logprobs, behavior_logprobs=logprobs,
+                     loss_mask=torch.tensor([[0., 1., 0.]]), advantages=torch.ones(1),
+                     rewards=torch.ones(1))
+        engine.train_tp_size = 1
+        reference_loss, _ = engine._loss(batch, masked_logits)
+        reference_loss.backward()
+        engine.train_tp_size = 2
+        loss, _ = engine._loss(batch, local_masked_logits)
+        loss.backward()
+        torch.testing.assert_close(loss, reference_loss)
+        torch.testing.assert_close(local_masked_logits.grad, masked_logits.grad[..., vocab_shard])
+        assert not torch.count_nonzero(local_masked_logits.grad[:, 1:])
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="requires two CPU ranks")
+@pytest.mark.parametrize("bounded", [False, True], ids=["native", "bounded"])
+def test_tensor_parallel_logprobs_and_local_gradients_match_unsharded_vocab(tmp_path, bounded):
+    torch.multiprocessing.start_processes(
+        _compare_vocab_shards, args=(f"file://{tmp_path / 'rendezvous'}", bounded),
+        nprocs=2, start_method="fork",
+    )
