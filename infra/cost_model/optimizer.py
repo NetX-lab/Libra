@@ -353,24 +353,10 @@ class TwoLevelNestedOptimizer:
         self,
         tp: int,
         requests: list[RequestInfo],
-        *,
-        num_requests: int | None = None,
-        total_prompt_tokens: int = 0,
-        total_gen_tokens: int = 0,
-        max_seq: int = 0,
     ) -> tuple[float, dict]:
-        aggregate = getattr(self.cost_model, "evaluate_rollout_segment", None)
-        if (
-            aggregate is not None
-            and num_requests is not None
-        ):
-            return aggregate(
-                tp,
-                num_requests=num_requests,
-                total_prompt_tokens=total_prompt_tokens,
-                total_gen_tokens=total_gen_tokens,
-                max_seq=max_seq,
-            )
+        segment = getattr(self.cost_model, "evaluate_rollout_segment", None)
+        if segment is not None:
+            return segment(tp, requests)
         evaluator = getattr(self.cost_model, "evaluate_rollout_instance", None)
         if evaluator is not None:
             return evaluator(tp, requests)
@@ -404,12 +390,6 @@ class TwoLevelNestedOptimizer:
         ] = {}
         dp[0][0][(0, 0)] = 0.0
         segment_cache: dict[tuple[int, int, int], tuple[float, dict]] = {}
-        prompt_prefix = [0]
-        generation_prefix = [0]
-        for request in sorted_requests:
-            prompt_prefix.append(prompt_prefix[-1] + request.prompt_length)
-            generation_prefix.append(generation_prefix[-1] + request.gen_length)
-
         for gpus in range(1, n_rollout_gpus + 1):
             for served in range(length_count + 1):
                 for tp_index, tp in enumerate(tp_values):
@@ -418,29 +398,8 @@ class TwoLevelNestedOptimizer:
                     for previous_served in range(served + 1):
                         segment_key = (tp, previous_served, served)
                         if segment_key not in segment_cache:
-                            use_aggregate = (
-                                hasattr(self.cost_model, "evaluate_rollout_segment")
-                            )
                             segment_cache[segment_key] = self._instance_cost(
-                                tp,
-                                (
-                                    []
-                                    if use_aggregate
-                                    else sorted_requests[previous_served:served]
-                                ),
-                                num_requests=served - previous_served,
-                                total_prompt_tokens=(
-                                    prompt_prefix[served] - prompt_prefix[previous_served]
-                                ),
-                                total_gen_tokens=(
-                                    generation_prefix[served]
-                                    - generation_prefix[previous_served]
-                                ),
-                                max_seq=(
-                                    sorted_requests[served - 1].total_length
-                                    if served > previous_served
-                                    else 0
-                                ),
+                                tp, sorted_requests[previous_served:served],
                             )
                         instance_time = segment_cache[segment_key][0]
                         if not math.isfinite(instance_time):
@@ -528,11 +487,6 @@ class TwoLevelNestedOptimizer:
             return float("inf"), {"reason": "empty_rollout_config"}
         ordered = sorted(requests, key=lambda request: request.total_length)
         request_count = len(ordered)
-        prompt_prefix = [0]
-        generation_prefix = [0]
-        for request in ordered:
-            prompt_prefix.append(prompt_prefix[-1] + request.prompt_length)
-            generation_prefix.append(generation_prefix[-1] + request.gen_length)
         dp = [[float("inf")] * (request_count + 1) for _ in range(len(tp_list) + 1)]
         back: dict[tuple[int, int], int] = {}
         cache: dict[tuple[int, int, int], float] = {}
@@ -542,29 +496,8 @@ class TwoLevelNestedOptimizer:
                 for previous_served in range(served + 1):
                     key = (tp, previous_served, served)
                     if key not in cache:
-                        use_aggregate = hasattr(
-                            self.cost_model, "evaluate_rollout_segment"
-                        )
                         cache[key] = self._instance_cost(
-                            tp,
-                            (
-                                []
-                                if use_aggregate
-                                else ordered[previous_served:served]
-                            ),
-                            num_requests=served - previous_served,
-                            total_prompt_tokens=(
-                                prompt_prefix[served] - prompt_prefix[previous_served]
-                            ),
-                            total_gen_tokens=(
-                                generation_prefix[served]
-                                - generation_prefix[previous_served]
-                            ),
-                            max_seq=(
-                                ordered[served - 1].total_length
-                                if served > previous_served
-                                else 0
-                            ),
+                            tp, ordered[previous_served:served],
                         )[0]
                     candidate = max(
                         dp[instance_count - 1][previous_served], cache[key]
@@ -613,10 +546,13 @@ class TwoLevelNestedOptimizer:
         rollout_node_tp_pattern: list[int] | None = None,
         train_cp_size: int = 1,
         dp_batch_group_size: int = 1,
+        training_sequence_lengths: list[int] | None = None,
+        rollout_calls_per_trace: float = 1.0,
     ) -> OptimizationResult:
         start_time = time.perf_counter()
         requests = representative_global_batch(requests, B_global)
-        lengths = [request.total_length for request in requests] or [1024]
+        lengths = training_sequence_lengths or [request.training_length or request.total_length
+                                                for request in requests] or [1024]
         result = OptimizationResult()
         granularity = max(1, int(allocation_granularity_gpus))
         train_budgets = range(
@@ -689,6 +625,7 @@ class TwoLevelNestedOptimizer:
                 }
             if rollout_config is None or not math.isfinite(rollout_time):
                 continue
+            rollout_time *= float(rollout_calls_per_trace)
             global_time = max(best_train_time, rollout_time)
             if self.verbose:
                 result.all_evaluated.append({

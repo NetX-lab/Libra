@@ -245,6 +245,9 @@ class ProfilingConfig:
 
     train_workspace_bytes: float = 0.5e9  # 500MB
 
+    # Offline backend calibration, shared by GRP, CMLFQ and EHP.
+    calibration: dict = field(default_factory=dict)
+
     @classmethod
     def from_dict(cls, d: dict) -> "ProfilingConfig":
         """Build an instance from a dictionary."""
