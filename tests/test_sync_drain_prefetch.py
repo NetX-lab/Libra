@@ -1,6 +1,10 @@
 from types import SimpleNamespace
+import asyncio
 import queue
 import threading
+
+import pytest
+import torch
 
 from RL_Framework.infra.execution.async_runner import AsyncTaskRunner
 from RL_Framework.infra.execution.batch_dispatcher import BatchTaskDispatcher, TaskInput
@@ -11,6 +15,24 @@ from RL_Framework.trainer.async_rl_trainer import AsyncRLTrainer
 class _VersionProvider:
     def get_version(self):
         return 0
+
+
+@pytest.mark.parametrize(
+    "objective, dynamic, expected",
+    [("legacy", False, False), ("decoupled", False, True), ("decoupled", True, False)],
+)
+def test_sync1_r2e_requires_exact_sampling_and_fixed_runtime_layout(objective, dynamic, expected):
+    trainer = AsyncRLTrainer.__new__(AsyncRLTrainer)
+    trainer.config = SimpleNamespace(
+        grpo_objective=objective, train_backend="megatron_core", rollout_backend="vllm",
+        sync_interval=1, ppo_epochs=1, weight_sync_mode="nccl",
+        rollout_weight_sync_mode="nccl", require_rollout_weight_sync=True,
+        global_resource_planner=SimpleNamespace(enabled=True, runtime_dynamic_reconfiguration_enabled=dynamic),
+    )
+    trainer.start_step = 0
+    trainer.train_engine = SimpleNamespace(optimizer_revision=0, get_version=lambda: 0)
+    trainer._configure_rollout_production()
+    assert trainer._bounded_rollout_production is expected
 
 
 def test_staleness_runtime_limit_reduces_and_restores_capacity():
@@ -123,3 +145,48 @@ def test_dispatcher_rechecks_pause_after_dequeue_before_submit():
     assert manager.get_stats().cancelled == 1
     assert dispatcher.cancel_queued()['task_ids'] == []
     assert manager.get_stats().cancelled == 1
+
+
+@pytest.mark.parametrize("sync_interval", [5, 25])
+def test_legacy_collector_keeps_training_without_sample_revision_between_publications(sync_interval):
+    trainer = AsyncRLTrainer.__new__(AsyncRLTrainer)
+    trainer.config = SimpleNamespace(
+        n_samples=2, sync_interval=sync_interval, max_head_offpolicyness=1,
+        global_resource_planner=SimpleNamespace(runtime_batch_collection_timeout_s=4),
+    )
+    trainer.is_main_process = True
+    trainer._use_heterogeneous = False
+    trainer._pending_grpo_groups = {}
+    trainer.train_engine = _VersionProvider()
+    trainer.rollout_engine = object()
+
+    async def episode(engine, data, **kwargs):
+        if data.get("timeout"):
+            raise asyncio.TimeoutError
+        return {"rewards": torch.tensor([0.0]), "versions": torch.tensor([kwargs["version"]])}
+
+    trainer.workflow = SimpleNamespace(run_episode=episode)
+    manager = trainer.staleness_manager = StalenessManager(trainer.train_engine, 8, 2, 1)
+    runner = AsyncTaskRunner(max_queue_size=16)
+    dispatcher = trainer.dispatcher = BatchTaskDispatcher(runner, manager, trainer._create_rollout_task)
+
+    def inputs():
+        for group in range(sync_interval + 4):
+            for member in range(2):
+                yield TaskInput(
+                    2 * group + member, {"timeout": group == 0},
+                    group_id=str(group), rollout_index=member,
+                )
+
+    work = inputs()
+    runner.initialize()
+    dispatcher.initialize()
+    try:
+        for step in range(sync_interval):
+            rows = trainer._collect_complete_grpo_batch(work, 2)
+            assert len(rows) == 2
+            assert {row["grpo_group_id"] for row in rows} == {str(step + 1)}
+            assert all("sample_revision" not in row for row in rows)
+        assert manager.get_stats().rejected == 2
+    finally:
+        dispatcher.destroy()
