@@ -291,6 +291,28 @@ def test_real_http_partial_tp_failure_quarantines_service(monkeypatch):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize('expected_service', [None, 'retired-service'])
+def test_nccl_session_rejects_missing_or_stale_uuid_before_drain_and_rpc(monkeypatch, expected_service):
+    import httpx
+    app = load_serving_app(monkeypatch, tp=1)
+    state = app.state.serving_state
+
+    async def unexpected(*args, **kwargs):
+        pytest.fail('Rejected service identity must not drain or enter a worker RPC')
+
+    monkeypatch.setattr(state, 'begin_reload', unexpected)
+    app.state.client.collective_rpc = unexpected
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://service') as client:
+            response = await client.post('/reload_weights_nccl', json=dict(host='train', port=29620,
+                world_size=2, rank_offset=0, session_id='new-members',
+                expected_service_instance_id=expected_service))
+            assert response.status_code == 409
+        assert state.server_generation == 0 and state.failed is None and not state.closed
+
+    asyncio.run(run())
+
 @pytest.mark.parametrize('session_id', ['', 'run-global-new-members'])
 @pytest.mark.parametrize('tensor_count', [None, 3])
 def test_nccl_session_wire_from_request_file_through_http_rpc_and_worker_spec(
@@ -328,7 +350,9 @@ def test_nccl_session_wire_from_request_file_through_http_rpc_and_worker_spec(
     if tensor_count is not None:
         request['expected_tensor_count'] = tensor_count
     if session_id:
-        request.update(nccl_session_id=session_id)
+        request.update(nccl_session_id=session_id, expected_service_instance_ids={
+            'returned': app.state.serving_state.server_instance_id,
+        })
     args = NS(instance_id='returned', control_dir=str(tmp_path), health_url='http://service/health',
         initial_model='/model', ready_timeout=0, reload_strategy='parallel', reload_method='inplace',
         poll_interval=.01, command=['server'])

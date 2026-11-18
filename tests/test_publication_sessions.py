@@ -28,12 +28,14 @@ def test_session_reuses_the_existing_homogeneous_endpoint_setup(
 
     def status(url, timeout):
         observed.append(url)
-        return io.StringIO(json.dumps(dict(server_instance_id=url)))
+        return io.StringIO(json.dumps(dict(server_instance_id=url, server_generation=0,
+            server_generation_verified=True, tp_size=1)))
 
     monkeypatch.setattr(publication_session.urllib.request, 'urlopen', status)
     offsets = {f'instance_{index}': index for index in range(owner.rollout_engine.num_instances)}
-    first = publication_session.prepare_nccl_session(owner, offsets)
-    assert publication_session.prepare_nccl_session(owner, offsets) == first
+    targets = publication_session.publication_targets(owner.config)
+    first = publication_session.prepare_nccl_session(owner, targets, offsets)
+    assert publication_session.prepare_nccl_session(owner, targets, offsets) == first
     assert observed == [endpoint + '/publication/status' for endpoint in expected] * 2
 
 
@@ -54,7 +56,9 @@ def test_native_publication_reuses_membership_and_sends_a_fresh_same_revision_tr
 
     def status(url, timeout):
         host = url.split('://', 1)[1].split(':', 1)[0]
-        return io.StringIO(json.dumps(dict(server_instance_id=states[host])))
+        service = states[host]
+        return io.StringIO(json.dumps(dict(server_instance_id=service,
+            server_generation=generations.get(service, 0), server_generation_verified=True, tp_size=1)))
 
     monkeypatch.setattr(publication_session.urllib.request, 'urlopen', status)
     monkeypatch.setattr(torch.cuda, 'current_device', lambda: 'cpu')
@@ -67,23 +71,37 @@ def test_native_publication_reuses_membership_and_sends_a_fresh_same_revision_tr
         request = json.loads((tmp_path / 'reload_request.json').read_text())
         assert spec.session_id == request['nccl_session_id']
         assert request['optimizer_revision'] == trainer.train_engine.optimizer_revision
+        assert request['expected_service_instance_ids'] == states
         requests.append(request)
         for identity, offset in request['nccl_rank_offsets'].items():
             service = states[identity]
             generations[service] = generations.get(service, 0) + 1
             worker = dict(rank=0, nccl_rank=offset+1, received_tensors=len(tensors),
                 receive_complete=True, loaded_parameters=1, service_generation=generations[service])
-            record = dict(version=request['version'], snapshot_id=request['snapshot_id'],
+            record = dict(instance_id=identity, version=request['version'], snapshot_id=request['snapshot_id'],
                 optimizer_revision=request['optimizer_revision'], server_response=dict(
+                    snapshot_id=request['snapshot_id'], optimizer_revision=request['optimizer_revision'],
                     service_instance_id=service, service_generation=generations[service],
                     prefix_cache_cleared=True, workers=[worker]))
             (tmp_path / f'ack_{identity}_{request["version"]}.json').write_text(json.dumps(record))
 
     monkeypatch.setattr(nccl_weight_sync, 'send_weights', send)
-    AsyncRLTrainer._sync_weights_nccl(trainer, 1)
+    receipt = AsyncRLTrainer._sync_weights_nccl(trainer, 1)
+    assert receipt['target_ids'] == ['a', 'b']
+    assert [ack['server_instance_id'] for ack in receipt['acknowledgements']] == ['service-a', 'service-b']
     AsyncRLTrainer._sync_weights_nccl(trainer, 1)
     assert requests[0]['snapshot_id'] != requests[1]['snapshot_id']
     assert requests[0]['nccl_session_id'] == requests[1]['nccl_session_id']
     states['a'] = 'returned-service-a'
     AsyncRLTrainer._sync_weights_nccl(trainer, 1)
     assert requests[2]['nccl_session_id'] != requests[1]['nccl_session_id']
+
+
+def test_unverified_live_service_cannot_allocate_a_publication_session():
+    owner = NS()
+    targets = [dict(instance_id='a', endpoint='a:8000', tp_size=1)]
+    state = dict(server_instance_id='a-old', server_generation=2,
+                 server_generation_verified=False, tp_size=1)
+    with pytest.raises(RuntimeError, match='Unverified current physical service'):
+        publication_session.prepare_nccl_session(owner, targets, {'a': 0}, read_state=lambda _: state)
+    assert not hasattr(owner, '_nccl_publication_session')
