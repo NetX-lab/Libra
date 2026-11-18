@@ -36,6 +36,7 @@ python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_r2e_gym_workflow.py \
   tests/test_decoupled_workflow_v2.py \
   tests/test_decoupled_grpo_v2.py \
+  tests/test_r2e_1938329_entrypoint.py \
   tests/test_optimizer_state.py \
   tests/test_elastic_optimizer_state.py \
   tests/test_ehp_dp_resharding.py \
