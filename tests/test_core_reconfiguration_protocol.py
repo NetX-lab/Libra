@@ -117,6 +117,41 @@ def test_one_rank_failure_reaches_dispatch_and_follower(tmp_path):
     assert trainers[1].config.train_tp_size == 2
 
 
+def test_repartition_weights_publish_before_binding_new_endpoint():
+    from RL_Framework.config import HeterogeneousInstanceConfig, HeterogeneousRolloutConfig
+    from RL_Framework.infra.sync.publication_session import publication_inventory
+    from RL_Framework.trainer.async_rl_trainer import AsyncRLTrainer
+    trainer = object.__new__(AsyncRLTrainer)
+    trainer.config = SimpleNamespace(heterogeneous_rollout=HeterogeneousRolloutConfig(instances=[
+        HeterogeneousInstanceConfig(instance_id='old', host='node', port=8001, tp=1),
+    ]))
+    trainer.rollout_engine = SimpleNamespace(instance_urls=['http://node:8001'])
+    trainer.runtime_elastic_executor = SimpleNamespace(_lent_rollout=None)
+    expected = [{'instance_id': 'new', 'endpoint': 'node:8002', 'tp_size': 2}]
+    operations = []
+
+    def publish(target_version, *, reopen_restored):
+        assert target_version == 17
+        assert not reopen_restored
+        assert publication_inventory(trainer)['targets'] == expected
+        assert trainer._rollout_unavailable_ids == {'new'}
+        operations.append('publish')
+
+    def rebind(reason):
+        assert operations == ['publish']
+        operations.append('rebind')
+
+    trainer._sync_weights = publish
+    trainer._rebind_rollout_engine_from_config = rebind
+    engine = SimpleNamespace(optimizer_revision=17, set_version=lambda revision: None)
+    result = protocol._run_operation(engine, {'operation': 'publish', 'target': {
+        'instances': [{'instance_id': 'new', 'host': 'node', 'port': 8002, 'tp': 2}],
+    }}, trainer)
+
+    assert result['acknowledged'] and operations == ['publish', 'rebind']
+    assert not trainer._rollout_unavailable_ids
+
+
 def test_followers_ignore_stale_or_repeated_commands(tmp_path):
     calls = []
     trainer = Trainer(Engine(1, calls), calls)

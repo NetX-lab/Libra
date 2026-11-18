@@ -55,6 +55,7 @@ def test_repeating_the_same_history_does_not_inflate_current_assignment_cost():
         repeated = evaluator._build_current_plan(config, sample * repeats)
         assert costs(repeated) == pytest.approx(costs(original))
         assert layout(repeated) == layout(original)
+    assert original.metadata["training"]["anchor_s"] > 0
 
 
 def test_real_candidate_search_is_invariant_to_duplicate_history():
@@ -92,7 +93,7 @@ def test_forced_rollout_and_training_candidates_use_the_same_global_batch(monkey
     monkeypatch.setenv("GRP_FORCE_TRAIN_GPUS", "8")
     monkeypatch.setenv("GRP_FORCE_ROLLOUT_TP_LIST", "4")
     requests, training = [], []
-    original_rollout = evaluator.evaluator.evaluate_rollout
+    original_rollout = evaluator.optimizer.evaluate_fixed_rollout_config
     original_training = evaluator.evaluator.evaluate_training
 
     def rollout(cluster, rows):
@@ -103,7 +104,7 @@ def test_forced_rollout_and_training_candidates_use_the_same_global_batch(monkey
         training.append((batch_size, len(lengths)))
         return original_training(topology, batch_size, lengths)
 
-    monkeypatch.setattr(evaluator.evaluator, "evaluate_rollout", rollout)
+    monkeypatch.setattr(evaluator.optimizer, "evaluate_fixed_rollout_config", rollout)
     monkeypatch.setattr(evaluator.evaluator, "evaluate_training", train)
     decision = evaluator.plan_if_needed(step=5, config=config, batch=ROWS * 16)
     assert decision.candidate_plan.train_gpus == 8

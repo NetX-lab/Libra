@@ -13,7 +13,6 @@ def test_timeout_notification_does_not_consume_successful_result_credit(monkeypa
     trainer.config = SimpleNamespace(n_samples=4, max_head_offpolicyness=3,
                                      enable_rollout_tracing=False)
     trainer.is_main_process = True
-    trainer._use_heterogeneous = False
     trainer.train_engine = SimpleNamespace(get_version=lambda: 0)
     trainer.rollout_engine = object()
     trainer._pending_grpo_groups = {}

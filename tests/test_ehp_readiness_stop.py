@@ -180,10 +180,33 @@ def test_local_stop_waits_for_launcher_and_child_processes():
             proc.wait()
 
 
+def test_hybrid_factory_installs_the_shared_bounded_tp_logprob_kernel(monkeypatch):
+    import torch
+    from RL_Framework.config import AsyncRLConfig
+    from RL_Framework.engine import train_factory
+    from RL_Framework.engine import logprob_compat
+    from RL_Framework.scripts.elastic_hybrid_worker import _initialize_megatron_worker
+    calls = []
+    config = SimpleNamespace(train_backend='megatron_core', max_seq_length=32768,
+                             global_resource_planner=SimpleNamespace(hybrid_lockstep_gradient_sync=True))
+    engine = SimpleNamespace(initialize=lambda **kwargs: calls.append(('initialize', kwargs)),
+                             prepare_elastic_gradient_communication=lambda: calls.append('prepare'),
+                             world_size=1, get_parallel_state=lambda: dict(train_tp=1, train_pp=1, train_cp=1, train_ep=1, train_dp=1))
+    monkeypatch.setattr(AsyncRLConfig, 'from_yaml', lambda path: config)
+    monkeypatch.setattr(train_factory, 'create_train_engine', lambda cfg: engine)
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.cuda, 'set_device', lambda device: None)
+    monkeypatch.setattr(logprob_compat, 'install', lambda target: calls.append(('bounded_logprob', target)))
+    result = _initialize_megatron_worker(SimpleNamespace(config='current-config.yaml', initialize_only=True))
+    assert result is engine
+    assert calls == [('initialize', {'max_seq_length': 32768}), ('bounded_logprob', engine), 'prepare']
+
+
 def test_hybrid_factory_partitions_core_dp2_into_one_complete_model_replica(monkeypatch):
     import torch
     from RL_Framework.config import AsyncRLConfig
     from RL_Framework.engine import train_factory
+    from RL_Framework.engine import logprob_compat
     from RL_Framework.scripts.elastic_hybrid_worker import _initialize_megatron_worker
     config = SimpleNamespace(train_backend='megatron_core', max_seq_length=32768,
                              train_tp_size=2, train_pp_size=1, train_cp_size=1, train_ep_size=1,
@@ -191,7 +214,7 @@ def test_hybrid_factory_partitions_core_dp2_into_one_complete_model_replica(monk
                              global_resource_planner=SimpleNamespace(hybrid_lockstep_gradient_sync=True))
     observed = []
     engine = SimpleNamespace(initialize=lambda **kwargs: None, world_size=2,
-                             prepare_elastic_gradient_communication=lambda: observed.append("prepared"),
+                             prepare_elastic_gradient_communication=lambda: 1,
                              get_parallel_state=lambda: dict(train_tp=2, train_pp=1, train_cp=1, train_ep=1, train_dp=1))
     def factory(cfg):
         observed.append((cfg.train_tp_size, cfg.train_dp_size, cfg.train_gpus, cfg.learning_rate))
@@ -200,10 +223,11 @@ def test_hybrid_factory_partitions_core_dp2_into_one_complete_model_replica(monk
     monkeypatch.setattr(train_factory, 'create_train_engine', factory)
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'set_device', lambda device: None)
+    monkeypatch.setattr(logprob_compat, 'install', lambda target: None)
     monkeypatch.setenv('WORLD_SIZE', '2')
     result = _initialize_megatron_worker(SimpleNamespace(config='current-core-config.yaml', initialize_only=True))
     assert result is engine
-    assert observed == [(2, 1, 2, 1e-6), "prepared"]
+    assert observed == [(2, 1, 2, 1e-6)]
     monkeypatch.setenv('WORLD_SIZE', '4')
     with pytest.raises(ValueError, match='one complete model replica'):
         _initialize_megatron_worker(SimpleNamespace(config='current-core-config.yaml', initialize_only=True))

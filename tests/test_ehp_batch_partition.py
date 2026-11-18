@@ -75,6 +75,7 @@ def make_trainer(tmp_path, rank=0, dp_size=1, dp_rank=0, source=True, hybrids=()
         batch_size=16, n_samples=4, total_steps=2, micro_batch_size=1,
         ppo_epochs=1, recompute_logprobs=False, sync_interval=0, save_interval=0,
         log_dir=str(tmp_path), enable_rollout_tracing=False,
+        heterogeneous_rollout=SimpleNamespace(instances=[]),
         global_resource_planner=SimpleNamespace(hybrid_worker_task_dir=str(tmp_path),
                                                hybrid_lockstep_gradient_sync=True),
     )
@@ -191,7 +192,10 @@ def test_logical_sampler_cursor_survives_rollout_client_rebind(tmp_path):
     dataset = [{"id": index} for index in range(12)]
     stream = AsyncRLTrainer._create_data_generator(trainer, dataset, None)
     first = [next(stream) for _ in range(4)]
-    trainer._reset_rollout_pipeline_after_reconfigure()
+    rebound = []
+    trainer.rollout_engine = SimpleNamespace(reconfigure_from_plan=lambda plan, config: rebound.append(config))
+    trainer._rebind_rollout_engine_from_config(reason="runtime_topology_change")
+    assert rebound == [trainer.config]
     second = [next(stream) for _ in range(4)]
     assert [task.task_id for task in first + second] == list(range(8))
     assert {task.group_id for task in first} == {"dp0:epoch0:sample0"}
@@ -206,7 +210,10 @@ def test_rebind_preserves_admitted_results_and_incomplete_group_members(tmp_path
     pending = {"group": trajectories("part", 3)}
     trainer._pending_grpo_groups = pending
     trainer.dispatcher = SimpleNamespace(reset_after_reconfigure=lambda: pytest.fail("valid work discarded"))
-    trainer._reset_rollout_pipeline_after_reconfigure()
+    rebound = []
+    trainer.rollout_engine = SimpleNamespace(reconfigure_from_plan=lambda plan, config: rebound.append(config))
+    trainer._rebind_rollout_engine_from_config(reason="runtime_topology_change")
+    assert rebound == [trainer.config]
     assert trainer._pending_grpo_groups is pending
     assert len(pending["group"]) == 3
 

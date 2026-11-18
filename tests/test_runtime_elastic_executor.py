@@ -1655,3 +1655,61 @@ def test_peer_rank_state_keeps_the_selected_transaction_id(tmp_path, explicit_co
     record = json.loads(path.read_text())
     assert record["coord_id"] == (explicit_coord_id or "active-transaction")
     assert record["unavailable_rollout_ids"] == ["loan-a"]
+
+
+def test_membership_return_keeps_restored_route_pending_without_dispatcher_drain_or_publish(monkeypatch):
+    from RL_Framework.infra.elastic import rollout_lending
+    events = []
+    handle = SimpleNamespace(instance_id="returned", is_ready=False)
+    trainer = SimpleNamespace(rollout_engine=SimpleNamespace(
+        scheduler=SimpleNamespace(_instances=[handle])), _rollout_unavailable_ids={"returned"},
+        _bounded_rollout_production=True,
+        _resume_rollout_pipeline=lambda: events.append("resume"))
+    cfg = SimpleNamespace(runtime_reconfigure_training=True, runtime_training_pool_plan_only=False)
+    executor = SimpleNamespace(config=SimpleNamespace(global_resource_planner=cfg),
+        dispatcher=SimpleNamespace(is_paused=lambda: False,
+            pause=lambda: events.append("pause"), wait_until_idle=lambda **kw: events.append("drain")),
+        trainer=trainer, _hybrid_worker_launch_enabled=True, _lent_rollout={"engines": [handle]},
+        _active_elastic_signal={}, _ensure_elastic_pool=lambda: None,
+        _desired_hybrid_workers=lambda *args: 0,
+        _reconfigure_training_pool=lambda *args: [], _finish_pending_activations=lambda: None,
+        _release_unused_core_snapshots_at_boundary=lambda: None,
+        _write_peer_rank_reconfiguration_state=lambda *args, **kw: events.append("applied"),
+        _publish_current_rollout_weights=lambda: events.append("publish"))
+    def restore(owner):
+        owner._lent_rollout = None
+        trainer._restored_rollouts_pending_publication = {"returned"}
+        return [handle]
+    monkeypatch.setattr(rollout_lending, "return_rollout", restore)
+    result = SimpleNamespace(training_actions=[], actions=[], started_processes=[], applied=False)
+    prepared = SimpleNamespace(candidate_plan=object(), result=result, current_train_gpus=2)
+    assert RuntimeElasticExecutor._execute_membership_only(executor, prepared).applied
+    assert events == ["applied"]
+    assert not handle.is_ready
+    assert trainer._restored_rollouts_pending_publication == {"returned"}
+
+
+def test_expired_signal_keeps_current_intent_until_post_recheck():
+    state = SimpleNamespace(config=SimpleNamespace(global_resource_planner=SimpleNamespace()),
+        _active_elastic_signal={"desired_replicas": 1, "expires_step": 2},
+        planner=SimpleNamespace(latest_runtime_metrics=SimpleNamespace(step=8)),
+        _elastic_replica_size_gpus=lambda: 2, _elastic_replica_capacity=lambda: 2)
+    assert RuntimeElasticExecutor._desired_hybrid_workers(state, 2) == 2
+
+
+def test_membership_coordinates_core_commands_without_draining_rollout(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    cfg = _config()
+    cfg.global_resource_planner.runtime_reconfiguration_coord_dir = str(tmp_path)
+    cfg.global_resource_planner.runtime_coordinate_reconfiguration_ranks = True
+    cfg.global_resource_planner.runtime_drain_before_reconfigure = False
+    planner, decision = _decision(cfg)
+    decision.resource_should_reconfigure = False
+    executor = RuntimeElasticExecutor(config=cfg, planner=planner)
+    prepared = executor.prepare_transaction(decision)
+    assert prepared.drain_required
+    assert not prepared.drain_before_reconfigure and not prepared.should_pause_dispatcher
+    executor.publish_peer_rank_drain_request(prepared)
+    request = json.loads((tmp_path / "request.json").read_text())
+    assert request["resource_reconfiguration"] is False

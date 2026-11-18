@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import logging
+import itertools
+import math
 import os
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from functools import cache
 from typing import Any, Sequence
 
 import numpy as np
@@ -15,6 +19,7 @@ from RL_Framework.infra.cost_model.model import (
     RequestInfo,
     RolloutClusterConfig,
     TrainParallelConfig,
+    TrainingCostModel,
     representative_global_batch,
 )
 from RL_Framework.infra.cost_model.optimizer import (
@@ -23,8 +28,177 @@ from RL_Framework.infra.cost_model.optimizer import (
 )
 from RL_Framework.infra.cost_model.resource_alloc import split_gpu_slots
 from RL_Framework.infra.cost_model.simulator_adapters import HybridSimulatorCostModel
+from RL_Framework.infra.sync.staleness import can_fit_group_deadlines
 
 logger = logging.getLogger(__name__)
+
+
+def bounded_update_time(
+    *, train_s: float, rollout_batch_s: float, groups_per_batch: int,
+    horizon: int, max_age: int, revision: int, reservations: list[dict],
+    publish_s: float = 0.0, initial_s: float = 0.0,
+    hybrid_publish_s: float | None = None, active_hybrid_replicas: int = 0,
+    rollout_call_s: float | None = None,
+    publish_inflight_progress_s: float = 0.0,
+    hybrid_publish_inflight_progress_s: float = 0.0,
+    background_ready_s: float = 0.0, core_train_s: float | None = None,
+    group_tail_s: float = 0.0,
+    group_size: int = 1, max_concurrent_rollouts: int | None = None,
+    pending_activation: bool = False, activation_s: float = 0.0,
+    activation_ready_replicas: int = 0,
+    activation_train_s: list[float] | None = None,
+    activation_ready_times_s: list[float] | None = None,
+    initial_rollout_batch_s: float | None = None,
+) -> float:
+    """Advance legal groups, bounded execution and Core work on one local clock.
+
+    The input is a POST snapshot. The current publication opens admission, then
+    each forecast update retires a batch before the next POST/publication. A
+    member without measured remaining work uses one representative trace time;
+    completed members never run again. This is a small planning approximation,
+    and never changes runtime membership or substitutes for a real READY.
+
+    Publication may advance an already running member to its current modeled
+    generate boundary, within the calibrated inflight interval. It cannot start
+    queued members or their next calls. The rest of publication is frozen. The
+    single-call cost is separate from full-trace work and its terminal tool tail;
+    absent overlap calibration retains the original fully frozen approximation.
+    """
+    group_size = max(1, int(group_size))
+    capacity = max(1, int(max_concurrent_rollouts or groups_per_batch * group_size))
+    window = groups_per_batch * (max_age + 1)
+    member_work = max(0.0, float(rollout_batch_s) + float(group_tail_s))
+    now = 0.0
+    groups = []
+    running, queued = [], []
+    identities = itertools.count()
+
+    def add_group(deadline, total, completed=0, already_running=0, remaining=None):
+        unfinished = max(0, int(total) - int(completed))
+        group = {"index": next(identities), "deadline": int(deadline), "remaining": unfinished}
+        groups.append(group)
+        jobs = [[member_work if remaining is None else max(0.0, float(remaining)), group]
+                for _ in range(unfinished)]
+        # Existing running members retain the execution slots they already own.
+        live = min(unfinished, max(0, int(already_running)))
+        running.extend(jobs[:live])
+        queued.extend(jobs[live:])
+
+    for reservation in reservations:
+        total = int(reservation.get("members_total", group_size))
+        completed = total if reservation.get("ready", False) else int(reservation.get("members_ready", 0))
+        add_group(reservation.get("deadline_revision", revision + max_age), total,
+                  completed, reservation.get("members_running", 0), reservation.get("remaining_s"))
+    if not can_fit_group_deadlines((group["deadline"] for group in groups), revision, groups_per_batch):
+        return float("inf")
+
+    def retire_finished():
+        finished = [job for job in running if job[0] <= 1e-9]
+        for job in finished:
+            job[1]["remaining"] -= 1
+            running.remove(job)
+        return bool(finished)
+
+    def start_queued():
+        while queued and len(running) < capacity:
+            running.append(queued.pop(0))
+        finished = retire_finished()
+        if finished and queued:
+            start_queued()
+
+    def advance(seconds, *, generating=True, speed=1.0):
+        nonlocal now
+        end = now + max(0.0, float(seconds))
+        if end <= now or not generating or speed <= 0.0:
+            now = end
+            return
+        start_queued()
+        while running and now < end:
+            elapsed = min(end - now, min(job[0] for job in running) / speed)
+            for job in running:
+                job[0] = max(0.0, job[0] - elapsed * speed)
+            now += elapsed
+            start_queued()
+        now = end
+
+    def admit(promise):
+        while len(groups) < window:
+            add_group(promise + max_age, group_size)
+        start_queued()
+
+    work = float(core_train_s if core_train_s is not None else train_s)
+    hybrid_active = active_hybrid_replicas > 0
+    hybrid_publish = float(hybrid_publish_s if hybrid_publish_s is not None else publish_s)
+    publication = hybrid_publish if hybrid_active else publish_s
+    hybrid_inflight = hybrid_publish_inflight_progress_s
+    inflight = hybrid_inflight if hybrid_active else publish_inflight_progress_s
+    training_after_activation = list(activation_train_s or ([train_s]
+        if pending_activation or background_ready_s > 0 else []))
+    ready_times = sorted(activation_ready_times_s if activation_ready_times_s is not None else
+                         [background_ready_s] * len(training_after_activation))
+
+    def activate(count):
+        nonlocal work, hybrid_active
+        count = min(max(0, int(count)), len(training_after_activation))
+        if count:
+            advance(activation_s)
+            hybrid_active = True
+            for _ in range(count):
+                work = training_after_activation.pop(0)
+            del ready_times[:count]
+
+    def publish():
+        nonlocal now
+        budget = max(0.0, min(float(publication), float(inflight)))
+        if rollout_call_s is not None and rollout_call_s > 0 and budget:
+            for job in running:
+                generation_left = max(0.0, job[0] - float(group_tail_s))
+                if not math.isfinite(generation_left):
+                    continue
+                # Normal work can have advanced partway through this call.
+                call_left = generation_left % rollout_call_s
+                if call_left <= 1e-9:
+                    call_left = rollout_call_s
+                job[0] -= min(budget, call_left, generation_left)
+            retire_finished()
+        now += max(0.0, float(publication))
+
+    initial_speed = 1.0
+    if initial_rollout_batch_s is not None:
+        initial_work = float(initial_rollout_batch_s) + float(group_tail_s)
+        initial_speed = (member_work / initial_work if initial_work > 0 and math.isfinite(initial_work)
+                         else 0.0 if not math.isfinite(initial_work) else 1.0)
+    advance(initial_s, speed=initial_speed)
+    # Only the actual ready subset can activate at this POST, even if a load
+    # duration estimate has elapsed for another joining replica.
+    activate(activation_ready_replicas)
+    publish()
+    admit(revision)
+    for update in range(revision, revision + horizon):
+        while True:
+            ready = [group for group in groups if not group["remaining"]]
+            if len(ready) >= groups_per_batch:
+                selected = sorted(ready, key=lambda group: group["deadline"])[:groups_per_batch]
+                selected_ids = {group["index"] for group in selected}
+                deferred = (group["deadline"] for group in groups if group["index"] not in selected_ids)
+                if can_fit_group_deadlines(deferred, update + 1, groups_per_batch):
+                    break
+            start_queued()
+            if not running or not math.isfinite(min(job[0] for job in running)):
+                return float("inf")
+            advance(min(job[0] for job in running))
+        advance(work)
+        publication = hybrid_publish if hybrid_active else publish_s
+        inflight = hybrid_inflight if hybrid_active else publish_inflight_progress_s
+        for group in selected:
+            groups.remove(group)
+        if update == revision + horizon - 1:
+            break
+        if ready_times:
+            activate(sum(ready_at <= now for ready_at in ready_times))
+        publish()
+        admit(update + 1)
+    return now
 
 
 @dataclass(frozen=True)
@@ -183,6 +357,10 @@ class ElasticHybridSignal:
     active_workers: int = 0
     joining_workers: int = 0
     replica_size_gpus: int = 1
+    loan_instance_ids: list[str] = field(default_factory=list)
+    current_loan_instance_ids: list[str] = field(default_factory=list)
+    horizon_updates: int = 0
+    predicted_savings_s: float = 0.0
 
     @property
     def desired_replicas(self) -> int:
@@ -198,7 +376,8 @@ class ElasticHybridSignal:
 
     @property
     def should_adjust(self) -> bool:
-        return self.desired_workers != self.current_workers
+        return (self.desired_workers != self.current_workers
+                or set(self.loan_instance_ids) != set(self.current_loan_instance_ids))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -218,6 +397,10 @@ class ElasticHybridSignal:
             "current_replicas": self.current_replicas,
             "capacity_replicas": self.capacity_replicas,
             "replica_size_gpus": self.replica_size_gpus,
+            "loan_instance_ids": list(self.loan_instance_ids),
+            "current_loan_instance_ids": list(self.current_loan_instance_ids),
+            "horizon_updates": self.horizon_updates,
+            "predicted_savings_s": self.predicted_savings_s,
         }
 
 
@@ -238,6 +421,7 @@ class PlannerDecision:
     # None preserves legacy hand-constructed decisions. Planner-produced
     # decisions explicitly distinguish full repartition from EHP adjustment.
     resource_should_reconfigure: bool | None = None
+    _member_costs: _MemberPlanningCosts | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -266,6 +450,15 @@ class PlannerDecision:
                 else None
             ),
         }
+
+
+@dataclass
+class _MemberPlanningCosts:
+    inputs: tuple
+    calls_per_trace: float
+    rollout: dict[tuple[int, ...], tuple[float, dict]] = field(default_factory=dict)
+    current_inputs: tuple | None = None
+    current_plan: GlobalResourcePlan | None = None
 
 
 class GlobalResourcePlanner:
@@ -307,10 +500,6 @@ class GlobalResourcePlanner:
         rejected_rollout_delta_threshold: int = 8,
         rollout_train_imbalance_threshold: float = 1.25,
         elastic_hybrid_planning_enabled: bool = False,
-        elastic_hybrid_max_workers: int = 0,
-        elastic_hybrid_borrow_train_rollout_ratio: float = 1.15,
-        elastic_hybrid_release_train_rollout_ratio: float = 0.90,
-        elastic_hybrid_max_rollout_pressure: float = 0.80,
         elastic_hybrid_signal_ttl_steps: int = 20,
         verbose: bool = False,
     ):
@@ -350,23 +539,6 @@ class GlobalResourcePlanner:
         self.elastic_hybrid_planning_enabled = bool(
             elastic_hybrid_planning_enabled
         )
-        self.elastic_hybrid_max_workers = max(0, int(elastic_hybrid_max_workers))
-        self.elastic_hybrid_borrow_train_rollout_ratio = max(
-            0.0, float(elastic_hybrid_borrow_train_rollout_ratio)
-        )
-        self.elastic_hybrid_release_train_rollout_ratio = max(
-            0.0, float(elastic_hybrid_release_train_rollout_ratio)
-        )
-        if (
-            self.elastic_hybrid_release_train_rollout_ratio
-            > self.elastic_hybrid_borrow_train_rollout_ratio
-        ):
-            raise ValueError(
-                "elastic hybrid release ratio cannot exceed borrow ratio"
-            )
-        self.elastic_hybrid_max_rollout_pressure = max(
-            0.0, float(elastic_hybrid_max_rollout_pressure)
-        )
         self.elastic_hybrid_signal_ttl_steps = max(
             1, int(elastic_hybrid_signal_ttl_steps)
         )
@@ -383,6 +555,8 @@ class GlobalResourcePlanner:
             verbose=verbose,
         )
         self._history: list[RequestInfo] = []
+        self._training_lengths: list[int] = []
+        self._calls_per_trace: float | None = None
         self._active_plan: GlobalResourcePlan | None = None
         self._last_decision: PlannerDecision | None = None
         self._runtime_metrics: list[RuntimeResourceMetrics] = []
@@ -445,18 +619,6 @@ class GlobalResourcePlanner:
             elastic_hybrid_planning_enabled=getattr(
                 planner_cfg, "elastic_hybrid_planning_enabled", False
             ),
-            elastic_hybrid_max_workers=getattr(
-                planner_cfg, "elastic_hybrid_max_workers", 0
-            ),
-            elastic_hybrid_borrow_train_rollout_ratio=getattr(
-                planner_cfg, "elastic_hybrid_borrow_train_rollout_ratio", 1.15
-            ),
-            elastic_hybrid_release_train_rollout_ratio=getattr(
-                planner_cfg, "elastic_hybrid_release_train_rollout_ratio", 0.90
-            ),
-            elastic_hybrid_max_rollout_pressure=getattr(
-                planner_cfg, "elastic_hybrid_max_rollout_pressure", 0.80
-            ),
             elastic_hybrid_signal_ttl_steps=getattr(
                 planner_cfg, "elastic_hybrid_signal_ttl_steps", 20
             ),
@@ -479,7 +641,77 @@ class GlobalResourcePlanner:
     def latest_runtime_metrics(self) -> RuntimeResourceMetrics | None:
         return self._runtime_metrics[-1] if self._runtime_metrics else None
 
+    def observe_training_batch(self, batch: list[Any]) -> int:
+        """Keep only full-sequence CPU lengths, separately from generate history."""
+        lengths = []
+        for item in batch or []:
+            if not isinstance(item, dict):
+                continue
+            input_ids = item.get("input_ids")
+            if input_ids is not None:
+                lengths.append(int(input_ids.shape[-1]))
+            elif item.get("sequence_length", item.get("training_length", 0)):
+                lengths.append(int(item.get("sequence_length", item.get("training_length"))))
+        if lengths:
+            self._training_lengths = lengths
+        calls = [int(item["n_turns"]) for item in batch or []
+                 if isinstance(item, dict) and item.get("n_turns", 0)]
+        if calls:
+            self._calls_per_trace = sum(calls) / len(calls)
+        return len(lengths)
+
+    def _training_workload_lengths(self, requests: list[RequestInfo], batch_size: int) -> list[int]:
+        calibration = getattr(self.evaluator.config.profiling, "calibration", {}) or {}
+        lengths = (self._training_lengths or calibration.get("training", {}).get("sequence_lengths")
+                   or [request.training_length or request.total_length for request in requests] or [1024])
+        return TrainingCostModel._representative_lengths(lengths, batch_size)
+
+    def _rollout_calls_per_trace(self, config: AsyncRLConfig) -> float:
+        calibration = getattr(config.profiling, "calibration", {}) or {}
+        return max(1.0, float(self._calls_per_trace if self._calls_per_trace is not None
+                              else calibration.get("calls_per_trace", 1.0)))
+
+    def _complete_trace_rollout_seconds(
+        self, config: AsyncRLConfig, tp_list: list[int], requests: list[RequestInfo],
+        *, costs: _MemberPlanningCosts | None = None,
+    ) -> float:
+        single_calls, _ = self._layout_supply(tp_list, requests, costs)
+        calls = costs.calls_per_trace if costs is not None else self._rollout_calls_per_trace(config)
+        return single_calls * calls
+
+    def _fixed_rollout_supply(
+        self, tp_list: list[int], requests: list[RequestInfo],
+    ) -> tuple[float, dict]:
+        rollout = RolloutClusterConfig(tp_list=tp_list)
+        if getattr(self.evaluator, "rollout_backend", "analytic") == "analytic":
+            return self.optimizer.evaluate_fixed_rollout_config(rollout, requests)
+        return self.evaluator.evaluate_rollout(rollout, requests)
+
+    def _member_planning_costs(self, config, requests, previous=None) -> _MemberPlanningCosts:
+        calibration = getattr(config.profiling, "calibration", {}) or {}
+        calls = self._rollout_calls_per_trace(config)
+        inputs = (
+            id(self.evaluator),
+            getattr(self.evaluator, "train_backend", "analytic"),
+            getattr(self.evaluator, "rollout_backend", "analytic"),
+            tuple((request.prompt_length, request.gen_length) for request in requests),
+            calibration.get("rollout", {}), calibration.get("training", {}),
+        )
+        if previous is not None and previous.inputs == inputs and previous.calls_per_trace == calls:
+            return previous
+        return _MemberPlanningCosts(deepcopy(inputs), calls)
+
+    def _layout_supply(self, tp_list, requests, costs):
+        if costs is None:
+            return self._fixed_rollout_supply(tp_list, requests)
+        analytic = getattr(self.evaluator, "rollout_backend", "analytic") == "analytic"
+        key = tuple(sorted(tp_list) if analytic else tp_list)
+        if key not in costs.rollout:
+            costs.rollout[key] = self._fixed_rollout_supply(tp_list, requests)
+        return costs.rollout[key]
+
     def observe_batch(self, batch: list[Any]) -> int:
+        self.observe_training_batch(batch)
         requests = self._extract_requests(batch)
         if not requests:
             return 0
@@ -625,8 +857,33 @@ class GlobalResourcePlanner:
             )
 
         workload = representative_global_batch(self._history, int(config.batch_size))
-        current = self._build_current_plan(config, workload)
         forced_rollout_tp = self._forced_rollout_tp_list(config)
+        force_runtime_reconfigure = os.environ.get("GRP_FORCE_RUNTIME_RECONFIGURE", "0") == "1"
+        explicit_repartition = (
+            forced_rollout_tp is not None
+            or bool(os.environ.get("GRP_FORCE_TRAIN_GPUS", "").strip())
+            or bool(getattr(config.global_resource_planner, "runtime_forced_train_gpus", 0))
+            or force_runtime_reconfigure
+        )
+        if (self.runtime_capabilities is not None and self.elastic_hybrid_planning_enabled
+                and not explicit_repartition):
+            costs = self._member_planning_costs(config, workload)
+            current = self._build_current_plan(config, workload, costs=costs)
+            signal = self._build_elastic_hybrid_signal(step=step, config=config,
+                current=current, candidate=current, runtime_metrics=runtime_metrics,
+                workload=workload, costs=costs)
+            adjusting = bool(signal is not None and signal.should_adjust)
+            decision = PlannerDecision(step=step, should_reconfigure=adjusting,
+                reason="elastic_hybrid_adjustment" if adjusting else "same_plan",
+                current_plan=current, candidate_plan=current, num_requests=len(self._history),
+                trigger=trigger, runtime_metrics=runtime_metrics,
+                elastic_hybrid_signal=signal, resource_should_reconfigure=False,
+                _member_costs=costs)
+            self._active_plan = current
+            if adjusting:
+                self._last_replan_step = int(step)
+            return self._remember(decision)
+        current = self._build_current_plan(config, workload)
         forced_train = self._forced_train_config(
             config,
             current,
@@ -659,6 +916,8 @@ class GlobalResourcePlanner:
             ),
             train_cp_size=max(1, int(getattr(config, "train_cp_size", 1) or 1)),
             dp_batch_group_size=max(1, int(getattr(config, "n_samples", 1) or 1)),
+            training_sequence_lengths=self._training_workload_lengths(workload, config.batch_size),
+            rollout_calls_per_trace=self._rollout_calls_per_trace(config),
         )
         candidate = self._plan_from_result(result, config)
         if candidate is None and not forced_candidate:
@@ -679,14 +938,14 @@ class GlobalResourcePlanner:
 
         if forced_rollout_tp is not None:
             forced_rollout = RolloutClusterConfig(tp_list=forced_rollout_tp)
-            forced_rollout_time, forced_rollout_details = self.evaluator.evaluate_rollout(
-                forced_rollout,
-                workload,
+            forced_rollout_time, forced_rollout_details = self._fixed_rollout_supply(
+                forced_rollout_tp, workload,
             )
+            forced_rollout_time *= self._rollout_calls_per_trace(config)
             forced_train_time = current.t_train
             forced_train_details = current.metadata.get("training", {})
             if forced_train is not None:
-                sequence_lengths = [r.total_length for r in workload] or [1024]
+                sequence_lengths = self._training_workload_lengths(workload, config.batch_size)
                 forced_train_time, forced_train_details = self.evaluator.evaluate_training(
                     forced_train,
                     config.batch_size,
@@ -711,7 +970,7 @@ class GlobalResourcePlanner:
                 },
             )
         elif forced_train is not None:
-            sequence_lengths = [r.total_length for r in workload] or [1024]
+            sequence_lengths = self._training_workload_lengths(workload, config.batch_size)
             forced_train_time, forced_train_details = self.evaluator.evaluate_training(
                 forced_train,
                 config.batch_size,
@@ -752,7 +1011,9 @@ class GlobalResourcePlanner:
                     rollout_node_tp_pattern=list(getattr(config.global_resource_planner,
                         "rollout_node_tp_pattern", []) or []),
                     train_cp_size=capabilities.cp,
-                    dp_batch_group_size=max(1, int(getattr(config, "n_samples", 1) or 1)))
+                    dp_batch_group_size=max(1, int(getattr(config, "n_samples", 1) or 1)),
+                    training_sequence_lengths=self._training_workload_lengths(workload, config.batch_size),
+                    rollout_calls_per_trace=self._rollout_calls_per_trace(config))
                 candidate = self._plan_from_result(feasible, config) or current
                 result = feasible
             else:
@@ -784,9 +1045,6 @@ class GlobalResourcePlanner:
         )
         elastic_adjust = bool(
             elastic_signal is not None and elastic_signal.should_adjust
-        )
-        force_runtime_reconfigure = (
-            os.environ.get("GRP_FORCE_RUNTIME_RECONFIGURE", "0") == "1"
         )
         resource_should = (
             (not same_plan or force_runtime_reconfigure)
@@ -837,139 +1095,205 @@ class GlobalResourcePlanner:
         self._mark_rejected_trigger_observed(trigger, runtime_metrics)
         return self._remember(decision)
 
+    def recheck_elastic_signal(
+        self, step: int, config: AsyncRLConfig,
+        runtime_metrics: RuntimeResourceMetrics | None = None,
+        *, decision: PlannerDecision | None = None,
+    ) -> ElasticHybridSignal | None:
+        """Recheck member costs and readiness once, then release the decision cache."""
+        if not self.elastic_hybrid_planning_enabled:
+            return None
+        workload = representative_global_batch(self._history, int(config.batch_size))
+        previous = decision._member_costs if decision is not None else None
+        costs = self._member_planning_costs(config, workload, previous)
+        current = self._build_current_plan(config, workload, costs=costs)
+        if decision is not None:
+            decision.current_plan = current
+            decision._member_costs = None
+        if not workload:
+            return None
+        return self._build_elastic_hybrid_signal(step=step, config=config,
+            current=current, candidate=current, runtime_metrics=runtime_metrics,
+            workload=workload, costs=costs)
+
     def _build_elastic_hybrid_signal(
-        self,
-        *,
-        step: int,
-        config: AsyncRLConfig,
-        current: GlobalResourcePlan,
-        candidate: GlobalResourcePlan,
-        runtime_metrics: RuntimeResourceMetrics | None,
+        self, *, step: int, config: AsyncRLConfig, current: GlobalResourcePlan,
+        candidate: GlobalResourcePlan, runtime_metrics: RuntimeResourceMetrics | None,
+        workload: list[RequestInfo] | None = None, costs: _MemberPlanningCosts | None = None,
     ) -> ElasticHybridSignal | None:
         if not self.elastic_hybrid_planning_enabled:
             return None
+        cfg = config.global_resource_planner
+        width = (max(1, int(config.train_tp_size)) * max(1, int(config.train_ep_size))
+                 * max(1, int(config.train_pp_size)) * max(1, int(config.train_cp_size)))
+        configured_width = int(getattr(cfg, "elastic_hybrid_replica_size_gpus", 0) or width)
+        if configured_width != width:
+            raise ValueError(f"elastic_hybrid_replica_size_gpus must equal one complete DP Replica ({width})")
+        raw = runtime_metrics.raw if runtime_metrics is not None else {}
+        stats = raw.get("step_stats", {})
+        dispatcher = raw.get("dispatcher", {})
+        active = max(0, int(stats.get("active_hybrid_replicas", stats.get("active_hybrid_workers", 0)) or 0))
+        joining = max(0, int(stats.get("joining_hybrid_replicas", stats.get("joining_hybrid_workers", 0)) or 0),
+                      int(stats.get("pending_hybrid_replica_joins", stats.get("pending_hybrid_joins", 0)) or 0))
+        instances = list(config.heterogeneous_rollout.instances)
+        by_id = {str(instance.instance_id): instance for instance in instances}
+        current_ids = tuple(sorted(str(identity) for identity in stats.get("loan_instance_ids", [])))
+        if set(current_ids) == by_id.keys():
+            # Legacy all-lent layouts keep their ready inventory. The next
+            # step restores supply if a full batch cannot be collected.
+            return None
+        minimum = max(1, int(getattr(cfg, "elastic_hybrid_min_rollout_gpus", 0) or 0))
+        from RL_Framework.infra.elastic.rollout_lending import can_expand_loan, loan_replica_capacity
+        choices, capacities = [()], {(): 0}
+        for count in range(1, len(instances) + 1):
+            for subset in itertools.combinations(instances, count):
+                replicas = loan_replica_capacity(instances, subset, width, minimum)
+                # A removable whole service adds no training capacity and only
+                # reduces rollout supply. Keep current loans separately below.
+                if replicas and all(loan_replica_capacity(instances,
+                        subset[:index] + subset[index + 1:], width, minimum) < replicas
+                        for index in range(len(subset))):
+                    identities = tuple(sorted(str(instance.instance_id) for instance in subset))
+                    choices.append(identities)
+                    capacities[identities] = replicas
+        if not current_ids and active + joining:
+            # Older callers report complete-replica counts. Resolve only a real
+            # physical candidate; never invent a partially borrowed service.
+            current_ids = next((choice for choice in choices
+                                if capacities[choice] == active + joining), ())
+        if current_ids not in choices:
+            choices.append(current_ids)
+            capacities[current_ids] = loan_replica_capacity(instances,
+                [by_id[key] for key in current_ids], width, 0)
+        current_workers = capacities[current_ids]
+        calibration = dict(getattr(config.profiling, "calibration", {}) or {})
+        lifecycle = calibration.get("lifecycle", {})
+        horizon = min(max(1, int(calibration.get("horizon_updates", 8))),
+                      max(0, int(stats.get("remaining_updates", max(0, config.total_steps - step - 1)))))
+        error = float(calibration.get("error_margin_s", 0.0))
+        remaining_load = max(0.0, float(stats.get("joining_remaining_s",
+            0.0 if stats.get("activation_ready", False) else
+            float(lifecycle.get("load_s", 0.0)) - float(stats.get("joining_elapsed_s", 0.0)))))
+        if workload is None:
+            workload = representative_global_batch(self._history, int(config.batch_size))
+        if not workload:
+            workload = [RequestInfo(1, 1)] * int(config.batch_size)
+        if costs is None:
+            costs = _MemberPlanningCosts((), self._rollout_calls_per_trace(config))
+        lengths = self._training_workload_lengths(workload, config.batch_size)
+        groups_per_batch = int(config.batch_size) // int(config.n_samples)
+        age = max(0, int(getattr(config, "max_head_offpolicyness", 1)))
+        revision = int(dispatcher.get("optimizer_revision", step + 1))
+        reservations = list(dispatcher.get("group_reservations", []))
+        publish = float(lifecycle.get("publish_s", 0.0))
+        hybrid_publish = float(lifecycle.get("hybrid_publish_s", publish))
+        publish_inflight = float(lifecycle.get("publish_inflight_progress_s", 0.0))
+        hybrid_publish_inflight = float(lifecycle.get("hybrid_publish_inflight_progress_s", 0.0))
+        tail = float(calibration.get("group_tool_s", 0.0)) + float(calibration.get("group_tail_s", 0.0))
+        calls_per_trace = costs.calls_per_trace
 
-        planner_cfg = config.global_resource_planner
-        replica_size = int(
-            getattr(planner_cfg, "elastic_hybrid_replica_size_gpus", 0) or 0
-        )
-        topology_width = (
-            max(1, int(getattr(config, "train_tp_size", 1) or 1))
-            * max(1, int(getattr(config, "train_ep_size", 1) or 1))
-            * max(1, int(getattr(config, "train_pp_size", 1) or 1))
-            * max(1, int(getattr(config, "train_cp_size", 1) or 1))
-        )
-        if replica_size > 0 and replica_size != topology_width:
-            raise ValueError(
-                "elastic_hybrid_replica_size_gpus must equal one complete DP "
-                f"Replica ({topology_width}); got {replica_size}"
-            )
-        if replica_size <= 0:
-            replica_size = topology_width
-        min_rollout_gpus = max(
-            0,
-            int(getattr(planner_cfg, "elastic_hybrid_min_rollout_gpus", 0) or 0),
-        )
-        capacity_replicas = max(
-            0,
-            (int(config.rollout_gpus) - min_rollout_gpus) // replica_size,
-        )
-        raw_step_stats = (
-            runtime_metrics.raw.get("step_stats", {})
-            if runtime_metrics is not None
-            else {}
-        )
-        active_workers = max(
-            0,
-            int(
-                raw_step_stats.get(
-                    "active_hybrid_replicas",
-                    raw_step_stats.get("active_hybrid_workers", 0),
-                )
-                or 0
-            ),
-        )
-        joining_workers = max(
-            int(
-                raw_step_stats.get(
-                    "joining_hybrid_replicas",
-                    raw_step_stats.get("joining_hybrid_workers", 0),
-                )
-                or 0
-            ),
-            int(
-                raw_step_stats.get(
-                    "pending_hybrid_replica_joins",
-                    raw_step_stats.get("pending_hybrid_joins", 0),
-                )
-                or 0
-            ),
-            0,
-        )
-        # A worker in ACTIVATING/JOINING already consumes rollout capacity.  It
-        # must therefore count as allocated so a GRP release signal can cancel
-        # an in-flight non-blocking join immediately.
-        current_workers = active_workers + joining_workers
+        def supply(tp_list):
+            return self._complete_trace_rollout_seconds(config, tp_list, workload, costs=costs)
 
-        train_time = (
-            float(runtime_metrics.train_time_s)
-            if runtime_metrics is not None and runtime_metrics.train_time_s > 0
-            else float(candidate.t_train or current.t_train)
-        )
-        rollout_time = (
-            float(runtime_metrics.rollout_time_s)
-            if runtime_metrics is not None and runtime_metrics.rollout_time_s > 0
-            else float(candidate.t_rollout or current.t_rollout)
-        )
-        train_rollout_ratio = train_time / max(rollout_time, 1e-6)
-        rollout_pressure = (
-            max(runtime_metrics.queue_pressure, runtime_metrics.active_rollout_pressure)
-            if runtime_metrics is not None
-            else 0.0
-        )
+        @cache
+        def training(replicas):
+            return self.evaluator.evaluate_elastic_training(
+                current.train_config, config.batch_size, config.n_samples, replicas, lengths)[0]
 
-        planned_extra = max(
-            0,
-            (int(candidate.train_gpus) - int(config.train_gpus)) // replica_size,
-        )
-        if capacity_replicas <= 0:
-            desired = 0
-            reason = "no_complete_replica_capacity"
-        elif rollout_pressure >= self.elastic_hybrid_max_rollout_pressure:
-            desired = 0
-            reason = "protect_rollout_capacity"
-        elif planned_extra > 0:
-            desired = min(capacity_replicas, planned_extra)
-            reason = "candidate_requests_more_training_capacity"
-        elif train_rollout_ratio >= self.elastic_hybrid_borrow_train_rollout_ratio:
-            desired = capacity_replicas
-            reason = "training_bottleneck"
-        elif train_rollout_ratio <= self.elastic_hybrid_release_train_rollout_ratio:
-            desired = 0
-            reason = "rollout_bottleneck"
-        else:
-            desired = current_workers
-            reason = "hysteresis_hold"
+        def borrow_frontend(ids):
+            # These are current single generate calls, not active traces or
+            # their remaining tool rounds. No token progress is assumed.
+            counts = stats.get("generate_reservations_by_instance", {})
+            drain = 0.0
+            for identity in ids:
+                count = max(0, int(counts.get(identity, 0)))
+                if count:
+                    calls = representative_global_batch(workload, count)
+                    drain = max(drain, self.evaluator.evaluate_rollout_instance(
+                        int(by_id[identity].tp), calls)[0])
+            # Targets drain in parallel, then the executor stops them in
+            # sequence. Execution cleanup may release an old snapshot, so a
+            # new loan includes its necessary Core capture once.
+            return (drain + len(ids) * float(lifecycle.get("borrow_stop_s", 0.0))
+                    + float(lifecycle.get("borrow_snapshot_s", 0.0))
+                    + float(lifecycle.get("borrow_coordination_s", 0.0)))
 
-        action = (
-            "join" if desired > current_workers
-            else "release" if desired < current_workers
-            else "hold"
-        )
-        return ElasticHybridSignal(
-            step=int(step),
-            desired_workers=int(desired),
-            current_workers=int(current_workers),
-            max_workers=int(capacity_replicas),
-            action=action,
-            reason=reason,
-            train_rollout_ratio=float(train_rollout_ratio),
-            rollout_pressure=float(rollout_pressure),
-            ttl_steps=int(self.elastic_hybrid_signal_ttl_steps),
-            active_workers=int(active_workers),
-            joining_workers=int(joining_workers),
-            replica_size_gpus=int(replica_size),
-        )
+        forecasts = []
+        for ids in choices:
+            replicas = capacities[ids]
+            surviving = [instance.tp for instance in instances if str(instance.instance_id) not in ids]
+            if not surviving:
+                continue
+            rollout = supply(surviving)
+            rollout_call = rollout / calls_per_trace
+            train = training(replicas)
+            changing = ids != current_ids
+            expanding = bool(current_ids and can_expand_loan(instances, current_ids, ids, width))
+            retains_current = not changing or expanding
+            initial = float(lifecycle.get("return_frontend_s", 0.0)) if current_ids and not retains_current else 0.0
+            new_ids = tuple(key for key in ids if not retains_current or key not in current_ids)
+            first_active = min(active, replicas) if retains_current else 0
+            before_train = training(first_active)
+            initial += borrow_frontend(new_ids) if new_ids else 0.0
+            new_load = initial + float(lifecycle.get("load_s", 0.0)) if new_ids else 0.0
+            activation_times = [training(count) for count in range(first_active + 1, replicas + 1)]
+            retained_pending = max(0, current_workers - first_active) if retains_current else 0
+            ready_replicas = min(retained_pending, int(stats.get(
+                "activation_ready_replicas", int(bool(stats.get("activation_ready", False))))))
+            load = new_load if new_ids else remaining_load if retains_current and joining else 0.0
+            activation_ready_times = None
+            if expanding and retained_pending:
+                activation_ready_times = ([0.0] * ready_replicas
+                    + [remaining_load] * (retained_pending - ready_replicas)
+                    + [new_load] * (replicas - current_workers))
+            # During return/replace only services outside both loans can run;
+            # restored services cannot receive work before this publication.
+            unchanged = [instance.tp for instance in instances
+                         if str(instance.instance_id) not in set(ids) | set(current_ids)]
+            initial_rollout = (supply(unchanged)
+                               if changing and unchanged else float("inf") if changing else None)
+            seconds = bounded_update_time(train_s=train, core_train_s=before_train,
+                rollout_batch_s=rollout, groups_per_batch=groups_per_batch,
+                horizon=horizon, max_age=age, revision=revision, reservations=reservations,
+                publish_s=publish, initial_s=initial, background_ready_s=load,
+                hybrid_publish_s=hybrid_publish, active_hybrid_replicas=first_active,
+                rollout_call_s=rollout_call, publish_inflight_progress_s=publish_inflight,
+                hybrid_publish_inflight_progress_s=hybrid_publish_inflight,
+                group_tail_s=tail, group_size=config.n_samples,
+                max_concurrent_rollouts=config.max_concurrent_rollouts,
+                pending_activation=bool(activation_times), activation_train_s=activation_times,
+                activation_ready_times_s=activation_ready_times,
+                activation_s=float(lifecycle.get("activate_s", 0.0)),
+                activation_ready_replicas=ready_replicas,
+                initial_rollout_batch_s=initial_rollout) if horizon else 0.0
+            steady_publish = hybrid_publish if replicas else publish
+            steady_inflight = hybrid_publish_inflight if replicas else publish_inflight
+            steady_overlap = max(0.0, min(steady_publish, steady_inflight, rollout_call, rollout))
+            forecasts.append({"loan_instance_ids": list(ids), "replicas": replicas,
+                "seconds": seconds, "steady_update_s":
+                    max(train, rollout + tail - steady_overlap) + steady_publish})
+        baseline = next(row for row in forecasts if tuple(row["loan_instance_ids"]) == current_ids)
+        eligible = [row for row in forecasts if row is baseline or
+            (not (set(row["loan_instance_ids"]) - set(current_ids))
+             or row["steady_update_s"] < baseline["steady_update_s"])]
+        best = min(eligible, key=lambda row: row["seconds"])
+        savings = baseline["seconds"] - best["seconds"]
+        if savings <= error:
+            best = baseline
+        desired_ids = list(best["loan_instance_ids"])
+        desired = int(best["replicas"])
+        changed = tuple(desired_ids) != current_ids
+        action = ("join" if desired > current_workers else "release" if desired < current_workers
+                  else "replace" if changed else "hold")
+        capacity = max(row["replicas"] for row in forecasts)
+        return ElasticHybridSignal(step=int(step), desired_workers=desired,
+            current_workers=current_workers, max_workers=capacity, action=action,
+            reason="calibrated_gain" if changed else "calibrated_hold",
+            train_rollout_ratio=0.0, rollout_pressure=0.0,
+            ttl_steps=int(self.elastic_hybrid_signal_ttl_steps), active_workers=active,
+            joining_workers=joining, replica_size_gpus=width,
+            loan_instance_ids=desired_ids, current_loan_instance_ids=list(current_ids),
+            horizon_updates=horizon, predicted_savings_s=savings if changed else 0.0)
 
     def _mark_rejected_trigger_observed(
         self,
@@ -1294,10 +1618,33 @@ class GlobalResourcePlanner:
             except (TypeError, ValueError):
                 continue
             if prompt_i > 0 or gen_i > 0:
+                input_ids = item.get("input_ids")
+                training_length = (int(input_ids.shape[-1]) if input_ids is not None else
+                    int(item.get("sequence_length", item.get("training_length", 0)) or 0))
+                # Older profiles recorded trace totals without the number of
+                # generation calls. Keep their original length approximation.
+                calls = max(1, int(item.get("n_turns", 1) or 1))
+                if calls > 1:
+                    # Whole-trace batches hold action tokens summed across turns;
+                    # the rollout history remains in per-generate units. The
+                    # midpoint follows the context growth of the complete trace.
+                    positions = {int(event["turn"]): int(event["token_position"])
+                                 for event in item.get("tool_returns", ()) or ()
+                                 if isinstance(event, dict)
+                                 and "turn" in event and "token_position" in event
+                                 and 0 <= int(event["turn"]) < calls - 1}
+                    if len(positions) == calls - 1:
+                        prompt_i += sum(positions.values()) // calls
+                    else:
+                        growth = max(0, training_length - prompt_i,
+                                     int(item.get("total_output_tokens", 0) or 0))
+                        prompt_i += growth * (calls - 1) // (2 * calls)
+                    gen_i = math.ceil(gen_i / calls)
                 requests.append(
                     RequestInfo(
                         prompt_length=max(1, prompt_i),
                         gen_length=max(1, gen_i),
+                        training_length=training_length,
                     )
                 )
         return requests
@@ -1306,6 +1653,7 @@ class GlobalResourcePlanner:
         self,
         config: AsyncRLConfig,
         requests: list[RequestInfo],
+        *, costs: _MemberPlanningCosts | None = None,
     ) -> GlobalResourcePlan:
         requests = representative_global_batch(requests, int(config.batch_size))
         train = TrainParallelConfig(
@@ -1325,19 +1673,16 @@ class GlobalResourcePlanner:
             n_instances = max(1, config.rollout_gpus // max(1, config.vllm_tp_size))
             rollout_tp = [max(1, config.vllm_tp_size)] * n_instances
         rollout = RolloutClusterConfig(tp_list=rollout_tp)
-        lengths = [r.total_length for r in requests] or [1024]
+        lengths = self._training_workload_lengths(requests, config.batch_size)
+        current_inputs = (train, tuple(rollout_tp), tuple(lengths), config.max_concurrent_rollouts)
+        if costs is not None and costs.current_inputs == current_inputs:
+            return costs.current_plan
         t_train, train_details = self.evaluator.evaluate_training(
             train, config.batch_size, lengths
         )
-        if getattr(self.evaluator, "rollout_backend", "analytic") == "analytic":
-            t_rollout, rollout_details = self.optimizer.evaluate_fixed_rollout_config(
-                rollout, requests
-            )
-        else:
-            t_rollout, rollout_details = self.evaluator.evaluate_rollout(
-                rollout, requests
-            )
-        return GlobalResourcePlan(
+        t_rollout, rollout_details = self._layout_supply(rollout_tp, requests, costs)
+        t_rollout *= costs.calls_per_trace if costs is not None else self._rollout_calls_per_trace(config)
+        plan = GlobalResourcePlan(
             train_config=train,
             rollout_config=rollout,
             t_train=t_train,
@@ -1351,6 +1696,10 @@ class GlobalResourcePlanner:
                 "rollout": rollout_details,
             },
         )
+        if costs is not None:
+            costs.current_plan = plan
+            costs.current_inputs = current_inputs
+        return plan
 
     def _plan_from_result(
         self,

@@ -140,6 +140,7 @@ class MegatronCoreTrainEngine:
         self._elastic_step_hybrid_workers: tuple[str, ...] = ()
         self._elastic_gradient_update_callback = None
         self._hybrid_optimizer_cuda_cache_released = False
+        self._hybrid_gradient_communication_groups = []
         self.hybrid_lockstep_gradient_sync = True
         self._elastic_active_gradient_timeout_s = 300.0
         self.checkpoints = MegatronDistributedCheckpointManager(

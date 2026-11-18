@@ -337,7 +337,6 @@ def test_trainer_admits_only_fresh_rollouts_with_an_actual_revision(sample_revis
     trainer.train_engine = SimpleNamespace(optimizer_revision=5, get_version=lambda: 5)
     trainer.rollout_engine = object()
     trainer.is_main_process = False
-    trainer._refresh_rollout_engine_from_manifest_for_task = lambda: None
     trainer.staleness_manager = StalenessManager(
         version_provider=trainer.train_engine, max_concurrent_rollouts=1, consumer_batch_size=1, max_staleness=1,
     )

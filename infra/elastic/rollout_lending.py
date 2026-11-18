@@ -33,7 +33,36 @@ def loan_replica_capacity(instances, selected, width, reserve):
     return sum(len(gpus) // width for gpus in by_host.values())
 
 
-def _choose_engines(executor, required):
+def can_expand_loan(instances, current_ids, target_ids, width):
+    """New services must be able to supply the extra full replicas."""
+    current, target = set(current_ids), set(target_ids)
+    if not current < target:
+        return False
+    old = [meta for meta in instances if meta.instance_id in current]
+    added = [meta for meta in instances if meta.instance_id in target - current]
+    chosen = old + added
+    return (loan_replica_capacity(old, old, width, 0)
+            + loan_replica_capacity(added, added, width, 0)
+            >= loan_replica_capacity(chosen, chosen, width, 0))
+
+
+def supports_local_lending(executor):
+    hetero = getattr(executor.config, "heterogeneous_rollout", None)
+    scheduling = getattr(hetero, "scheduling", None)
+    scheduler = getattr(getattr(executor, "rollout_engine", None), "scheduler", None)
+    trainer = getattr(executor, "trainer", None)
+    sources = getattr(trainer, "_rollout_source_world_size",
+                      getattr(executor.config, "train_dp_size", 1))
+    ranks = getattr(trainer, "_rollout_source_ranks", (0,))
+    return (getattr(trainer, "_bounded_rollout_production", True)
+            and sources == 1 and tuple(ranks) == (0,)
+            and getattr(scheduling, "scheduler_type", None) == "cmlfq_cost"
+            and getattr(scheduling, "cmlfq_kv_backend", None) == "recompute"
+            and callable(getattr(scheduler, "withdraw_instances", None))
+            and callable(getattr(scheduler, "wait_for_generations", None)))
+
+
+def _choose_engines(executor, required, instance_ids=None):
     loan = getattr(executor, "_lent_rollout", None) or {}
     existing = loan.get("engines", [])
     old_ids = {meta.instance_id for meta in existing}
@@ -48,6 +77,15 @@ def _choose_engines(executor, required):
         total = loan_replica_capacity(instances, [*existing, *added], width, reserve)
         extra = loan_replica_capacity(added, added, width, 0)
         return min(total, old_capacity + extra) * width >= required
+
+    if instance_ids is not None:
+        added_ids = set(instance_ids) - old_ids
+        if not added_ids.issubset(live):
+            raise ValueError("rollout loan targets must have current physical owners")
+        selected = tuple(live[name] for name in sorted(added_ids))
+        if not fits(selected):
+            raise ValueError("rollout loan targets cannot supply the requested complete replicas and reserve")
+        return selected
 
     metas = tuple(live[name] for name in sorted(live))
     candidates = []
@@ -112,7 +150,7 @@ def _rollback_expansion(executor):
         executor.dispatcher.resume()
 
 
-def lend_rollout(executor, required_gpu_count):
+def lend_rollout(executor, required_gpu_count, *, instance_ids=None):
     """Grow the loan to a total GPU target without replacing active Hybrids.
 
     Only newly selected whole engines are stopped. Their physical slots become
@@ -121,13 +159,18 @@ def lend_rollout(executor, required_gpu_count):
     required = int(required_gpu_count)
     previous = getattr(executor, "_lent_rollout", None)
     existing = previous["engines"] if previous else []
+    old_ids = {meta.instance_id for meta in existing}
+    target_ids = set(instance_ids) if instance_ids is not None else None
+    if target_ids is not None and not old_ids.issubset(target_ids):
+        raise RuntimeError("a different physical rollout loan must be returned before switching")
     width = executor._elastic_replica_size_gpus()
-    if required < 1 or loan_replica_capacity(existing, existing, width, 0) * width >= required:
+    if required < 1 or (target_ids in (None, old_ids)
+                        and loan_replica_capacity(existing, existing, width, 0) * width >= required):
         return deepcopy(previous["slots"]) if previous else {}
     if getattr(executor, "_rollout_loan_rollback", None):
         raise RuntimeError("an incomplete rollout loan expansion must be recovered before retry")
     executor._adopt_existing_rollout_processes()
-    selected = _choose_engines(executor, required)
+    selected = _choose_engines(executor, required, target_ids)
     if not selected:
         return deepcopy(previous["slots"]) if previous else {}
 
@@ -155,19 +198,27 @@ def lend_rollout(executor, required_gpu_count):
     executor._rollout_loan_rollback = pending
     dispatcher = getattr(executor, "dispatcher", None)
     timeout = float(getattr(executor.config.global_resource_planner, "runtime_drain_timeout_s", 3600.))
+    local = supports_local_lending(executor) and len(selected) < len(executor._process_meta)
     paused_here = False
     try:
-        paused_here = dispatcher is not None and not dispatcher.is_paused()
-        if paused_here:
-            dispatcher.pause()
-            pending["paused_here"] = True
-        drain_timeout = timeout if timeout > 0 else float("inf")
-        if dispatcher is not None:
-            dispatcher.wait_until_idle(timeout=drain_timeout)
-        engine = getattr(executor, "rollout_engine", None)
-        if callable(getattr(engine, "wait_until_idle", None)):
-            engine.wait_until_idle(timeout=drain_timeout)
-        _set_unavailable(executor, selected_ids)
+        if local:
+            indices = [index for index, handle in enumerate(scheduler._instances)
+                       if handle.instance_id in selected_ids]
+            scheduler.withdraw_instances(indices)
+            # Requests reserved before withdrawal may still need to enter HTTP.
+            scheduler.wait_for_generations(indices, timeout=timeout if timeout > 0 else None)
+        else:
+            paused_here = dispatcher is not None and not dispatcher.is_paused()
+            if paused_here:
+                dispatcher.pause()
+                pending["paused_here"] = True
+            drain_timeout = timeout if timeout > 0 else float("inf")
+            if dispatcher is not None:
+                dispatcher.wait_until_idle(timeout=drain_timeout)
+            engine = getattr(executor, "rollout_engine", None)
+            if callable(getattr(engine, "wait_until_idle", None)):
+                engine.wait_until_idle(timeout=drain_timeout)
+            _set_unavailable(executor, selected_ids)
         for meta in selected:
             pending["uncertain"].append(meta.instance_id)
             stopped = executor._stop_rollout_process(meta.instance_id)
@@ -196,8 +247,9 @@ def lend_rollout(executor, required_gpu_count):
             scheduler = getattr(getattr(executor, "rollout_engine", None), "scheduler", None)
             if any(handle.is_ready for handle in getattr(scheduler, "_instances", [])):
                 dispatcher.resume()
-            elif getattr(executor, "_lent_rollout", None) is not None:
-                executor._lent_rollout["resume_dispatcher_after_publication"] = True
+            else:
+                if trainer is not None:
+                    trainer._paused_for_rollout_loan = True
 
 
 def wait_hybrid_stopped(executor, worker_id, request_id=None):
@@ -253,6 +305,12 @@ def return_rollout(executor):
             wait_hybrid_stopped(executor, worker_id, request.get("request_id"))
     _set_unavailable(executor, {meta.instance_id for meta in saved["engines"]})
     restored = _restart_engines(executor, saved)
-    executor._rollout_lending_resume_pending = bool(saved.get("resume_dispatcher_after_publication", False))
     executor._lent_rollout = None
+    trainer = getattr(executor, "trainer", None)
+    if trainer is not None:
+        from .rollout_lifecycle import apply_availability
+        pending = set(getattr(trainer, "_restored_rollouts_pending_publication", ()))
+        pending.update(meta.instance_id for meta in restored)
+        trainer._restored_rollouts_pending_publication = pending
+        apply_availability(trainer, pending)
     return restored

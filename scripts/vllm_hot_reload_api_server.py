@@ -55,8 +55,27 @@ _custom_router = APIRouter()
 
 
 @_custom_router.get('/publication/status')
+@_custom_router.get('/libra/kv/identity')
 async def publication_status(request: Request):
     return request.app.state.serving_state.status()
+
+
+@_custom_router.post('/libra/kv/lease')
+async def acquire_kv_lease(request: Request):
+    body = await request.body()
+    lease_id = json.loads(body).get('lease_id') if body else None
+    if lease_id is not None and (not isinstance(lease_id, str) or not re.fullmatch('[a-f0-9]{32}', lease_id)):
+        raise HTTPException(status_code=400, detail='Invalid KV lease ID')
+    try:
+        return await request.app.state.serving_state.acquire_kv_lease(lease_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@_custom_router.delete('/libra/kv/lease/{lease_id}')
+async def release_kv_lease(lease_id: str, request: Request):
+    await request.app.state.serving_state.release_kv_lease(lease_id)
+    return {'released': True}
 
 
 async def ensure_behavior_capture(request):

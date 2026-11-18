@@ -88,8 +88,8 @@ def test_shared_episode_orders_generation_score_feedback_and_finish(objective, f
         def route_cmlfq_tool_return(self, request_id, event, length):
             events.append(('tool', event['payload_tokens'], length))
 
-        def finish_cmlfq_request(self, request_id, length):
-            events.append(('finish', length))
+        def finish_cmlfq_request(self, request_id, length, *, generated_tokens=None):
+            events.append(('finish', length, generated_tokens))
 
     def reward(**kwargs):
         events.append(('reward', kwargs['completion']))
@@ -112,7 +112,7 @@ def test_shared_episode_orders_generation_score_feedback_and_finish(objective, f
     row = asyncio.run(model.run_episode(Engine(), {'prompt_id': 'p'}))
     assert events == [('begin', 1), ('generate', 0), ('score', 'a'),
         ('feedback',), ('tool', feedback_tokens, feedback_tokens + 1),
-        ('generate', 1), ('score', 'b'), ('reward', 'b'), ('finish', feedback_tokens + 2)]
+        ('generate', 1), ('score', 'b'), ('reward', 'b'), ('finish', feedback_tokens + 2, 2)]
     assert row['loss_mask'].tolist() == [[0, 1] + [0] * feedback_tokens + [1]]
     assert row['tool_returns'][0]['remaining_length'] == 1
     assert row['tool_returns'][0]['generated_token_position'] == 1

@@ -4,9 +4,9 @@ import asyncio
 import json
 import math
 import tempfile
+import threading
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -22,7 +22,6 @@ from RL_Framework.infra.scheduling.cmlfq_scheduler import CMLFQMigrationDecision
 from RL_Framework.infra.scheduling.cmlfq_tool_state import DefaultToolStateExtractor
 from RL_Framework.infra.scheduling.factory import SchedulerFactory
 from RL_Framework.infra.cost_model.model import RolloutCostModel
-from RL_Framework.infra.elastic.rollout_lifecycle import apply_availability
 
 
 BUCKETS = {
@@ -59,11 +58,6 @@ def scheduler(lengths=(1000, 10000), **kwargs):
     return s
 
 
-def rollout_availability(scheduler):
-    owner = SimpleNamespace(rollout_engine=SimpleNamespace(scheduler=scheduler))
-    return lambda unavailable: apply_availability(owner, unavailable)
-
-
 class TestDistributionCostRouting(unittest.TestCase):
     def test_completion_rejects_a_request_that_exceeds_instance_kv_capacity(self):
         model = RolloutCostModel(
@@ -87,7 +81,7 @@ class TestDistributionCostRouting(unittest.TestCase):
         self.assertTrue(decision.should_migrate)
         self.assertEqual(decision.target_instance_index, 1)
 
-    def test_recompute_prefill_is_charged_once_on_the_target(self):
+    def test_equal_recompute_prefill_is_charged_to_both_stay_and_move(self):
         s = scheduler(lengths=(10000,))
         s.routing_costs.decode_ms = {"1": {"long": 2000}, "4": {"long": 1000}}
         s.routing_costs.migrations = []
@@ -95,12 +89,13 @@ class TestDistributionCostRouting(unittest.TestCase):
             num_params=1, d_model=1, n_layers=1, n_kv_heads=1, head_dim=1,
             dtype_bytes=1, flops_peak=1000, mem_bw=1000, mem_capacity=1e9,
             tp_comm_overhead=0, prefill_mfu=1, prefill_chunk_size=100,
+            calibration={"4": {"prefill_scale": 4}},
         )
         request = s.schedule(100, "p").request_id
         decision = s.on_tool_return(request, EVENT, 0)
-        # Both choices include prefill; migration pays no second target prefill.
+        # Both services recompute 100 tokens (42.4s); decode is 2s vs 1s.
         self.assertTrue(decision.should_migrate)
-        self.assertAlmostEqual(decision.prefill_seconds, 10.6)
+        self.assertAlmostEqual(decision.prefill_seconds, 42.4)
         self.assertAlmostEqual(decision.migration_seconds, 0)
 
     def test_online_tree_excludes_feedback_from_remaining_generated_tokens(self):
@@ -135,15 +130,54 @@ class TestDistributionCostRouting(unittest.TestCase):
             self.assertEqual(restored.residual_distribution("p", [STATE], s._bucket_thresholds),
                              [("short", 1, 75)])
 
+    def test_generate_counts_exclude_tool_traces_and_follow_commit_and_rollback(self):
+        s = scheduler(lengths=())
+        idle = s.schedule(100, "tool-gap").request_id
+        request = s.schedule(100, "current-call").request_id
+        self.assertEqual(s.generation_reservation_counts(), {"s": 0, "l": 0})
+        decision = s.reserve_generation(request)
+        self.assertEqual(s.generation_reservation_counts(), {"s": 1, "l": 0})
+        s.commit_generation(request, decision)
+        self.assertEqual(s.generation_reservation_counts(), {"s": 0, "l": 0})
+        s.reserve_generation(idle)
+        s.rollback_generation(idle)
+        self.assertEqual(s.generation_reservation_counts(), {"s": 0, "l": 0})
+
+    def test_withdraw_preserves_reserved_before_http_and_waits_for_commit(self):
+        s = scheduler(lengths=())
+        request = s.schedule(100, "unseen").request_id
+        decision = s.reserve_generation(request)
+        s.withdraw_instances([0])
+        with self.assertRaises(TimeoutError):
+            s.wait_for_generations([0], timeout=.001)
+        finished = threading.Event()
+        waiter = threading.Thread(target=lambda: (s.wait_for_generations([0], timeout=1), finished.set()))
+        waiter.start()
+        self.assertFalse(finished.wait(.01))
+        s.commit_generation(request, decision)
+        self.assertTrue(finished.wait(1))
+        waiter.join()
+        self.assertFalse(s.get_instance_handle(0).is_ready)
+        s.set_instances_available([0], True)
+        self.assertTrue(s.get_instance_handle(0).is_ready)
+
     def test_withdrawn_source_without_distribution_recomputes_on_survivor(self):
         s = scheduler(lengths=())
         request = s.schedule(100, "unseen").request_id
-        rollout_availability(s)({"s"})
+        s.withdraw_instances([0])
         decision = s.reserve_generation(request)
         self.assertEqual(decision.target_instance_index, 1)
         self.assertEqual(decision.execution_path, "recompute")
         s.commit_generation(request, decision)
         self.assertEqual(s.get_request_route(request).instance_index, 1)
+
+    def test_rollback_releases_withdrawn_target_generation_wait(self):
+        s = scheduler(lengths=())
+        request = s.schedule(100, "unseen").request_id
+        s.reserve_generation(request)
+        s.withdraw_instances([0])
+        s.rollback_generation(request)
+        s.wait_for_generations([0], timeout=.001)
 
     def test_distribution_changes_decision_when_legacy_mean_and_p90_disagree(self):
         s = scheduler(lengths=(1000, 1000, 1000, 15000))
@@ -296,7 +330,7 @@ class TestBackendIntegration(unittest.IsolatedAsyncioTestCase):
                 record = getattr(engine, "record_cmlfq_tool_return", engine.route_cmlfq_tool_return)
                 record(rid, EVENT, 900)
                 self.assertEqual(estimate.call_count, 0)
-                rollout_availability(engine.scheduler)({"s"})
+                engine.scheduler.withdraw_instances([0])
                 result = await engine.generate("transcript", request_id=rid)
                 self.assertEqual(result["_schedule_info"]["instance_index"], 1)
                 self.assertGreater(estimate.call_count, 0)
@@ -339,8 +373,7 @@ class TestBackendIntegration(unittest.IsolatedAsyncioTestCase):
             return self.response()
         engine = self.engine(handler, transfer=False)
         rid = engine.begin_cmlfq_request("p", 100)
-        set_unavailable = rollout_availability(engine.scheduler)
-        set_unavailable({"s", "l"})
+        engine.scheduler.withdraw_instances([0, 1])
         pending = None
         try:
             engine.route_cmlfq_tool_return(rid, EVENT, 900)
@@ -348,7 +381,7 @@ class TestBackendIntegration(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(.01)
             self.assertFalse(pending.done())
             self.assertEqual(seen, [])
-            set_unavailable({"s"})
+            engine.scheduler.set_instances_available([1], True)
             result = await asyncio.wait_for(pending, 1)
             self.assertEqual(result["_schedule_info"]["instance_index"], 1)
             self.assertEqual(result["_schedule_info"]["execution_path"], "recompute")

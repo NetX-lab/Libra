@@ -29,7 +29,6 @@ def _trainer(n_samples=4):
     trainer.config = SimpleNamespace(n_samples=n_samples)
     trainer.train_engine = _FakeTrainEngine()
     trainer._task_counter = 0
-    trainer._use_heterogeneous = False
     return trainer
 
 
@@ -41,6 +40,14 @@ def test_data_generator_repeats_each_prompt_as_a_contiguous_group():
     assert len({task.group_id for task in tasks[4:]}) == 1
     assert tasks[0].group_id != tasks[4].group_id
     assert [task.rollout_index for task in tasks[:4]] == [0, 1, 2, 3]
+
+
+def test_data_generator_uses_the_configured_sampler_seed():
+    trainer = _trainer(n_samples=1)
+    trainer.config.seed = 42
+    dataset = [{"x": index} for index in range(8)]
+    tasks = islice(trainer._create_data_generator(dataset, None), len(dataset))
+    assert [task.data["x"] for task in tasks] == [6, 3, 0, 7, 2, 1, 4, 5]
 
 
 def test_advantages_are_normalized_within_prompt_not_across_prompts():

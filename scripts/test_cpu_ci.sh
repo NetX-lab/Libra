@@ -5,6 +5,8 @@ python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_config_parsing.py \
   tests/test_qwen3_config.py \
   tests/test_planner_global_batch_workload.py \
+  tests/test_global_resource_planner_simulators.py \
+  tests/test_elastic_cost_horizon.py \
   tests/test_finite_rollout_cost.py \
   tests/test_r2e_cluster_placement.py \
   tests/test_async_task_runner.py \
@@ -61,6 +63,7 @@ python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_rollout_process.py \
   tests/test_rollout_supply.py \
   tests/test_runtime_boundary_integration.py \
+  tests/test_runtime_boundary.py \
   tests/test_runtime_core_capabilities.py \
   tests/test_runtime_elastic_executor.py \
   tests/test_runtime_blue_green_gpu_ownership.py \

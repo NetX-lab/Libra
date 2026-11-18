@@ -133,6 +133,8 @@ def _initialize_megatron_worker(args):
     for key in ("tp", "pp", "cp", "ep"):
         if int(actual[f"train_{key}"]) != int(getattr(config, f"train_{key}_size", 1)):
             raise RuntimeError(f"Hybrid factory changed the requested {key} model parallelism")
+    from RL_Framework.engine.logprob_compat import install as install_bounded_logprob
+    install_bounded_logprob(engine)
     if args.initialize_only:
         engine.prepare_elastic_gradient_communication()
     else:
@@ -252,6 +254,7 @@ def main():
                     if task_snapshot and task_snapshot != str(snapshot):
                         _install_state_and_prepare(args, engine, task_snapshot)
                         snapshot = task_snapshot
+                    data["trajectories"] = [dict(row) for row in data["trajectories"]]
                     _prepare_training_task(engine, data)
                     payload = engine.compute_elastic_gradient_payload(data["trajectories"], worker_id=args.replica_id or args.worker_id, target_core_id=args.target_core_id, step=int(data["step"]), state_version=int(data["state_version"]), membership_epoch=int(data["membership_epoch"]), global_sample_count=int(data.get("global_sample_count", 0)))
                 else:
