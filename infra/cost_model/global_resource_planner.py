@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -21,6 +21,7 @@ from RL_Framework.infra.cost_model.optimizer import (
     OptimizationResult,
     TwoLevelNestedOptimizer,
 )
+from RL_Framework.infra.cost_model.resource_alloc import split_gpu_slots
 from RL_Framework.infra.cost_model.simulator_adapters import HybridSimulatorCostModel
 
 logger = logging.getLogger(__name__)
@@ -1122,9 +1123,12 @@ class GlobalResourcePlanner:
         self,
         plan: GlobalResourcePlan,
         config: AsyncRLConfig,
+        *,
+        allocation_hosts: Sequence[str] | None = None,
     ) -> None:
-        preserve_slots = (config.train_gpus == plan.train_gpus
-                          and config.rollout_gpus == plan.rollout_gpus)
+        preserve_slots = (int(config.train_gpus) == int(plan.train_gpus)
+                          and int(config.rollout_gpus) == int(plan.rollout_gpus))
+        previous_instances = list(config.heterogeneous_rollout.instances)
         config.n_total_gpus = plan.n_total_gpus
         config.train_gpus = plan.train_gpus
         config.rollout_gpus = plan.rollout_gpus
@@ -1142,14 +1146,24 @@ class GlobalResourcePlanner:
         hetero = config.heterogeneous_rollout
         hetero.enabled = True
         hetero.total_gpus = plan.rollout_gpus
-        host_gpu_pools = self._rollout_host_gpu_pools(config, plan.rollout_gpus)
-        if preserve_slots and hetero.instances:
+        if allocation_hosts is None:
+            host_gpu_pools = self._rollout_host_gpu_pools(config, plan.rollout_gpus)
+        else:
+            _, rollout_slots = split_gpu_slots(
+                allocation_hosts, config.hardware.gpus_per_node, plan.train_gpus,
+            )
+            host_gpu_pools = list(rollout_slots.items())
+        if preserve_slots and previous_instances:
             observed: dict[str, set[int]] = {}
-            for instance in hetero.instances:
-                observed.setdefault(instance.host or hetero.vllm_host, set()).update(instance.gpus)
-            # Repartition the actual rollout pool, excluding the fixed Core GPUs.
-            if sum(map(len, observed.values())) == plan.rollout_gpus:
+            for instance in previous_instances:
+                observed.setdefault(instance.host or hetero.vllm_host, set()).update(
+                    int(gpu) for gpu in instance.gpus)
+            # On a shared node, observing rollout GPUs [1, 2, 3] does not
+            # authorize taking Core GPU 0. Repartition only the current pool.
+            if sum(len(gpus) for gpus in observed.values()) == int(plan.rollout_gpus):
                 host_gpu_pools = [(host, sorted(gpus)) for host, gpus in observed.items()]
+            else:
+                preserve_slots = False
         if host_gpu_pools:
             hetero.available_gpus = sorted(
                 {gpu for _, gpus in host_gpu_pools for gpu in gpus}
@@ -1163,19 +1177,59 @@ class GlobalResourcePlanner:
                 hetero.available_gpus = list(available)
             host_gpu_pools = [(hetero.vllm_host, available)]
 
+        allocations, retained = {}, {}
+        if preserve_slots:
+            # Retain an unchanged physical service only when the remaining
+            # requested degrees still fit. This keeps the leading TP1 service
+            # running through [1,1,1] -> [1,2] without fragmenting a TP4 pool.
+            sizes = {host: len(gpus) for host, gpus in host_gpu_pools}
+            for previous in sorted(previous_instances, key=lambda item: (
+                    sizes.get(item.host or hetero.vllm_host, 0), min(item.gpus, default=-1))):
+                index = next((index for index, tp in enumerate(plan.rollout_tp_list)
+                              if index not in allocations and int(tp) == int(previous.tp)), None)
+                if index is None:
+                    continue
+                host = previous.host or hetero.vllm_host
+                trial = [(name, [gpu for gpu in gpus if name != host or gpu not in previous.gpus])
+                         for name, gpus in host_gpu_pools]
+                check = [(name, list(gpus)) for name, gpus in trial]
+                try:
+                    for candidate, tp in sorted(enumerate(plan.rollout_tp_list),
+                                                key=lambda item: int(item[1]), reverse=True):
+                        if candidate not in allocations and candidate != index:
+                            self._allocate_rollout_instance(check, int(tp))
+                except ValueError:
+                    continue
+                allocations[index] = (host, list(previous.gpus))
+                retained[index] = previous
+                host_gpu_pools = trial
+        for index, tp in sorted(enumerate(plan.rollout_tp_list),
+                                key=lambda item: int(item[1]), reverse=True):
+            if index not in allocations:
+                allocations[index] = self._allocate_rollout_instance(host_gpu_pools, int(tp))
+
+        used_ids = {instance.instance_id for instance in retained.values()}
+        used_ports = {int(instance.port) for instance in retained.values() if instance.port}
         instances = []
-        for idx, tp in enumerate(plan.rollout_tp_list):
-            host, gpus = self._allocate_rollout_instance(host_gpu_pools, tp)
-            instances.append(
-                HeterogeneousInstanceConfig(
-                    instance_id=f"grp_tp{tp}_{idx}",
-                    tp=tp,
-                    gpus=gpus,
-                    host=host or hetero.vllm_host,
-                    port=int(hetero.vllm_base_port) + idx,
-                    description="managed_by_global_resource_planner",
-                )
-            )
+        for index, tp in enumerate(plan.rollout_tp_list):
+            host, gpus = allocations[index]
+            if index in retained:
+                instances.append(replace(retained[index], host=host, gpus=gpus))
+                continue
+            suffix = index
+            while f"grp_tp{tp}_{suffix}" in used_ids:
+                suffix += 1
+            identity = f"grp_tp{tp}_{suffix}"
+            port = int(hetero.vllm_base_port) + index
+            while port in used_ports:
+                port += 1
+            if port > 65535:
+                raise ValueError("The configured rollout port range is invalid")
+            used_ids.add(identity)
+            used_ports.add(port)
+            instances.append(HeterogeneousInstanceConfig(instance_id=identity, tp=tp,
+                gpus=gpus, host=host or hetero.vllm_host, port=port,
+                description="managed_by_global_resource_planner"))
         hetero.instances = instances
 
     @staticmethod
@@ -1305,10 +1359,6 @@ class GlobalResourcePlanner:
     ) -> GlobalResourcePlan | None:
         if result.train_config is None or result.rollout_config is None:
             return None
-        max_concurrent = max(
-            config.batch_size,
-            result.rollout_config.n_instances * config.batch_size,
-        )
         return GlobalResourcePlan(
             train_config=result.train_config,
             rollout_config=result.rollout_config,
@@ -1316,7 +1366,7 @@ class GlobalResourcePlanner:
             t_rollout=result.t_rollout,
             t_global=result.t_global,
             n_total_gpus=self.n_total_gpus,
-            max_concurrent_rollouts=max_concurrent,
+            max_concurrent_rollouts=config.max_concurrent_rollouts,
             metadata={
                 "source": "optimizer",
                 "n_configs_explored": result.n_configs_explored,

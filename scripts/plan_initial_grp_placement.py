@@ -8,6 +8,9 @@ import json
 from pathlib import Path
 
 from RL_Framework.config import AsyncRLConfig
+from RL_Framework.scripts.materialize_r2e_cluster import (
+    seed_cluster_config, materialize_planned_cluster,
+)
 from RL_Framework.infra.cost_model.preflight_planner import (
     PreflightPlanner,
     load_history_jsonl,
@@ -57,9 +60,7 @@ def main() -> None:
         raise ValueError("gpus-per-host must be positive")
 
     config = AsyncRLConfig.from_yaml(args.config)
-    physical_total = len(hosts) * args.gpus_per_host
-    if config.n_total_gpus != physical_total:
-        config.n_total_gpus = physical_total
+    config = seed_cluster_config(config, hosts, args.gpus_per_host)
     planner_cfg = config.global_resource_planner
     planner_cfg.initial_allocation_strategy = "grp"
     planner_cfg.fixed_train_gpus = 0
@@ -71,6 +72,7 @@ def main() -> None:
         args.gpus_per_host, planner_cfg.min_rollout_gpus
     )
 
+    history = None
     history_source = "real_profile"
     history_path = args.history_jsonl
     profile_summary = {}
@@ -195,32 +197,15 @@ def main() -> None:
             "global_resource_planner.startup_profile_dataset_jsonl, or explicitly "
             "enable --allow-synthetic-fallback"
         )
-    result = PreflightPlanner(config, apply_best_candidate=True).run(history)
-    planned = result.planned_config
-    if planned.train_gpus % args.gpus_per_host:
-        raise RuntimeError("GRP produced a non-node-aligned training allocation")
-    if planned.rollout_gpus % args.gpus_per_host:
-        raise RuntimeError("GRP produced a non-node-aligned rollout allocation")
-
-    train_nodes = planned.train_gpus // args.gpus_per_host
-    rollout_nodes = planned.rollout_gpus // args.gpus_per_host
-    if train_nodes + rollout_nodes != len(hosts):
-        raise RuntimeError("GRP placement does not consume the candidate host pool")
-
-    train_hosts = hosts[:train_nodes]
-    rollout_hosts = hosts[train_nodes:train_nodes + rollout_nodes]
-    planned.num_nodes = train_nodes
-    planned.train_gpus_per_node = args.gpus_per_host
-    planned.rollout_gpus_per_node = args.gpus_per_host
+    result = PreflightPlanner(config, apply_best_candidate=True).run(history, allocation_hosts=hosts)
+    if not result.applied or result.applied_plan is None:
+        raise RuntimeError("Initial GRP did not produce a feasible resource plan")
+    planned, placement = materialize_planned_cluster(result.planned_config, hosts, args.gpus_per_host)
+    train_hosts, rollout_hosts = placement["train_hosts"], placement["rollout_hosts"]
     planned.to_yaml(args.output_config)
 
     payload = {
-        "strategy": "grp",
-        "gpus_per_host": args.gpus_per_host,
-        "train_gpus": planned.train_gpus,
-        "rollout_gpus": planned.rollout_gpus,
-        "train_hosts": train_hosts,
-        "rollout_hosts": rollout_hosts,
+        **placement,
         "history_source": history_source,
         "history_jsonl": history_path,
         "profile_summary": profile_summary,
