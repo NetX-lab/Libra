@@ -143,3 +143,76 @@ def test_elastic_training_joins_each_replica_after_its_local_anchor_and_backprop
     # Core: 103+1506=1609; Hybrid: 64+1728=1792; exposed costs: 5+2.
     assert details["sample_counts"] == [4, 4]
     assert seconds == pytest.approx(1799.)
+
+
+def test_evaluate_training_shards_anchor_across_dp_and_ep():
+    from RL_Framework.config import ModelArchConfig
+    from RL_Framework.infra.cost_model.model import CostModel, TrainParallelConfig
+
+    costs = CostModel(model_arch=ModelArchConfig(n_layers=1, is_moe=True, num_experts=4, num_activated_experts=2))
+    lengths = [1024] * 16
+    _, d_dp1 = costs.evaluate_training(TrainParallelConfig(tp=2, dp=1, ep=1, b_micro=1), 16, lengths)
+    _, d_dp2 = costs.evaluate_training(TrainParallelConfig(tp=2, dp=2, ep=1, b_micro=1), 16, lengths)
+    _, d_dp4 = costs.evaluate_training(TrainParallelConfig(tp=2, dp=4, ep=1, b_micro=1), 16, lengths)
+    _, d_ep2 = costs.evaluate_training(TrainParallelConfig(tp=2, dp=1, ep=2, b_micro=1), 16, lengths)
+
+    assert d_dp2["anchor_s"] == pytest.approx(d_dp1["anchor_s"] / 2.0)
+    assert d_dp4["anchor_s"] == pytest.approx(d_dp1["anchor_s"] / 4.0)
+    expected_ep2_anchor = 8 * costs.training_model.compute_stage_fwd_time(
+        1024, TrainParallelConfig(tp=2, dp=1, ep=2, b_micro=1)
+    )
+    assert d_ep2["anchor_s"] == pytest.approx(expected_ep2_anchor)
+
+
+def test_evaluate_training_matches_zero_hybrid_elastic_critical_path():
+    from RL_Framework.config import ModelArchConfig, ProfilingConfig
+    from RL_Framework.infra.cost_model.model import CostModel, TrainParallelConfig
+
+    profile = ProfilingConfig(
+        alpha_mlp_fwd=0., beta_mlp_fwd=0., alpha_mlp_bwd=100., beta_mlp_bwd=0.,
+        alpha_attn_fwd=1., beta_attn_fwd=0., gamma_attn_fwd=0.,
+        alpha_attn_bwd=0., beta_attn_bwd=0., gamma_attn_bwd=0.,
+        calibration={"training": {"compute_scale": 1.5, "anchor_scale": 2.0, "optimizer_s": 3.0}},
+    )
+    costs = CostModel(model_arch=ModelArchConfig(n_layers=1), profiling=profile)
+    # zero_level=0 isolates replica sharding from ZeRO-1 DP background contention
+    core = TrainParallelConfig(tp=1, dp=2, b_micro=1, zero_level=0)
+    lengths = [10, 1, 1, 1, 4, 4, 4, 4]
+    total_train, details = costs.evaluate_training(core, 8, lengths)
+    # Use hybrids=0 with core_replicas=2 -> same 2-replica partition without hybrid_gradient_s
+    total_elastic, elastic_details = costs.evaluate_elastic_training(core, 8, 4, 0, lengths)
+
+    # Replica 0: anchor=(100+3)*2=206, compute=1506*1.5=2259 -> 2465
+    # Replica 1: anchor=64*2=128, compute=1728*1.5=2592 -> 2720 (critical!)
+    assert details["replica_anchor_times"] == [pytest.approx(206.0), pytest.approx(128.0)]
+    assert details["anchor_s"] == pytest.approx(128.0)
+    assert total_train == pytest.approx(total_elastic + details["t_dp_exposed"] * 1.5)
+    assert elastic_details["sample_counts"] == [4, 4]
+
+
+def test_evaluate_training_handles_indivisible_batch_and_disabled_recompute():
+    from RL_Framework.config import ModelArchConfig, ProfilingConfig
+    from RL_Framework.infra.cost_model.model import CostModel, TrainParallelConfig
+
+    profile = ProfilingConfig(
+        calibration={"training": {"compute_scale": 2.0, "anchor_scale": 3.0, "optimizer_s": 1.5}},
+    )
+    costs_on = CostModel(model_arch=ModelArchConfig(n_layers=1), profiling=profile, recompute_logprobs=True)
+    cfg = TrainParallelConfig(tp=2, dp=4, b_micro=1)
+    _, details_on = costs_on.evaluate_training(cfg, 10, [512] * 10)
+    per_sample_fwd = costs_on.training_model.compute_stage_fwd_time(
+        512, TrainParallelConfig(tp=2, dp=1, b_micro=1)
+    ) * 3.0
+    assert details_on["replica_anchor_times"] == [
+        pytest.approx(3 * per_sample_fwd),
+        pytest.approx(3 * per_sample_fwd),
+        pytest.approx(2 * per_sample_fwd),
+        pytest.approx(2 * per_sample_fwd),
+    ]
+    assert details_on["anchor_s"] == pytest.approx(3 * per_sample_fwd)
+
+    costs_off = CostModel(model_arch=ModelArchConfig(n_layers=1), profiling=profile, recompute_logprobs=False)
+    raw_seconds, _ = costs_off.training_model.compute_iteration_time(cfg, 10, [512] * 10)
+    total_off, details_off = costs_off.evaluate_training(cfg, 10, [512] * 10)
+    assert details_off["anchor_s"] == 0.0
+    assert total_off == pytest.approx(raw_seconds * 2.0 + 1.5)

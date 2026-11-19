@@ -1007,19 +1007,52 @@ class CostModel:
         """Full training sequence, anchor, optimizer and communication path."""
         seconds, details = self.training_model.compute_iteration_time(config, B_global, L)
         calibration = self.calibration.get("training", {})
-        compute = seconds * float(calibration.get("compute_scale", 1.0))
-        anchor = 0.0
-        if self.recompute_logprobs:
+        data_parallel_degree = max(1, config.dp * config.ep)
+        compute_scale = float(calibration.get("compute_scale", 1.0))
+        anchor_scale = float(calibration.get("anchor_scale", 1.0))
+        optimizer = float(calibration.get("optimizer_s", 0.0))
+
+        replica_pipeline_times = list(details.get("replica_pipeline_times") or [])
+        t_dp_exposed = float(details.get("t_dp_exposed", 0.0))
+        if len(replica_pipeline_times) != data_parallel_degree:
+            replica_pipeline_times = [max(0.0, seconds - t_dp_exposed)] * data_parallel_degree
+
+        replica_anchors = [0.0] * data_parallel_degree
+        if self.recompute_logprobs and B_global > 0:
             from dataclasses import replace
+
             lengths = self.training_model._representative_lengths(L, B_global)
             anchor_shape = replace(config, dp=1, b_micro=self.recompute_micro_batch_size)
-            anchor = sum(self.training_model.compute_stage_fwd_time(
-                max(lengths[start:start + anchor_shape.b_micro]), anchor_shape)
-                for start in range(0, B_global, anchor_shape.b_micro))
-            anchor *= float(calibration.get("anchor_scale", 1.0))
-        optimizer = float(calibration.get("optimizer_s", 0.0))
-        return compute + anchor + optimizer, dict(details, compute_s=compute,
-            anchor_s=anchor, optimizer_s=optimizer)
+            base_count, remainder = divmod(B_global, data_parallel_degree)
+            offset = 0
+            for replica in range(data_parallel_degree):
+                count = base_count + (1 if replica < remainder else 0)
+                samples = lengths[offset : offset + count]
+                offset += count
+                if not samples:
+                    continue
+                raw_anchor = sum(
+                    self.training_model.compute_stage_fwd_time(
+                        max(samples[start : start + anchor_shape.b_micro]), anchor_shape
+                    )
+                    for start in range(0, len(samples), anchor_shape.b_micro)
+                )
+                replica_anchors[replica] = raw_anchor * anchor_scale
+
+        replica_computes = [t * compute_scale for t in replica_pipeline_times]
+        critical_idx = max(
+            range(data_parallel_degree),
+            key=lambda r: replica_anchors[r] + replica_computes[r],
+        )
+        anchor = replica_anchors[critical_idx]
+        compute = replica_computes[critical_idx] + t_dp_exposed * compute_scale
+        return compute + anchor + optimizer, dict(
+            details,
+            compute_s=compute,
+            anchor_s=anchor,
+            optimizer_s=optimizer,
+            replica_anchor_times=replica_anchors,
+        )
 
     def evaluate_elastic_training(
         self, core: TrainParallelConfig, B_global: int, group_size: int,
