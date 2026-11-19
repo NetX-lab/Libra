@@ -33,6 +33,10 @@ class FixedCosts:
         self.rollout_model = None
     def decode_seconds(self, tp, bin_name, remaining, context):
         return self.decode_by_tp[tp]
+    def prefill_seconds(self, tp, context):
+        return 0.0
+    def completion_seconds(self, tp, bin_name, remaining, context, other_requests):
+        return self.decode_seconds(tp, bin_name, remaining, context)
     def migration_seconds(self, source, target, context, allow_transfer):
         return "recompute", self.migration
 class Feed:
@@ -60,6 +64,17 @@ class KVRouterTest(unittest.TestCase):
         for length in lengths:
             s.prefix_tree.insert(Trajectory("p", [STATE], [length], length + 1000))
         return s, feed
+    def test_finish_accepts_generated_tokens_separately_from_transcript(self):
+        scheduler, _ = self.make_scheduler()
+        request = scheduler.schedule(100, prompt_id="p").request_id
+        scheduler.on_tool_return(request, {**EVENT, "generated_token_position": 7},
+                                 generated_tokens=35, preview=False)
+        scheduler.finish_request(request, 50, generated_tokens=20)
+        self.assertFalse(scheduler.has_request(request))
+        trajectory = scheduler._recent_trajectories[-1]
+        self.assertEqual(trajectory.remaining_unit, "model_generated_tokens")
+        self.assertEqual(trajectory.total_remaining_lengths, [13])
+
     def start_request(self, s):
         route = s.schedule(100, "p")
         self.assertGreaterEqual(route.instance_index, 0)

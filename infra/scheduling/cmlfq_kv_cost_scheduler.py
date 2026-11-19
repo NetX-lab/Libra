@@ -719,8 +719,9 @@ class CMLFQDynamicKVCostScheduler(CMLFQCostScheduler):
             self._first_generation.discard(request_id)
             self._initial_route_records.pop(request_id, None)
 
-    def finish_request(self, request_id: str, total_output_tokens: int):
+    def finish_request(self, request_id: str, total_output_tokens: int, *,
+                       generated_tokens: int | None = None):
         with self._lock:
-            super().finish_request(request_id, total_output_tokens)
+            super().finish_request(request_id, total_output_tokens, generated_tokens=generated_tokens)
             self._first_generation.discard(request_id)
             self._initial_route_records.pop(request_id, None)
