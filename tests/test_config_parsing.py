@@ -18,3 +18,18 @@ def test_from_dict_parses_numeric_strings_and_ignores_unknown_keys():
     assert config.tp_comm_overhead == 5e-6
     assert isinstance(config.tp_comm_overhead, float)
     assert not hasattr(config, "unknown_key")
+
+
+def test_decoupled_configuration_round_trips_to_megatron_engine(tmp_path, monkeypatch):
+    from RL_Framework.config import AsyncRLConfig
+    from RL_Framework.engine.train_factory import create_train_engine
+
+    monkeypatch.chdir(tmp_path)
+    config = AsyncRLConfig.from_dict(dict(
+        model_path='unused', grpo_objective='decoupled',
+        weight_sync_mode='nccl', rollout_weight_sync_mode='nccl',
+    ))
+
+    loaded = AsyncRLConfig.from_dict(config.to_dict())
+    assert create_train_engine(loaded).grpo_objective == 'decoupled'
+    assert AsyncRLConfig(model_path='unused').grpo_objective == 'legacy'

@@ -117,6 +117,17 @@ class TestDistributionCostRouting(unittest.TestCase):
         self.assertAlmostEqual(measured.prefill_seconds, 0)
         self.assertAlmostEqual(measured.migration_seconds, .1)
 
+    def test_analytic_decode_prices_an_unprofiled_bin(self):
+        model = RolloutCostModel(
+            num_params=1000, d_model=8, n_layers=2, n_kv_heads=2, head_dim=4,
+            dtype_bytes=2, flops_peak=1e9, mem_bw=1e9, mem_capacity=1e9,
+            tp_comm_overhead=0, prefill_mfu=1, act_workspace_bytes=0,
+        )
+        routing = CMLFQRoutingCosts(rollout_model=model)
+        seconds = routing.decode_work_seconds(1, "short", 8, 32, other_requests=1)
+        self.assertTrue(math.isfinite(seconds))
+        self.assertGreater(seconds, 0)
+
     def test_online_tree_excludes_feedback_from_remaining_generated_tokens(self):
         s = scheduler(lengths=())
         engine = HeterogeneousRolloutEngine(scheduler=s)

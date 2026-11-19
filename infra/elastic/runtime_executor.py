@@ -2844,7 +2844,10 @@ class RuntimeElasticExecutor:
             "native_rdma_max_bytes": int(getattr(cfg, "native_rdma_max_bytes", 67108864)),
         }
         if template:
-            return template.format(**values)
+            command = template.format(**values)
+            if getattr(self.config, "grpo_objective", "legacy") == "decoupled":
+                return shlex.join(["env", "LIBRA_CAPTURE_BEHAVIOR=1", "bash", "-c", command])
+            return command
         env_prefix = ""
         if cuda_visible_devices:
             env_prefix = f"CUDA_VISIBLE_DEVICES={values['cuda_visible_devices']} "
@@ -3334,6 +3337,9 @@ class RuntimeElasticExecutor:
         env["LIBRA_EXPECTED_TP_SIZE"] = str(meta.tp)
         env.setdefault("LIBRA_CHECK_PREFIX_CACHE", "1")
         env.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+        env.setdefault("LIBRA_CAPTURE_BEHAVIOR", "0")
+        if getattr(self.config, "grpo_objective", "legacy") == "decoupled":
+            env["LIBRA_CAPTURE_BEHAVIOR"] = "1"
         backend = str(getattr(self.config.heterogeneous_rollout.scheduling, "cmlfq_kv_backend", "recompute"))
         if backend == "cpu_offload":
             directory = str(Path(self.config.rollout_weight_sync_control_dir) / "kv-store")
@@ -3616,7 +3622,10 @@ class RuntimeElasticExecutor:
         if template:
             # Keep explicit site templates, but placement remains the launch
             # helper's responsibility for default local commands.
-            return template.format(**values)
+            command = template.format(**values)
+            if getattr(self.config, "grpo_objective", "legacy") == "decoupled":
+                return shlex.join(["env", "LIBRA_CAPTURE_BEHAVIOR=1", "bash", "-c", command])
+            return command
         if (len(inst.gpus) != int(inst.tp) or len(set(inst.gpus)) != len(inst.gpus)
                 or any(int(gpu) < 0 for gpu in inst.gpus)):
             raise ValueError("Rollout TP workers must own distinct assigned node GPU IDs")
@@ -3639,7 +3648,10 @@ class RuntimeElasticExecutor:
             "--health-url", f"http://127.0.0.1:{port}/health", "--initial-model", self.config.model_path,
             "--ready-timeout", str(planner_cfg.vllm_ready_timeout_s),
             "--reload-method", "inplace", "--reload-strategy", "parallel", "--", *server]
-        return shlex.join(["env", "CUDA_VISIBLE_DEVICES=" + devices, *supervisor])
+        environment = ["env", "CUDA_VISIBLE_DEVICES=" + devices]
+        if getattr(self.config, "grpo_objective", "legacy") == "decoupled":
+            environment.append("LIBRA_CAPTURE_BEHAVIOR=1")
+        return shlex.join([*environment, *supervisor])
 
     def close(self):
         """Fence late callbacks, then stop every resource already committed.

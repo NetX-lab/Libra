@@ -104,10 +104,8 @@ class CMLFQRoutingCosts:
             return float(value) / 1000.0 * count
         if self.rollout_model is None:
             return math.inf
-        elapsed = self.rollout_model.compute_instance_makespan_from_totals(
-            num_requests=count,
-            total_prompt_tokens=count * max(0, context),
-            total_gen_tokens=count * max(0, math.ceil(remaining)),
-            tp=tp,
-        )
+        from RL_Framework.infra.cost_model.model import RequestInfo
+
+        requests = [RequestInfo(max(0, context), max(0, math.ceil(remaining))) for _ in range(count)]
+        elapsed = self.rollout_model.compute_instance_makespan(requests, tp)
         return max(0.0, elapsed - count * self.prefill_seconds(tp, context))

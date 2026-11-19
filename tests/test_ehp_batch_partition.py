@@ -132,6 +132,19 @@ def test_actual_train_collects_fixed_batch_and_dispatches_complete_groups(tmp_pa
 def _gloo_collection_worker(rank, rendezvous, directory):
     dist.init_process_group("gloo", rank=rank, world_size=4,
                             init_method=f"file://{rendezvous}", timeout=timedelta(seconds=30))
+    # Gloo's async all-gather destructor can need the GIL to free tensors.
+    # Keep them alive while the Python thread holds the GIL and joins its workers.
+    from torch.distributed import distributed_c10d
+
+    all_gather = distributed_c10d.all_gather
+    collective_tensors = []
+
+    def gather_with_owned_tensors(outputs, tensor, *args, **kwargs):
+        collective_tensors.extend(outputs)
+        collective_tensors.append(tensor)
+        return all_gather(outputs, tensor, *args, **kwargs)
+
+    distributed_c10d.all_gather = gather_with_owned_tensors
     try:
         path = Path(directory)
         results = []
@@ -154,6 +167,7 @@ def _gloo_collection_worker(rank, rendezvous, directory):
         with pytest.raises(RuntimeError, match="incomplete fixed batch"):
             trainer._collect_fixed_global_batch(None, trainer._source_batch_sample_count(), [])
     finally:
+        distributed_c10d.all_gather = all_gather
         dist.destroy_process_group()
 
 

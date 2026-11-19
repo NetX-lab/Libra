@@ -14,6 +14,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from RL_Framework.workflow.behavior import SamplingEvidenceError
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +71,8 @@ class CMLFQGenerationBackend:
             params.update(do_remote_prefill=True, do_remote_decode=False)
             output = await target.generate(prompt=prompt, kv_transfer_params=params, **kwargs)
             return BackendResult(output, "transfer")
+        except SamplingEvidenceError:
+            raise
         except Exception as error:
             # Non-streaming requests: no partial output has reached the caller.
             # Cancellation (BaseException) is deliberately not retried.
@@ -98,6 +102,8 @@ class CMLFQGenerationBackend:
         try:
             try:
                 output = await target.generate(prompt=prompt, kv_transfer_params=params, **kwargs)
+            except SamplingEvidenceError:
+                raise
             except Exception as error:
                 if "libra_load_key" not in params:
                     raise
