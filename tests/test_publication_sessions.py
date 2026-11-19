@@ -18,6 +18,7 @@ from RL_Framework.trainer.async_rl_trainer import AsyncRLTrainer
 def test_session_reuses_the_existing_homogeneous_endpoint_setup(
         monkeypatch, endpoints, environment, expected):
     config = NS(rollout_backend='vllm', model_path='/model', vllm_endpoints=endpoints,
+        heterogeneous_rollout=NS(enabled=False, instances=[NS(instance_id='inactive', host='inactive', port=9999, tp=1)]),
         vllm_host='127.0.0.1', vllm_port=8000, vllm_num_instances=0,
         rollout_gpus=3, vllm_tp_size=1)
     owner = NS(config=config, is_main_process=False)
@@ -41,7 +42,7 @@ def test_session_reuses_the_existing_homogeneous_endpoint_setup(
 
 def test_native_publication_reuses_membership_and_sends_a_fresh_same_revision_transfer(tmp_path, monkeypatch):
     states = dict(a='service-a', b='service-b')
-    config = NS(heterogeneous_rollout=NS(instances=[
+    config = NS(heterogeneous_rollout=NS(enabled=True, instances=[
         NS(instance_id=name, host=name, port=8000, tp=1) for name in states]),
         rollout_weight_sync_control_dir=str(tmp_path), rollout_nccl_host='core',
         rollout_nccl_port=29620, rollout_nccl_chunk_mb=1, rollout_nccl_rate_limit_gbps=0,
