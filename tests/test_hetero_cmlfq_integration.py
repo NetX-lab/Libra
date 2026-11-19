@@ -502,5 +502,118 @@ class TestHeterogeneousEngineCMLFQ(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(long_engine.calls, 1)
 
 
+
+class TestSingleDynamicIntegration(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def config(kind="cmlfq_cost_kv_dynamic", enabled=False):
+        config = AsyncRLConfig(model_path="not-loaded")
+        config.heterogeneous_rollout.instances = []
+        sched = config.heterogeneous_rollout.scheduling
+        sched.scheduler_type = kind
+        sched.enable_metrics_feedback = enabled
+        sched.cmlfq_buckets = {
+            "short": {"tp_degrees": [1], "max_tokens": 4000},
+            "long": {"tp_degrees": [2], "max_tokens": 12000},
+        }
+        return config
+
+    def test_factory_and_poller_rebinding_preserve_official_lifecycle(self):
+        from unittest.mock import patch
+        from RL_Framework.infra.scheduling.cmlfq_kv_cost_scheduler import CMLFQDynamicKVCostScheduler
+        config = self.config()
+        with patch("RL_Framework.infra.scheduling.metrics_feed.VLLMMetricsPoller") as poller:
+            engine = HeterogeneousRolloutEngine.from_config(config)
+            first_feed = engine._metrics_poller
+            self.assertIsInstance(engine.scheduler, CMLFQDynamicKVCostScheduler)
+            self.assertIs(engine.scheduler._metrics_feed, first_feed)
+            self.assertFalse(engine.scheduler._feedback.enabled)
+            poller.assert_called_once_with(interval_s=1.0, timeout_s=1.0, ttl_s=5.0)
+            first_feed.start.assert_called_once()
+            state = ToolReturnState("search", PayloadSizeClass.SizeSmall, ExecutionStatus.ToolSuccess)
+            engine.scheduler.prefix_tree.insert(Trajectory("carry", [state], [1000]))
+            old_scheduler = engine.scheduler
+            old_scheduler._dynamic_boundary = 6000
+            engine.reconfigure_from_plan(None, config)
+            first_feed.stop.assert_called_once()
+            self.assertIsNot(engine.scheduler, old_scheduler)
+            self.assertIsNotNone(engine.scheduler.prefix_tree.lookup("carry", [state]))
+            self.assertEqual(engine.scheduler._dynamic_boundary, 4000)
+            self.assertIsNone(engine.scheduler._last_boundary_epoch)
+            self.assertIs(engine.scheduler._metrics_feed, engine._metrics_poller)
+            self.assertEqual(poller.call_count, 2)
+            rebuilt = HeterogeneousRolloutEngine.from_config(
+                config, carry_scheduler_state_from=engine.scheduler,
+            )
+            self.assertIsNotNone(rebuilt.scheduler.prefix_tree.lookup("carry", [state]))
+            rebuilt.close_sync()
+            engine.close_sync()
+            self.assertIsNone(rebuilt.scheduler._metrics_feed)
+            self.assertIsNone(engine.scheduler._metrics_feed)
+
+    def test_other_alias_retains_configured_metrics_behavior(self):
+        from unittest.mock import patch
+        config = self.config("cmlfq_cost")
+        with patch("RL_Framework.infra.scheduling.metrics_feed.VLLMMetricsPoller") as poller:
+            engine = HeterogeneousRolloutEngine.from_config(config)
+            poller.assert_not_called()
+            self.assertIsNone(engine._metrics_poller)
+            config.heterogeneous_rollout.scheduling.enable_metrics_feedback = True
+            engine._setup_metrics_polling(config.heterogeneous_rollout)
+            poller.assert_called_once_with(interval_s=3.0, timeout_s=1.0, ttl_s=10.0)
+            engine.close_sync()
+
+    async def test_single_generation_metadata_commit_and_backend_failure_rollback(self):
+        from types import SimpleNamespace
+        from RL_Framework.infra.scheduling.cmlfq_kv_cost_scheduler import CMLFQDynamicKVCostScheduler
+        from RL_Framework.infra.scheduling.cmlfq_tool_state import DefaultToolStateExtractor
+        event = {"tool_type": "search", "output": "ok", "payload_tokens": 2}
+        state = DefaultToolStateExtractor().extract(event)
+        scheduler = CMLFQDynamicKVCostScheduler(
+            buckets=self.config().heterogeneous_rollout.scheduling.cmlfq_buckets,
+        )
+        engine = HeterogeneousRolloutEngine(scheduler=scheduler)
+        engine.add_instance("short", "127.0.0.1", 8000, 1)
+        engine.add_instance("long", "127.0.0.1", 8001, 2)
+        class Costs:
+            def decode_seconds(self, tp, *args):
+                return 10.0 if tp == 1 else 1.0
+            def migration_seconds(self, *args):
+                return "recompute", 0.0
+        class Feed:
+            def snapshots(self):
+                import time
+                return {name: SimpleNamespace(
+                    updated_at=time.time(), gpu_cache_usage=0.2, running=0,
+                    waiting=0, kv_capacity_tokens=100,
+                ) for name in ("short", "long")}
+        class FailedRollout(_FakeRolloutEngine):
+            async def generate(self, **kwargs):
+                raise RuntimeError("backend failed")
+        scheduler.routing_costs = Costs()
+        scheduler.attach_metrics_feed(Feed())
+        scheduler.prefix_tree.insert(Trajectory("p", [state], [5000]))
+        engine.engines = [_FakeRolloutEngine("short"), _FakeRolloutEngine("long")]
+        request_id = engine.begin_cmlfq_request("p", 100)
+        first = await engine.generate("prompt", request_id=request_id, prompt_id="p")
+        self.assertEqual(first["_schedule_info"]["kv_routing"]["policy"], "cmlfq_cost_kv_dynamic")
+        self.assertEqual(first["_schedule_info"]["instance_index"], 0)
+        engine.route_cmlfq_tool_return(request_id, event, generated_tokens=1)
+        engine.engines[1] = FailedRollout("long")
+        with self.assertRaisesRegex(RuntimeError, "backend failed"):
+            await engine.generate("prompt+tool", request_id=request_id, prompt_id="p")
+        self.assertEqual(sum(h.active_requests for h in scheduler._instances), 1)
+        self.assertFalse(scheduler._reservations)
+        self.assertEqual(scheduler.get_request_route(request_id).instance_index, 0)
+        engine.engines[1] = _FakeRolloutEngine("long")
+        second = await engine.generate("prompt+tool", request_id=request_id, prompt_id="p")
+        self.assertEqual(second["_schedule_info"]["instance_index"], 1)
+        self.assertEqual(second["_schedule_info"]["kv_routing"]["chosen_instance_id"], "long")
+        self.assertEqual(sum(h.active_requests for h in scheduler._instances), 1)
+        engine.finish_cmlfq_request(request_id, 100)
+        self.assertEqual(sum(h.active_requests for h in scheduler._instances), 0)
+        self.assertFalse(scheduler._reservations)
+        self.assertFalse(scheduler._pending_cost_routes)
+        await engine._cmlfq_backend.close()
+
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ from RL_Framework.infra.scheduling.base import (
 from RL_Framework.infra.scheduling.factory import SchedulerFactory
 from RL_Framework.infra.scheduling.cmlfq_cost_scheduler import CMLFQCostScheduler, NoAvailableRolloutError
 from RL_Framework.engine.cmlfq_backend import CMLFQGenerationBackend
+from RL_Framework.infra.scheduling.cmlfq_kv_cost_scheduler import CMLFQDynamicKVCostScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -66,14 +67,17 @@ class HeterogeneousRolloutEngine:
         feedback = MetricsFeedbackConfig.from_scheduling(
             getattr(hetero_cfg, "scheduling", None)
         )
-        if not feedback.enabled:
+        single_dynamic = isinstance(self.scheduler, CMLFQDynamicKVCostScheduler)
+        if not feedback.enabled and not single_dynamic:
             self._stop_metrics_poller()
             return
         self._stop_metrics_poller()
         poller = VLLMMetricsPoller(
-            interval_s=feedback.poll_interval_s,
+            interval_s=(self.scheduler.METRICS_POLL_INTERVAL_SECONDS
+                        if single_dynamic else feedback.poll_interval_s),
             timeout_s=feedback.request_timeout_s,
-            ttl_s=feedback.staleness_ttl_s,
+            ttl_s=(self.scheduler.KV_TTL_SECONDS
+                   if single_dynamic else feedback.staleness_ttl_s),
         )
         self._metrics_poller = poller
         self._refresh_metrics_endpoints()
@@ -610,6 +614,8 @@ class HeterogeneousRolloutEngine:
                 "estimated_decode_seconds": decision.decode_seconds,
                 "estimated_migration_seconds": decision.migration_seconds,
             }
+            if isinstance(scheduler, CMLFQDynamicKVCostScheduler):
+                output["_schedule_info"]["kv_routing"] = decision.kv_routing
             return output
         except BaseException:
             # Do not roll back another coroutine's reservation if this one
