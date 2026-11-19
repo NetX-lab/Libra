@@ -107,6 +107,7 @@ class Trajectory:
     return_states: list[ToolReturnState]
     total_remaining_lengths: list[float]
     total_length: float | None = None
+    remaining_unit: str = "model_generated_tokens"
 
     def __post_init__(self):
         assert len(self.return_states) == len(self.total_remaining_lengths), (
@@ -130,6 +131,20 @@ class CausalPrefixTree:
         self._global_root: PrefixTreeNode | None = None
         self._lock = threading.RLock()
         self._total_insertions = 0
+        self.remaining_unit = "model_generated_tokens"
+
+    def _use_remaining_unit(self, unit: str) -> bool:
+        if unit == self.remaining_unit:
+            return True
+        # New generated-token evidence replaces the old transcript window.
+        # A legacy writer cannot contaminate an already rebuilt new window.
+        if self._roots and unit != "model_generated_tokens":
+            return False
+        self._roots.clear()
+        self._global_root = None
+        self._total_insertions = 0
+        self.remaining_unit = unit
+        return True
 
     # ----------------------------------------------------------------
 
@@ -140,6 +155,8 @@ class CausalPrefixTree:
         prompt_id = trajectory.prompt_id
 
         with self._lock:
+            if not self._use_remaining_unit(trajectory.remaining_unit):
+                return
 
             root = self._roots.get(prompt_id)
             if root is None:
@@ -208,6 +225,8 @@ class CausalPrefixTree:
         distribution rather than inventing one from mean/P90.
         """
         with self._lock:
+            if self.remaining_unit != "model_generated_tokens":
+                return []
             node = self.lookup_with_fallback(prompt_id, return_states)
             if node is None or not node.remaining_lengths:
                 return []
@@ -271,6 +290,7 @@ class CausalPrefixTree:
             other._roots = copy.deepcopy(self._roots)
             other._global_root = copy.deepcopy(self._global_root)
             other._total_insertions = self._total_insertions
+            other.remaining_unit = self.remaining_unit
         return other
 
     def merge(self, other: "CausalPrefixTree") -> None:
@@ -278,6 +298,8 @@ class CausalPrefixTree:
         if other is self:
             return
         with other._lock:
+            if not other._roots and other._global_root is None:
+                return
             other_roots = {
                 prompt_id: PrefixTreeNode.from_dict(root.to_dict())
                 for prompt_id, root in other._roots.items()
@@ -288,7 +310,10 @@ class CausalPrefixTree:
                 else None
             )
             other_insertions = other._total_insertions
+            other_unit = other.remaining_unit
         with self._lock:
+            if not self._use_remaining_unit(other_unit):
+                return
             for prompt_id, source in other_roots.items():
                 target = self._roots.get(prompt_id)
                 if target is None:
@@ -310,7 +335,8 @@ class CausalPrefixTree:
         """Save the current state."""
         with self._lock:
             data = {
-                "version": 2,
+                "version": 3,
+                "remaining_unit": self.remaining_unit,
                 "total_insertions": self._total_insertions,
                 "roots": {
                     prompt_id: root.to_dict()
@@ -341,6 +367,7 @@ class CausalPrefixTree:
         with self._lock:
             self._roots.clear()
             self._global_root = None
+            self.remaining_unit = data.get("remaining_unit", "context_tokens")
             self._total_insertions = data.get("total_insertions", 0)
             for prompt_id, root_d in data.get("roots", {}).items():
                 self._roots[prompt_id] = PrefixTreeNode.from_dict(root_d)

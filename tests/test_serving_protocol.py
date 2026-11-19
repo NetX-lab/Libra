@@ -112,6 +112,7 @@ def test_generation_headers_attest_completion_without_changing_request_body():
         headers = dict(sent[0]['headers'])
         assert headers[b'x-libra-request-id'] == b'actual-request'
         assert headers[b'x-libra-service-generation'] == b'0'
+        assert headers[b'x-libra-optimizer-revision'] == b'0'
         assert headers[b'x-libra-service-generation-verified'] == b'1'
         assert headers[b'x-libra-reload-overlap'] == b'0'
         assert state.active_requests == 0
@@ -408,3 +409,37 @@ def test_nccl_session_wire_from_request_file_through_http_rpc_and_worker_spec(
     state = app.state.serving_state.status()
     assert state['server_generation_verified'] and state['optimizer_revision'] == 2
     assert state['server_generation'] == 1 and not state['closed']
+
+
+def test_http_capture_is_opt_in_and_prepares_each_tp_worker_once(monkeypatch):
+    import httpx
+    from RL_Framework.scripts import behavior_sampling
+
+    monkeypatch.setenv('LIBRA_CAPTURE_BEHAVIOR', '1')
+    app = load_serving_app(monkeypatch, tp=2)
+    installs = []
+
+    async def rpc(name, timeout):
+        assert name == 'dependency_enable_behavior_capture' and timeout == 120
+        installs.append('workers')
+        return [dict(tp_rank=rank, installed=True) for rank in range(2)]
+
+    app.state.client.collective_rpc = rpc
+    monkeypatch.setattr(behavior_sampling, 'install_behavior_response',
+                        lambda: installs.append('api'))
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://service') as client:
+            prompt = {'prompt': [1, 2]}
+            ordinary = await client.post('/v1/completions', json=prompt)
+            assert ordinary.status_code == 200
+            assert not installs
+            for _ in range(2):
+                captured = await client.post('/v1/completions', json=prompt,
+                    headers={'X-Libra-Capture-Behavior': '1'})
+                assert captured.status_code == 200
+                assert captured.headers['x-libra-optimizer-revision'] == '0'
+            assert installs == ['workers', 'api']
+            assert app.state.serving_state.active_requests == 0
+
+    asyncio.run(run())

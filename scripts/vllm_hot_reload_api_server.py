@@ -59,6 +59,29 @@ async def publication_status(request: Request):
     return request.app.state.serving_state.status()
 
 
+async def ensure_behavior_capture(request):
+    if os.environ.get('LIBRA_CAPTURE_BEHAVIOR', '0') != '1':
+        raise HTTPException(status_code=409, detail='Actual sampler capture was not enabled')
+    async with request.app.state.behavior_install_lock:
+        existing = getattr(request.app.state, 'behavior_capture_workers', None)
+        if existing is not None:
+            return {'workers': existing, 'installed': True}
+        workers = await api_server.engine_client(request).collective_rpc('dependency_enable_behavior_capture', timeout=120)
+        expected = request.app.state.serving_state.tp_size
+        if (len(workers) != expected or sorted(worker.get('tp_rank', -1) for worker in workers) != list(range(expected))
+                or not all(worker.get('installed') for worker in workers)):
+            raise RuntimeError('All current TP workers must verify the actual serving sampler')
+        from RL_Framework.scripts.behavior_sampling import install_behavior_response
+        install_behavior_response()
+        request.app.state.behavior_capture_workers = workers
+        return {'workers': workers, 'installed': True}
+
+
+@_custom_router.post('/dependency_probe/behavior/install')
+async def install_behavior(request: Request):
+    return await ensure_behavior_capture(request)
+
+
 def _kv_directory(key: str) -> Path:
     if not re.fullmatch(r"[a-f0-9]{32}", key):
         raise HTTPException(status_code=400, detail="invalid KV key")
@@ -180,8 +203,12 @@ def make_serving_state(args):
 def build_app_with_reload_routes(args):
     app = _build_app(args)
     app.state.serving_state = make_serving_state(args)
+    app.state.behavior_install_lock = asyncio.Lock()
     app.include_router(_custom_router)
-    app.add_middleware(GenerationMiddleware, state=app.state.serving_state)
+    async def ensure(scope):
+        if dict(scope.get('headers', ())).get(b'x-libra-capture-behavior') == b'1':
+            await ensure_behavior_capture(Request(scope))
+    app.add_middleware(GenerationMiddleware, state=app.state.serving_state, ensure_behavior=ensure)
     return app
 
 

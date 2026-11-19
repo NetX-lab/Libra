@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import logging
 import math
 from dataclasses import dataclass, field
@@ -23,37 +24,31 @@ class RequestInfo:
     """Request info implementation."""
     prompt_length: int
     gen_length: int
+    training_length: int = 0
 
     @property
     def total_length(self) -> int:
         return self.prompt_length + self.gen_length
 
 
-def representative_global_batch(
-    requests: list[RequestInfo], batch_size: int
-) -> list[RequestInfo]:
-    """Use history as a length distribution, not a growing rollout workload.
+def representative_global_batch(requests: list[RequestInfo], batch_size: int) -> list[RequestInfo]:
+    """Use history as a length distribution, not as a growing rollout workload.
 
-    Deterministic length quantiles retain the observed endpoints, including the
-    longest sequence used for memory checks. Repeated quantiles are deliberate
+    Deterministic length quantiles retain the observed endpoints (including the
+    longest sequence used for memory checks). Repeated quantiles are deliberate
     when the requested global batch is larger than the available history.
     """
     if batch_size < 1:
         raise ValueError("global batch size must be positive")
-    ordered = sorted(
-        requests,
-        key=lambda request: (
-            request.total_length, request.prompt_length, request.gen_length
-        ),
-    )
+    ordered = sorted(requests, key=lambda request: (
+        request.total_length, request.prompt_length, request.gen_length,
+    ))
     if not ordered:
         return []
     if batch_size == 1:
         return [ordered[-1]]
-    result = [
-        ordered[min(len(ordered) - 1, int((index + 0.5) * len(ordered) / batch_size))]
-        for index in range(batch_size)
-    ]
+    result = [ordered[min(len(ordered) - 1, int((index + .5) * len(ordered) / batch_size))]
+              for index in range(batch_size)]
     result[0], result[-1] = ordered[0], ordered[-1]
     return result
 
@@ -133,6 +128,7 @@ class RolloutCostModel:
         act_workspace_bytes: float = 1.0e9,
         max_queue_limit: int = 256,
         effective_num_params: float | None = None,
+        calibration: dict | None = None,
     ):
         self.P = num_params
         self.P_active = effective_num_params or num_params
@@ -151,6 +147,7 @@ class RolloutCostModel:
         self.kv_frag_rate = kv_frag_rate
         self.act_workspace = act_workspace_bytes
         self.max_queue_limit = max_queue_limit
+        self.calibration = dict(calibration or {})
 
     # ========================================================================
 
@@ -208,7 +205,8 @@ class RolloutCostModel:
         t_comp = total_flops / effective_flops
 
         t_comm = 2.0 * self.n_layers * self.tp_comm_overhead if tp > 1 else 0.0
-        return t_comp + t_comm
+        return (t_comp + t_comm) * float(
+            self.calibration.get(str(tp), {}).get("prefill_scale", 1.0))
 
     def compute_decode_step_time(self, total_active_tokens: int, tp: int) -> float:
         """Compute decode step time."""
@@ -225,7 +223,8 @@ class RolloutCostModel:
         t_mem = d_read / effective_bw
 
         t_comm = 2.0 * self.n_layers * self.tp_comm_overhead if tp > 1 else 0.0
-        return t_mem + t_comm
+        return (t_mem + t_comm) * float(
+            self.calibration.get(str(tp), {}).get("decode_scale", 1.0))
 
     # ========================================================================
 
@@ -300,54 +299,46 @@ class RolloutCostModel:
     def compute_instance_makespan(
         self, requests: list[RequestInfo], tp: int,
     ) -> float:
-        """Compute instance makespan."""
+        """Accumulate finite-cohort decode work as requests finish and slots refill."""
         if not requests:
             return 0.0
-
-
         total_prompt_tokens = sum(r.prompt_length for r in requests)
-        total_gen_tokens = sum(r.gen_length for r in requests)
-        return self.compute_instance_makespan_from_totals(
-            num_requests=len(requests),
-            total_prompt_tokens=total_prompt_tokens,
-            total_gen_tokens=total_gen_tokens,
-            tp=tp,
-        )
-
-    def compute_instance_makespan_from_totals(
-        self,
-        *,
-        num_requests: int,
-        total_prompt_tokens: int,
-        total_gen_tokens: int,
-        tp: int,
-    ) -> float:
-        if num_requests <= 0:
-            return 0.0
-        avg_prompt = total_prompt_tokens / num_requests
-        avg_gen = total_gen_tokens / num_requests
-
-
-        b_bar = self.compute_steady_state_batch(tp, avg_prompt, avg_gen)
-
-
-
         t_prefill_step = self.compute_prefill_step_time(
             B_prefill=1, L_chunk=self.L_chunk, tp=tp
         )
         n_prefill_steps = total_prompt_tokens / max(self.L_chunk, 1)
         total_prefill_time = n_prefill_steps * t_prefill_step
-
-
-
-        avg_active_tokens_per_seq = avg_prompt + avg_gen / 2.0
-        total_active_tokens = int(b_bar * avg_active_tokens_per_seq)
-        t_decode_step = self.compute_decode_step_time(total_active_tokens, tp)
-
-
-        n_decode_steps = total_gen_tokens / max(b_bar, 1.0)
-        total_decode_time = n_decode_steps * t_decode_step
-
+        decoding = [request for request in requests if request.gen_length > 0]
+        if not decoding:
+            return total_prefill_time
+        capacity = max(1, min(len(decoding), int(self.compute_steady_state_batch(
+            tp, total_prompt_tokens / len(requests),
+            sum(request.gen_length for request in requests) / len(requests),
+        ))))
+        # Decode-step cost is linear in the active contexts. Integrate it at
+        # each completion interval's midpoint, retaining the last long request.
+        active = []
+        pending = 0
+        elapsed_steps = active_tokens = total_decode_time = 0.0
+        while active or pending < len(decoding):
+            while pending < len(decoding) and len(active) < capacity:
+                request = decoding[pending]
+                pending += 1
+                heapq.heappush(active, (
+                    elapsed_steps + request.gen_length, request.total_length,
+                ))
+                active_tokens += request.prompt_length
+            finish_steps = active[0][0]
+            steps = finish_steps - elapsed_steps
+            midpoint_tokens = active_tokens + len(active) * steps / 2.0
+            total_decode_time += steps * self.compute_decode_step_time(
+                int(max(0.0, midpoint_tokens)), tp,
+            )
+            active_tokens += len(active) * steps
+            elapsed_steps = finish_steps
+            while active and active[0][0] <= elapsed_steps:
+                _, finished_context = heapq.heappop(active)
+                active_tokens -= finished_context
         return total_prefill_time + total_decode_time
 
     # ========================================================================
@@ -906,6 +897,10 @@ class CostModel:
         ma = model_arch or ModelArchConfig()
         prof = profiling or ProfilingConfig()
 
+        self.calibration = dict(getattr(prof, "calibration", {}) or {})
+        self.recompute_logprobs = bool(recompute_logprobs)
+        self.recompute_micro_batch_size = max(1, int(recompute_micro_batch_size))
+
         self.rollout_model = RolloutCostModel(
             num_params=ma.num_params,
             d_model=ma.d_model,
@@ -917,6 +912,7 @@ class CostModel:
             mem_bw=hw.mem_bw,
             mem_capacity=hw.mem_capacity,
             tp_comm_overhead=hw.tp_comm_overhead,
+            calibration=self.calibration.get("rollout", {}),
             prefill_mfu=prof.prefill_mfu,
             decode_bw_util=prof.decode_bw_util,
             prefill_chunk_size=prof.prefill_chunk_size,
@@ -1002,45 +998,104 @@ class CostModel:
             "max_seq": max_seq,
         }
 
-    def evaluate_rollout_segment(
-        self,
-        tp: int,
-        *,
-        num_requests: int,
-        total_prompt_tokens: int,
-        total_gen_tokens: int,
-        max_seq: int,
-    ) -> tuple[float, dict]:
-        """O(1) analytic Cost(tp, a, b) from prefix-sum aggregates."""
-        if num_requests <= 0:
-            return 0.0, {"tp": int(tp), "num_requests": 0}
-        if self.rollout_model.check_oom(max_seq, int(tp)):
-            return float("inf"), {
-                "oom": True,
-                "tp": int(tp),
-                "max_seq": int(max_seq),
-                "token_capacity": self.rollout_model.compute_token_capacity(int(tp)),
-            }
-        seconds = self.rollout_model.compute_instance_makespan_from_totals(
-            num_requests=num_requests,
-            total_prompt_tokens=total_prompt_tokens,
-            total_gen_tokens=total_gen_tokens,
-            tp=int(tp),
-        )
-        return seconds, {
-            "tp": int(tp),
-            "num_requests": int(num_requests),
-            "max_seq": int(max_seq),
-        }
-
     def evaluate_training(
         self,
         config: TrainParallelConfig,
         B_global: int,
         L: int | list[int],
     ) -> tuple[float, dict]:
-        """Evaluate training."""
-        return self.training_model.compute_iteration_time(config, B_global, L)
+        """Full training sequence, anchor, optimizer and communication path."""
+        seconds, details = self.training_model.compute_iteration_time(config, B_global, L)
+        calibration = self.calibration.get("training", {})
+        data_parallel_degree = max(1, config.dp * config.ep)
+        compute_scale = float(calibration.get("compute_scale", 1.0))
+        anchor_scale = float(calibration.get("anchor_scale", 1.0))
+        optimizer = float(calibration.get("optimizer_s", 0.0))
+
+        replica_pipeline_times = list(details.get("replica_pipeline_times") or [])
+        t_dp_exposed = float(details.get("t_dp_exposed", 0.0))
+        if len(replica_pipeline_times) != data_parallel_degree:
+            replica_pipeline_times = [max(0.0, seconds - t_dp_exposed)] * data_parallel_degree
+
+        replica_anchors = [0.0] * data_parallel_degree
+        if self.recompute_logprobs and B_global > 0:
+            from dataclasses import replace
+
+            lengths = self.training_model._representative_lengths(L, B_global)
+            anchor_shape = replace(config, dp=1, b_micro=self.recompute_micro_batch_size)
+            base_count, remainder = divmod(B_global, data_parallel_degree)
+            offset = 0
+            for replica in range(data_parallel_degree):
+                count = base_count + (1 if replica < remainder else 0)
+                samples = lengths[offset : offset + count]
+                offset += count
+                if not samples:
+                    continue
+                raw_anchor = sum(
+                    self.training_model.compute_stage_fwd_time(
+                        max(samples[start : start + anchor_shape.b_micro]), anchor_shape
+                    )
+                    for start in range(0, len(samples), anchor_shape.b_micro)
+                )
+                replica_anchors[replica] = raw_anchor * anchor_scale
+
+        replica_computes = [t * compute_scale for t in replica_pipeline_times]
+        critical_idx = max(
+            range(data_parallel_degree),
+            key=lambda r: replica_anchors[r] + replica_computes[r],
+        )
+        anchor = replica_anchors[critical_idx]
+        compute = replica_computes[critical_idx] + t_dp_exposed * compute_scale
+        return compute + anchor + optimizer, dict(
+            details,
+            compute_s=compute,
+            anchor_s=anchor,
+            optimizer_s=optimizer,
+            replica_anchor_times=replica_anchors,
+        )
+
+    def evaluate_elastic_training(
+        self, core: TrainParallelConfig, B_global: int, group_size: int,
+        hybrids: int, lengths: int | list[int],
+    ) -> tuple[float, dict]:
+        """The actual whole-group Core/Hybrid work and its critical path."""
+        from dataclasses import replace
+        from RL_Framework.infra.elastic.batch_partition import complete_group_sample_counts
+
+        # The trainer assigns whole groups to every existing Core DP rank
+        # and then to the active Hybrid replicas.
+        core_replicas = core.dp * core.ep
+        counts = complete_group_sample_counts(B_global, group_size, core_replicas + hybrids)
+        representative = self.training_model._representative_lengths(lengths, B_global)
+        calibration = self.calibration.get("training", {})
+        shape = replace(core, dp=1)
+        compute_scale = float(calibration.get("compute_scale", 1.0))
+        anchor_scale = float(calibration.get("anchor_scale", 1.0))
+        optimizer = float(calibration.get("optimizer_s", 0.0))
+        gradient = float(calibration.get("hybrid_gradient_s", 0.0)) if hybrids else 0.0
+        participants = []
+        offset = 0
+        for count in counts:
+            samples = representative[offset:offset + count]
+            offset += count
+            if not count:
+                participants.append({"samples": 0, "compute_s": 0.0, "anchor_s": 0.0})
+                continue
+            compute, _ = self.training_model.compute_iteration_time(shape, count, samples)
+            anchor = 0.0
+            if self.recompute_logprobs:
+                anchor_shape = replace(shape, b_micro=self.recompute_micro_batch_size)
+                anchor = sum(self.training_model.compute_stage_fwd_time(
+                    max(samples[start:start + anchor_shape.b_micro]), anchor_shape)
+                    for start in range(0, count, anchor_shape.b_micro))
+            participants.append({"samples": count, "compute_s": compute * compute_scale,
+                                 "anchor_s": anchor * anchor_scale})
+        critical = max(participants, key=lambda part: part["anchor_s"] + part["compute_s"],
+                       default={"anchor_s": 0.0, "compute_s": 0.0})
+        total = critical["anchor_s"] + critical["compute_s"] + gradient + optimizer
+        return total, {"sample_counts": counts, "participants": participants,
+            "anchor_s": critical["anchor_s"], "compute_s": critical["compute_s"],
+            "optimizer_s": optimizer, "hybrid_gradient_s": gradient}
 
     def check_train_oom(
         self,
