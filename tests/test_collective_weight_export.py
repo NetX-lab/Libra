@@ -1,6 +1,5 @@
 """Transport failures must not abandon peers inside the next TP export."""
 
-import io
 import json
 from datetime import timedelta
 from pathlib import Path
@@ -57,7 +56,7 @@ def _worker(rank, rendezvous, directory):
                     rollout_nccl_port=29620, rollout_nccl_chunk_mb=1,
                     rollout_nccl_rate_limit_gbps=0, rollout_weight_sync_timeout_s=2,
                     rollout_weight_sync_poll_interval_s=0.001,
-                    heterogeneous_rollout=SimpleNamespace(instances=[
+                    heterogeneous_rollout=SimpleNamespace(enabled=True, instances=[
                         SimpleNamespace(instance_id="engine", host="127.0.0.1", port=8000, tp=2),
                     ]),
                 )
@@ -85,8 +84,9 @@ def _worker(rank, rendezvous, directory):
                 )
                 caught = ""
                 with patch.object(nccl_weight_sync, "send_weights", send), \
-                     patch.object(publication_session.urllib.request, "urlopen",
-                         lambda *args, **kwargs: io.StringIO('{"server_instance_id":"live-service"}')), \
+                     patch.object(publication_session, "live_publication_state",
+                         lambda endpoint: dict(server_instance_id="live-service",
+                             server_generation=0, server_generation_verified=True, tp_size=2)), \
                      patch.object(torch.cuda, "current_device", lambda: "cpu"), \
                      patch.object(torch.cuda, "current_stream", lambda: SimpleNamespace(synchronize=lambda: None)):
                     try:

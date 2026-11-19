@@ -8,6 +8,7 @@ python -m pytest -v -o faulthandler_timeout=60 --strict-markers --junitxml=repor
   tests/test_finite_rollout_cost.py \
   tests/test_r2e_cluster_placement.py \
   tests/test_async_task_runner.py \
+  tests/test_async_rl_trainer_weight_sync.py \
   tests/test_sync_drain_prefetch.py \
   tests/test_rollout_credit.py \
   tests/test_phase_tracer.py \
