@@ -104,6 +104,7 @@ def generation_headers(state, request_id, generation, status, streaming=False):
                     and 200 <= status < 300 and not streaming)
     values = {
         'x-libra-request-id': request_id,
+        'x-libra-optimizer-revision': str(state.optimizer_revision),
         'x-libra-service-instance': state.server_instance_id,
         'x-libra-service-generation': str(state.server_generation),
         'x-libra-service-generation-start': str(generation),
@@ -116,8 +117,8 @@ def generation_headers(state, request_id, generation, status, streaming=False):
 
 class GenerationMiddleware:
     """Admit request lifetimes through the same boundary used by weight reload."""
-    def __init__(self, app, state):
-        self.app, self.state = app, state
+    def __init__(self, app, state, ensure_behavior=None):
+        self.app, self.state, self.ensure_behavior = app, state, ensure_behavior
 
     async def __call__(self, scope, receive, send):
         if (scope['type'] != 'http' or scope.get('method') != 'POST'
@@ -152,6 +153,8 @@ class GenerationMiddleware:
                 for part in bodies:
                     await send(part)
         try:
+            if self.ensure_behavior is not None:
+                await self.ensure_behavior(scope)
             await self.app(scope, receive, observe)
         finally:
             await self.state.leave()
