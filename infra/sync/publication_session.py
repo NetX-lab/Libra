@@ -10,7 +10,7 @@ import uuid
 def publication_targets(config, *, instance_ids=None):
     """Resolve current physical endpoints using the same order as the NCCL ranks."""
     hetero = getattr(config, 'heterogeneous_rollout', None)
-    instances = getattr(hetero, 'instances', []) if hetero else []
+    instances = hetero.instances if hetero is not None and hetero.enabled else []
     if instances:
         targets = []
         for index, instance in enumerate(instances):
