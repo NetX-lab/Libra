@@ -38,7 +38,8 @@ def test_online_window_and_rebuild_follow_real_engine_rebind(kind, persist, life
     engine = HeterogeneousRolloutEngine.from_config(config)
     # Offline evidence must survive rebind but should be retired at the first
     # periodic rebuild, which intentionally uses only the online window.
-    engine.scheduler.prefix_tree.insert(Trajectory("offline", [STATE], [2000]))
+    unit = "model_generated_tokens" if kind == "cmlfq_cost" else "context_tokens"
+    engine.scheduler.prefix_tree.insert(Trajectory("offline", [STATE], [2000], remaining_unit=unit))
     rebuilt = []
     original = CausalPrefixTree.rebuild
 
@@ -51,8 +52,10 @@ def test_online_window_and_rebuild_follow_real_engine_rebind(kind, persist, life
             engine.scheduler.register_instance(0, "short", 1)
             engine.notify_epoch_start(step)
             request = engine.begin_cmlfq_request(f"p-{step}", 100)
-            engine.route_cmlfq_tool_return(request, EVENT, 100)
-            engine.finish_cmlfq_request(request, 1000 + step)
+            # R2E supplies both lengths to both schedulers. Each retains the
+            # same units as its existing offline tree across online updates.
+            engine.route_cmlfq_tool_return(request, dict(EVENT, generated_token_position=100), 102)
+            engine.finish_cmlfq_request(request, 1102 + step, generated_tokens=1000 + step)
             old = engine.scheduler
             if lifecycle == "from_config":
                 engine = HeterogeneousRolloutEngine.from_config(
@@ -68,6 +71,8 @@ def test_online_window_and_rebuild_follow_real_engine_rebind(kind, persist, life
             assert current.prefix_tree is not old.prefix_tree
             assert current._recent_trajectories is not old._recent_trajectories
             assert current.prefix_tree.lookup(f"p-{step}", [STATE]) is not None
+            expected_length = (900 if kind == "cmlfq_cost" else 1000) + step
+            assert current.prefix_tree.lookup(f"p-{step}", [STATE]).remaining_lengths == [expected_length]
             if step < 4:
                 assert current.prefix_tree.lookup("offline", [STATE]) is not None
             engine.notify_epoch_end(step)
