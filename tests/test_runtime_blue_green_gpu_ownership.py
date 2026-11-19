@@ -15,7 +15,7 @@ def process(name, gpus, port, *, host='node-a', pid=11):
 class Executor(RuntimeElasticExecutor):
     def __init__(self, current, desired, *, fail_stop=None):
         config = NS(global_resource_planner=NS(runtime_drain_before_reconfigure=True),
-            heterogeneous_rollout=NS(vllm_base_port=8000, instances=[
+            heterogeneous_rollout=NS(enabled=True, vllm_base_port=8000, instances=[
                 NS(instance_id=meta.instance_id, port=meta.port) for meta in desired]))
         super().__init__(config=config, planner=None)
         self.desired = desired
