@@ -51,7 +51,7 @@ def test_runtime_subset_targets_are_selected_from_current_configuration(monkeypa
     runtime = object.__new__(RuntimeElasticExecutor)
     instances = [NS(instance_id=name, tp=1, gpus=[index], host='node', port=8000+index)
         for index, name in enumerate(('old-hybrid-engine', 'returned-engine', 'unaffected-engine'))]
-    runtime.config = NS(heterogeneous_rollout=NS(instances=instances))
+    runtime.config = NS(heterogeneous_rollout=NS(enabled=True, instances=instances))
     calls = []
     monkeypatch.setattr(commands, 'dispatch_core_command',
         lambda *args, **kwargs: calls.append((args, kwargs)))

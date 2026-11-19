@@ -75,7 +75,7 @@ def make_trainer(tmp_path, rank=0, dp_size=1, dp_rank=0, source=True, hybrids=()
         batch_size=16, n_samples=4, total_steps=2, micro_batch_size=1,
         ppo_epochs=1, recompute_logprobs=False, sync_interval=0, save_interval=0,
         log_dir=str(tmp_path), enable_rollout_tracing=False,
-        heterogeneous_rollout=SimpleNamespace(instances=[]),
+        heterogeneous_rollout=SimpleNamespace(enabled=True, instances=[]),
         global_resource_planner=SimpleNamespace(hybrid_worker_task_dir=str(tmp_path),
                                                hybrid_lockstep_gradient_sync=True),
     )
