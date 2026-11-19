@@ -1,4 +1,4 @@
-"""Request-completion CPU offload connector for vLLM V1 0.9.2.
+"""Request-completion CPU offload connector for vLLM V1.
 
 The completion is returned before the next worker tick stages its retained KV
 blocks into pinned CPU memory. That tick overlaps external tool execution.
@@ -10,6 +10,7 @@ between workers (use tmpfs on one host, shared storage across hosts).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -22,6 +23,8 @@ from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def cache_directory(root: str, key: str) -> Path:
@@ -43,9 +46,16 @@ class OffloadMetadata(KVConnectorMetadata):
 
 
 class LibraCPUOffloadConnector(KVConnectorBase_V1):
-    def __init__(self, vllm_config, role):
-        super().__init__(vllm_config, role)
+    def __init__(self, vllm_config, role, kv_cache_config=None):
+        if kv_cache_config is None:
+            super().__init__(vllm_config, role)
+        else:
+            super().__init__(vllm_config, role, kv_cache_config)
+        groups = getattr(kv_cache_config, "kv_cache_groups", None)
+        if groups is not None and len(groups) != 1:
+            raise ValueError("CPU offload requires exactly one KV cache group")
         extra = vllm_config.kv_transfer_config
+        self.verify_reload = bool(extra.get_from_extra_config("verify_reload", False))
         self.root = extra.get_from_extra_config("storage_path", "/dev/shm/libra-kv")
         Path(self.root).mkdir(parents=True, exist_ok=True)
         self.block_size = vllm_config.cache_config.block_size
@@ -64,10 +74,100 @@ class LibraCPUOffloadConnector(KVConnectorBase_V1):
         self.stream = None
 
     def register_kv_caches(self, kv_caches):
+        caches = {}
+        local_heads = self.num_heads // self.tp
+        import vllm
+        vllm_version = getattr(vllm, "__version__", "unknown")
+
         for name, tensor in kv_caches.items():
-            if tensor.ndim != 5 or tensor.shape[0] != 2:
-                raise ValueError(f"unsupported KV layout for {name}: {tuple(tensor.shape)}")
-        self.caches = kv_caches
+            shape = tuple(tensor.shape)
+            backend_name = "unresolved"
+
+            def fail(message, cause=None):
+                error = ValueError(
+                    f"cannot resolve KV layout for layer={name}, "
+                    f"backend={backend_name}, shape={shape}, "
+                    f"vLLM={vllm_version}: {message}"
+                )
+                if cause is None:
+                    raise error
+                raise error from cause
+
+            if tensor.ndim != 5:
+                fail("expected a five-dimensional cache")
+            if shape[2] != self.block_size or shape[3] != local_heads:
+                fail(
+                    f"expected block_size={self.block_size} and "
+                    f"local_heads={local_heads}"
+                )
+
+            axis0_is_kv = shape[0] == 2
+            axis1_is_kv = shape[1] == 2
+            if axis0_is_kv and not axis1_is_kv:
+                canonical = tensor
+            elif axis1_is_kv and not axis0_is_kv:
+                canonical = tensor.movedim(1, 0)
+            elif axis0_is_kv and axis1_is_kv:
+                try:
+                    context = self._vllm_config.compilation_config.static_forward_context
+                    layer = context[name]
+                except (AttributeError, KeyError, TypeError) as exc:
+                    fail("ambiguous leading axes require layer metadata", exc)
+
+                backend = getattr(layer, "attn_backend", None)
+                if backend is None:
+                    try:
+                        from vllm.attention.selector import get_attn_backend
+                        backend = get_attn_backend(
+                            layer.head_size, layer.dtype, layer.kv_cache_dtype,
+                            self.block_size, is_attention_free=False,
+                        )
+                    except Exception as exc:
+                        fail("could not resolve the layer attention backend", exc)
+
+                    backend_name = getattr(backend, "__name__", type(backend).__name__)
+                    try:
+                        implementation = backend.get_impl_cls()
+                        compatible_impl = isinstance(layer.impl, implementation)
+                    except Exception as exc:
+                        fail("could not verify the resolved backend implementation", exc)
+                    if not compatible_impl:
+                        fail(
+                            "backend implementation mismatch",
+                            TypeError(
+                                f"backend implementation {implementation!r} does not "
+                                f"match layer implementation {type(layer.impl)!r}"
+                            ),
+                        )
+                else:
+                    backend_name = getattr(backend, "__name__", type(backend).__name__)
+
+                try:
+                    backend_shape = tuple(backend.get_kv_cache_shape(
+                        3, self.block_size, local_heads, tensor.shape[-1],
+                    ))
+                except Exception as exc:
+                    fail("backend KV shape probe failed", exc)
+
+                if backend_shape == (
+                    2, 3, self.block_size, local_heads, tensor.shape[-1],
+                ):
+                    canonical = tensor
+                elif backend_shape == (
+                    3, 2, self.block_size, local_heads, tensor.shape[-1],
+                ):
+                    canonical = tensor.movedim(1, 0)
+                else:
+                    fail(
+                        f"unsupported backend KV shape probe: {backend_shape}",
+                        TypeError(f"unsupported KV cache shape {backend_shape}"),
+                    )
+            else:
+                fail("neither of the first two axes has the KV dimension of 2")
+
+            caches[name] = canonical
+
+        self.caches = caches
         self.stream = torch.cuda.Stream()
 
     def request_finished(self, request, block_ids):
@@ -105,14 +205,23 @@ class LibraCPUOffloadConnector(KVConnectorBase_V1):
             if any(not (directory / f"rank_{rank}.json").exists() for rank in range(source_tp)):
                 return 0, False
             tokens = manifest["tokens"]
-            n = min(len(tokens), len(request.prompt_token_ids) - 1)
-            n = n // self.block_size * self.block_size
-            if tokens[:n] != request.prompt_token_ids[:n] or n <= num_computed_tokens:
+            prompt_tokens = request.prompt_token_ids
+            limit = min(len(tokens), len(prompt_tokens) - 1)
+            limit -= limit % self.block_size
+            if num_computed_tokens % self.block_size:
+                return 0, False
+            n = 0
+            for end in range(self.block_size, limit + 1, self.block_size):
+                if tokens[n:end] != prompt_tokens[n:end]:
+                    break
+                n = end
+            if n <= num_computed_tokens:
                 return 0, False
             if self.num_heads % source_tp:
                 return 0, False
             self.matches[request.request_id] = {
                 "key": key, "source_tp": source_tp, "num_tokens": n,
+                "num_local_tokens": num_computed_tokens,
                 "request_id": request.request_id,
             }
             return n - num_computed_tokens, False
@@ -122,6 +231,8 @@ class LibraCPUOffloadConnector(KVConnectorBase_V1):
     def update_state_after_alloc(self, request, blocks, num_external_tokens):
         if num_external_tokens > 0:
             match = dict(self.matches.pop(request.request_id))
+            if num_external_tokens != match["num_tokens"] - match["num_local_tokens"]:
+                raise RuntimeError("CPU KV allocation does not match the available prefix")
             match["block_ids"] = list(blocks.get_block_ids()[0])
             self.loads.append(match)
             self.imported[request.request_id] = num_external_tokens
@@ -164,7 +275,7 @@ class LibraCPUOffloadConnector(KVConnectorBase_V1):
         for request_id, (event, gathered, host, item, started) in list(self.pending.items()):
             if request_id not in self.completed_ids:
                 continue
-            # vLLM 0.9.2 may stop ticking when only finished requests remain.
+            # The scheduler may stop ticking when only finished requests remain.
             # Complete DMA on this post-completion tick; the client/tool runs
             # independently. Disk publication stays in the background thread.
             event.synchronize()
@@ -216,17 +327,39 @@ class LibraCPUOffloadConnector(KVConnectorBase_V1):
             start = max(first_head, rank * source_heads) - rank * source_heads
             end = min(last_head, (rank + 1) * source_heads) - rank * source_heads
             shards.append((tensors, start, end))
+        local_tokens = item.get("num_local_tokens", 0)
         n = item["num_tokens"]
-        blocks = item["block_ids"][:n // self.block_size]
+        if local_tokens % self.block_size or n % self.block_size:
+            raise RuntimeError("CPU KV reload boundaries must align to whole blocks")
+        first_block, end_block = local_tokens // self.block_size, n // self.block_size
+        blocks = item["block_ids"][first_block:end_block]
+        if len(blocks) != end_block - first_block:
+            raise RuntimeError("CPU KV allocation is missing external prefix blocks")
         indices = torch.tensor(blocks, device="cuda", dtype=torch.long)
+        bytes_copied = 0
+        verified_layers = 0
         for name, destination in self.caches.items():
             # Canonical full head axis is assembled on CPU before slicing the
             # target rank. Source/target TP ranks are never CUDA device ids.
-            pieces = [part[name][:, :len(blocks), :, start:end, :]
+            pieces = [part[name][:, first_block:end_block, :, start:end, :]
                       for part, start, end in shards]
             rank_cache = (pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)).contiguous()
             rank_cache = rank_cache.pin_memory()
-            destination.index_copy_(1, indices, rank_cache.to(destination.device, non_blocking=True))
+            loaded = rank_cache.to(destination.device, non_blocking=True)
+            destination.index_copy_(1, indices, loaded)
+            bytes_copied += rank_cache.numel() * rank_cache.element_size()
+            if self.verify_reload:
+                if not torch.equal(destination.index_select(1, indices), loaded):
+                    raise RuntimeError(f"CPU KV reload verification failed for {name}")
+                verified_layers += 1
+        if self.verify_reload:
+            logger.info("CPU_KV_RELOAD_VERIFIED %s", json.dumps({
+                "event": "CPU_KV_RELOAD_VERIFIED", "verified": True,
+                "key": item["key"], "request_id": item["request_id"],
+                "rank": self.rank, "source_tp": item["source_tp"],
+                "target_tp": self.tp, "num_tokens": n - local_tokens,
+                "bytes": bytes_copied, "layers_verified": verified_layers,
+            }, sort_keys=True))
 
     def wait_for_layer_load(self, layer_name):
         # Reload and model execution share the current CUDA stream.
