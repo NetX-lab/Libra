@@ -56,7 +56,7 @@ def supports_local_lending(executor):
     ranks = getattr(trainer, "_rollout_source_ranks", (0,))
     return (getattr(trainer, "_bounded_rollout_production", True)
             and sources == 1 and tuple(ranks) == (0,)
-            and getattr(scheduling, "scheduler_type", None) == "cmlfq_cost"
+            and getattr(scheduling, "scheduler_type", None) in ("cmlfq_cost", "cmlfq_cost_kv_dynamic")
             and getattr(scheduling, "cmlfq_kv_backend", None) == "recompute"
             and callable(getattr(scheduler, "withdraw_instances", None))
             and callable(getattr(scheduler, "wait_for_generations", None)))

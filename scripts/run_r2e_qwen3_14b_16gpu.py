@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -82,10 +83,16 @@ def train_command(host, config_path, tasks):
 
 
 def launch_host():
-    return os.environ.get("SLURMD_NODENAME") or socket.gethostname()
+    return os.environ.get("LIBRA_QS_NODE") or os.environ.get("SLURMD_NODENAME") or socket.gethostname()
 
 
 def same_host(left, right):
+    for host in (left, right):
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        return left == right
     return left.split(".", 1)[0] == right.split(".", 1)[0]
 
 
@@ -188,22 +195,41 @@ def run_node(config_path, run_dir, host):
     services = [meta for meta in executor._desired_rollout_processes(None) if same_host(meta.host, host)]
     worker_dir = Path(config.global_resource_planner.hybrid_worker_remote_control_dir)
     controller = NodeWorkers(worker_dir, host, {gpu for meta in services for gpu in meta.gpus})
+    rollout_controller = None
+    if root := os.getenv("LIBRA_QS_ROLLOUT_DIR"):
+        from RL_Framework.infra.elastic.qs_rollout_process import Controller
+        rollout_controller = Controller(root, host, controller.gpus)
     try:
         started = []
         for meta in services:
             # The trainer adopts the PID from this node. Make it the supervisor PID.
             meta.command = "exec " + meta.command
             service = executor._start_one_rollout_process(meta)
+            if rollout_controller is not None:
+                rollout_controller.register(executor._processes[meta.instance_id],
+                                            meta.instance_id, meta.port, meta.gpus)
             started.append(vars(service))
-            executor._wait_rollout_process_start_ready(service)
+            if rollout_controller is None:
+                executor._wait_rollout_process_start_ready(service)
+        if rollout_controller is not None:
+            for service in executor._process_meta.values():
+                executor._wait_rollout_process_start_ready(service)
         write_json(run_dir / f"node-{host}.ready.json", started)
         while not (run_dir / "controllers.stop").exists():
+            if rollout_controller is not None:
+                rollout_controller.poll()
             controller.poll()
             time.sleep(0.2)
     finally:
         try:
             controller.close()
         finally:
+            if rollout_controller is not None:
+                try:
+                    rollout_controller.close()
+                finally:
+                    executor._processes.clear()
+                    executor._process_meta.clear()
             executor.close()
 
 

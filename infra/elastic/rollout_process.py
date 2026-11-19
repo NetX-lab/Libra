@@ -20,11 +20,10 @@ def is_local_host(host, env=None):
     host = str(host or '')
     try:
         address = ipaddress.ip_address(host)
-        if address.is_loopback or address.is_unspecified:
-            return True
+        return address.is_loopback or address.is_unspecified or host == env.get('LIBRA_QS_NODE')
     except ValueError:
         pass
-    names = {'', 'localhost', socket.gethostname(), socket.gethostname().split('.', 1)[0],
+    names = {'', 'localhost', env.get('LIBRA_QS_NODE', ''), socket.gethostname(), socket.gethostname().split('.', 1)[0],
              str(env.get('SLURMD_NODENAME', ''))}
     return host in names or host.split('.', 1)[0] in {name.split('.', 1)[0] for name in names if name}
 
@@ -147,6 +146,9 @@ def stop_owned_session(proc, timeout=30.):
 
 
 def launch_rollout_process(meta, env, stdout=None, control_dir=None):
+    if env.get('LIBRA_QS_ROLLOUT_DIR') and not env.get('LIBRA_QS_CONTROLLER'):
+        from .qs_rollout_process import launch
+        return launch(meta, env)
     remote = not is_local_host(meta.host, env)
     token = uuid.uuid4().hex
     owner = dict(token=token, instance_id=meta.instance_id, host=meta.host, gpus=list(meta.gpus), remote=remote,
@@ -189,6 +191,9 @@ def _owned_remote_step(owner, env):
 
 
 def stop_rollout_process(proc, meta=None, timeout=30., control_dir=None):
+    from .qs_rollout_process import QSProcess
+    if isinstance(proc, QSProcess):
+        return proc.stop(timeout)
     owner = getattr(proc, '_libra_rollout_owner', None)
     if not owner or not owner['remote']:
         return stop_owned_session(proc, timeout)
@@ -351,6 +356,9 @@ def stop_adopted_rollout(meta, env=None, timeout=30., control_dir=None):
     matching service on that remote node; a bare PID never authorizes a scan.
     """
     env = dict(os.environ if env is None else env)
+    if env.get('LIBRA_QS_ROLLOUT_DIR'):
+        from .qs_rollout_process import stop_adopted
+        return stop_adopted(env['LIBRA_QS_ROLLOUT_DIR'], meta, timeout)
     job = env.get('SLURM_JOB_ID') or env.get('SLURM_JOBID')
     if not job or int(meta.pid) <= 0:
         raise RuntimeError('Adopted rollout stop requires a known PID and current Slurm allocation')
