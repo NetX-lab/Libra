@@ -179,12 +179,17 @@ def make_serving_state(args):
     return ServingState(args.tensor_parallel_size, args.model)
 
 
-def build_app_with_reload_routes(args, *pos, **kwargs):
+def _build_app_for_libra(args, *pos, **kwargs):
     app = _build_app(args, *pos, **kwargs)
-    app.state.serving_state = make_serving_state(args)
-    app.include_router(_custom_router)
     # SageMaker bootstrap eagerly builds this stack before serving starts.
     app.middleware_stack = None
+    return app
+
+
+def build_app_with_reload_routes(args, *pos, **kwargs):
+    app = _build_app_for_libra(args, *pos, **kwargs)
+    app.state.serving_state = make_serving_state(args)
+    app.include_router(_custom_router)
     app.add_middleware(GenerationMiddleware, state=app.state.serving_state)
     return app
 

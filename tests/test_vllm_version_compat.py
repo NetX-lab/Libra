@@ -210,7 +210,7 @@ def test_server_builds_private_routes_and_reports_publication_status():
     import httpx
 
     app = _serving_app()
-    routes = {route.path for route in app.routes}
+    routes = app.openapi()["paths"].keys()
     assert {
         "/publication/status", "/reload_weights", "/reload_weights_nccl",
         "/libra/kv/{key}",
