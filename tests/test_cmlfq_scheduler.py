@@ -226,6 +226,12 @@ class TestCausalPrefixTree(unittest.TestCase):
         self.assertEqual(root.mean_remaining_length, 2500)
         self.assertEqual(self.tree.get_stats()["total_insertions"], 2)
 
+    def test_empty_rank_snapshot_does_not_retire_legacy_context_observations(self):
+        state = self._make_state("code", "small", "success")
+        self.tree.insert(Trajectory("p1", [state], [3000], remaining_unit="context_tokens"))
+        self.tree.merge(CausalPrefixTree())
+        self.assertEqual(self.tree.lookup("p1", [state]).remaining_lengths, [3000])
+        self.assertEqual(self.tree.remaining_unit, "context_tokens")
 
 # ---------------------------------------------------------------------------
 
@@ -507,6 +513,19 @@ class TestMigrationCostProfiler(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestCMLFQOfflineProfiler(unittest.TestCase):
+    def test_old_raw_transcript_positions_recover_only_generated_remaining_work(self):
+        raw = {"prompt_id": "p", "output_len": 100, "total_output_tokens": 3100,
+               "tool_returns": [
+                   {"tool_type": "validator", "payload_tokens": 1000,
+                    "token_position": 1020, "remaining_length": 2080},
+                   {"tool_type": "validator", "payload_tokens": 2000,
+                    "token_position": 3050, "remaining_length": 50},
+               ]}
+        trajectory = TrajectoryExtractor().extract_from_raw_data([raw])[0]
+        self.assertEqual(trajectory.total_length, 100)
+        self.assertEqual(trajectory.total_remaining_lengths, [80, 50])
+        self.assertEqual(trajectory.remaining_unit, "model_generated_tokens")
+
     def test_profile_from_raw_data(self):
         profiler = CMLFQOfflineProfiler()
         raw_data = [
