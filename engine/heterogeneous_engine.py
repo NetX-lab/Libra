@@ -581,7 +581,7 @@ class HeterogeneousRolloutEngine:
             while True:
                 try:
                     decision = scheduler.reserve_generation(
-                        request_id, input_tokens if input_tokens > 0 else None,
+                        request_id, input_tokens if input_tokens > 0 else None, max_new_tokens,
                     )
                     break
                 except NoAvailableRolloutError:
@@ -609,6 +609,7 @@ class HeterogeneousRolloutEngine:
                 "fallback_reason": outcome.fallback_reason,
                 "estimated_decode_seconds": decision.decode_seconds,
                 "estimated_migration_seconds": decision.migration_seconds,
+                "estimated_prefill_seconds": decision.prefill_seconds,
             }
             return output
         except BaseException:
