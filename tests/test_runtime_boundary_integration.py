@@ -335,3 +335,23 @@ def test_late_hybrid_activation_is_fenced_before_runtime_done(tmp_path, monkeypa
         handle.result(timeout=2)
     assert launches == []
     assert read_record(leader._runtime_boundary_protocol.runtime_done_path())["status"] == "success"
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, TimeoutError])
+def test_final_hybrid_task_failure_still_closes_executor_and_notifies_followers(tmp_path, failure_type):
+    leader, follower = make_cleanup_trainers(tmp_path)
+    failure = failure_type("last Hybrid task failed")
+    executor = CloseRecorder()
+
+    def wait_for_tasks():
+        raise failure
+
+    executor.wait_for_hybrid_training_tasks = wait_for_tasks
+    leader.runtime_elastic_executor = executor
+    with pytest.raises(failure_type) as caught:
+        leader._cleanup(wait_for_hybrid_tasks=True)
+    assert caught.value is failure
+    assert executor.closed
+    assert read_record(leader._runtime_boundary_protocol.runtime_done_path())["status"] == "failed"
+    with pytest.raises(RuntimeError, match="last Hybrid task failed"):
+        follower._cleanup()

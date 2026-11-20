@@ -202,8 +202,17 @@ class R2EGymWorkflow:
             raise SamplingEvidenceError("Initial prompt leaves no safe generation budget")
         probabilities, masks = [0.0] * initial_length, [0] * initial_length
         prompt_id = str(data.get("prompt_id", f"{data.get('repo_name', 'repo')}:{data.get('commit_hash', '')}"))
+        begin_async = getattr(engine, "begin_cmlfq_request_when_available", None)
         begin = getattr(engine, "begin_cmlfq_request", None)
-        request_id = begin(prompt_id, initial_length) if callable(begin) else ""
+        if callable(begin_async):
+            request_id = await begin_async(prompt_id, initial_length)
+        else:
+            request_id = begin(prompt_id, initial_length) if callable(begin) else ""
+        record_tool_return = getattr(engine, "record_cmlfq_tool_return", None)
+        route_tool_return = (
+            record_tool_return if callable(record_tool_return)
+            else getattr(engine, "route_cmlfq_tool_return", None)
+        )
         tool_returns, current_text, final_completion = [], prompt_text, ""
         final_turn = 0
         sample_revision = None
@@ -298,9 +307,8 @@ class R2EGymWorkflow:
                     reward=metrics["reward"],
                 )
                 tool_returns.append(event)
-                route = getattr(engine, "route_cmlfq_tool_return", None)
-                if request_id and callable(route):
-                    route(request_id, event, total_output)
+                if request_id and callable(route_tool_return):
+                    route_tool_return(request_id, event, total_output)
             total_output = len(ids) - initial_length
             for event in tool_returns:
                 event["remaining_length"] = (
@@ -338,7 +346,10 @@ class R2EGymWorkflow:
                 probabilities, dtype=torch.float32).unsqueeze(0)
             finish = getattr(engine, "finish_cmlfq_request", None)
             if request_id and callable(finish):
-                finish(request_id, total_output)
+                if callable(record_tool_return):
+                    finish(request_id, total_output, generated_tokens=output_length)
+                else:
+                    finish(request_id, total_output)
             return trajectory
         except BaseException:
             # Cancellation must retire CMLFQ state too, or idle waits can hang.

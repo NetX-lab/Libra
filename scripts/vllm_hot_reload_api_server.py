@@ -47,6 +47,7 @@ class ReloadWeightsNcclRequest(BaseModel):
     optimizer_revision: int | None = None
     expected_tensor_count: int | None = None
     session_id: str = ''
+    expected_service_instance_id: str | None = None
 
 
 _reload_lock = asyncio.Lock()
@@ -156,6 +157,9 @@ async def reload_weights_nccl(
     async with _reload_lock:
         started = time.perf_counter()
         state = request.app.state.serving_state
+        if (payload.session_id
+                and payload.expected_service_instance_id != state.server_instance_id):
+            raise HTTPException(status_code=409, detail='NCCL session targets a different physical service')
         if ((payload.snapshot_id is None) != (payload.optimizer_revision is None)
                 or payload.optimizer_revision is not None and payload.optimizer_revision < state.optimizer_revision):
             raise HTTPException(status_code=409, detail='Missing or regressing snapshot identity')

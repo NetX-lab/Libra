@@ -14,7 +14,7 @@ from RL_Framework.infra.scheduling.base import (
     SchedulingResult,
 )
 from RL_Framework.infra.scheduling.factory import SchedulerFactory
-from RL_Framework.infra.scheduling.cmlfq_cost_scheduler import CMLFQCostScheduler
+from RL_Framework.infra.scheduling.cmlfq_cost_scheduler import CMLFQCostScheduler, NoAvailableRolloutError
 from RL_Framework.engine.cmlfq_backend import CMLFQGenerationBackend
 
 logger = logging.getLogger(__name__)
@@ -570,19 +570,22 @@ class HeterogeneousRolloutEngine:
         if managed and not scheduler.has_request(request_id):
             raise ValueError(f"Unknown CMLFQ request: {request_id}")
         if not managed:
-            route = scheduler.schedule(
-                input_tokens=max(1, input_tokens or len(prompt) // 3),
-                prompt_id=prompt_id, epoch=epoch,
+            request_id = await self.begin_cmlfq_request_when_available(
+                prompt_id, max(1, input_tokens or len(prompt) // 3), epoch,
             )
-            if route.instance_index < 0:
+            if not request_id:
                 raise RuntimeError("No available CMLFQ instance")
-            request_id = route.request_id
         decision = None
         output_tokens = 0
         try:
-            decision = scheduler.reserve_generation(
-                request_id, input_tokens if input_tokens > 0 else None,
-            )
+            while True:
+                try:
+                    decision = scheduler.reserve_generation(
+                        request_id, input_tokens if input_tokens > 0 else None, max_new_tokens,
+                    )
+                    break
+                except NoAvailableRolloutError:
+                    await asyncio.sleep(.05)
             outcome = await self._cmlfq_backend.generate(
                 source=self.engines[decision.source_instance_index],
                 target=self.engines[decision.target_instance_index],
@@ -606,6 +609,7 @@ class HeterogeneousRolloutEngine:
                 "fallback_reason": outcome.fallback_reason,
                 "estimated_decode_seconds": decision.decode_seconds,
                 "estimated_migration_seconds": decision.migration_seconds,
+                "estimated_prefill_seconds": decision.prefill_seconds,
             }
             return output
         except BaseException:
@@ -750,6 +754,14 @@ class HeterogeneousRolloutEngine:
             )
         return None
 
+    async def begin_cmlfq_request_when_available(self, prompt_id, input_tokens, epoch=-1):
+        """Start a trace after a temporary whole-engine swap has a route."""
+        while True:
+            try:
+                return self.begin_cmlfq_request(prompt_id, input_tokens, epoch)
+            except NoAvailableRolloutError:
+                await asyncio.sleep(.05)
+
     def begin_cmlfq_request(
         self,
         prompt_id: str,
@@ -767,6 +779,13 @@ class HeterogeneousRolloutEngine:
         )
         return result.request_id
 
+    def record_cmlfq_tool_return(self, request_id: str, tool_result: Any, generated_tokens: int) -> None:
+        """Record feedback; cost routing chooses a target when generation is reserved."""
+        if isinstance(self.scheduler, CMLFQCostScheduler):
+            self.scheduler.on_tool_return(request_id, tool_result, generated_tokens, preview=False)
+        else:
+            self.route_cmlfq_tool_return(request_id, tool_result, generated_tokens)
+
     def route_cmlfq_tool_return(
         self,
         request_id: str,
@@ -783,11 +802,14 @@ class HeterogeneousRolloutEngine:
             self.execute_cmlfq_migration(request_id, decision)
         return decision
 
-    def finish_cmlfq_request(self, request_id: str, total_output_tokens: int):
+    def finish_cmlfq_request(self, request_id: str, total_output_tokens: int, *, generated_tokens: int | None = None):
         """Finish cmlfq request."""
         self._cmlfq_backend.release_request(request_id)
         if request_id and hasattr(self.scheduler, "finish_request"):
-            self.scheduler.finish_request(request_id, total_output_tokens)
+            if generated_tokens is None or not isinstance(self.scheduler, CMLFQCostScheduler):
+                self.scheduler.finish_request(request_id, total_output_tokens)
+            else:
+                self.scheduler.finish_request(request_id, total_output_tokens, generated_tokens=generated_tokens)
 
     def cancel_cmlfq_request(self, request_id: str):
         """Cancel cmlfq request."""

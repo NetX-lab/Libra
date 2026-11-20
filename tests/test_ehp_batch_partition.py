@@ -237,3 +237,56 @@ def test_dispatch_rejects_membership_generation_change_before_update(tmp_path):
         trainer.train(None, dataset=[1])
     assert not trainer.train_engine.updated
     assert not (tmp_path / "hybrid0.step_0.pt").exists()
+
+
+def dispatch_trainer(tmp_path):
+    trainer = make_trainer(tmp_path, hybrids=["hybrid0"])
+    (tmp_path / "membership").mkdir()
+    (tmp_path / "membership" / "hybrid0.json").write_text(json.dumps(
+        dict(run_id="fixed-b-test", role="hybrid_training", membership_epoch=7)))
+    trainer._pending_hybrid_training_batches = {"hybrid0": trajectories("batch", 4)}
+    return trainer
+
+
+@pytest.mark.parametrize("suffix", ["", ".done", ".failed", ".error", ".cancelled"])
+def test_dispatch_preserves_existing_task_or_terminal_file(tmp_path, suffix):
+    trainer = dispatch_trainer(tmp_path)
+    existing = tmp_path / ("hybrid0.step_0.pt" + suffix)
+    existing.write_bytes(b"previous task")
+    with pytest.raises(RuntimeError, match="already exists"):
+        trainer._dispatch_hybrid_training_batches(0)
+    assert existing.read_bytes() == b"previous task"
+    assert not (tmp_path / "hybrid0.step_0.pt.tmp").exists()
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_dispatch_registers_before_publish_and_retires_unpublished_failure(tmp_path, monkeypatch, cleanup_fails):
+    trainer = dispatch_trainer(tmp_path)
+    pending = {}
+
+    def record(worker, data, *task_path):
+        pending[worker] = data
+
+    def forget(worker, data):
+        assert pending[worker] is data
+        pending.pop(worker)
+
+    trainer.runtime_elastic_executor = SimpleNamespace(
+        hybrid_task_identity=lambda worker: {"launch_owner": "owner"},
+        record_hybrid_task_assignment=record, forget_hybrid_task_assignment=forget)
+
+    def fail_publish(source, target):
+        assert source.exists() and "hybrid0" in pending
+        assert not target.exists()
+        raise OSError("publish denied")
+
+    monkeypatch.setattr(Path, "replace", fail_publish)
+    if cleanup_fails:
+        def fail_cleanup(path, **kwargs):
+            raise OSError("cleanup denied")
+        monkeypatch.setattr(Path, "unlink", fail_cleanup)
+    with pytest.raises(OSError, match="publish denied"):
+        trainer._dispatch_hybrid_training_batches(0)
+    assert pending == {}
+    assert (tmp_path / "hybrid0.step_0.pt.tmp").exists() is cleanup_fails
+    assert not (tmp_path / "hybrid0.step_0.pt").exists()

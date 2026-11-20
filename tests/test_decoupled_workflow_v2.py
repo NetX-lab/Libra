@@ -94,6 +94,27 @@ def test_exact_multiturn_prefix_and_behavior_need_only_sampler_fields(monkeypatc
     assert "logprobs" not in row and "behavior_turns" not in row
 
 
+def test_exact_sampling_preserves_cost_router_token_accounting(monkeypatch):
+    class CostRoutedEngine(Engine):
+        async def begin_cmlfq_request_when_available(self, prompt_id, length):
+            self.events.append(("async_begin", prompt_id, length))
+            return "trajectory"
+
+        def record_cmlfq_tool_return(self, request_id, event, length):
+            self.events.append(("record", request_id, length, event["generated_token_position"]))
+
+        def finish_cmlfq_request(self, request_id, length, *, generated_tokens=None):
+            self.events.append(("finish", request_id, length, generated_tokens))
+
+    engine = CostRoutedEngine()
+    row = asyncio.run(workflow(monkeypatch).run_episode(engine, {"prompt_id": "p"}, version=2))
+    assert engine.events == [
+        ("async_begin", "p", 2), ("record", "trajectory", 5, 2), ("finish", "trajectory", 6, 3),
+    ]
+    assert engine.calls[1]["prompt_token_ids"] == [10, 11, 301, 302, 20, 21, 22]
+    assert row["behavior_logprobs"][0, [2, 3, 7]].tolist() == pytest.approx([-0.2] * 3)
+
+
 def test_multiturn_uses_oldest_actual_action_revision_not_submission(monkeypatch):
     engine = Engine(revisions=(3, 4))
     row = asyncio.run(workflow(monkeypatch).run_episode(engine, {"prompt_id": "p"}, version=99))

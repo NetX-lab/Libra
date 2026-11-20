@@ -4,7 +4,23 @@ from __future__ import annotations
 
 import numpy as np
 from dataclasses import dataclass
-from typing import List
+from typing import List, Sequence
+
+
+def split_gpu_slots(
+    hosts: Sequence[str], gpus_per_host: int, train_gpus: int,
+) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+    """Assign leading GPU slots to Core and all remaining slots to rollout."""
+    train, rollout = {}, {}
+    remaining = train_gpus
+    for host in hosts:
+        core_slots = min(remaining, gpus_per_host)
+        if core_slots:
+            train[host] = list(range(core_slots))
+            remaining -= core_slots
+        if core_slots < gpus_per_host:
+            rollout[host] = list(range(core_slots, gpus_per_host))
+    return train, rollout
 
 
 @dataclass

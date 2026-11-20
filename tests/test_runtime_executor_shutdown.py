@@ -2,8 +2,7 @@
 
 import json
 import threading
-from concurrent.futures import CancelledError, ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
+from concurrent.futures import CancelledError, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from types import SimpleNamespace
 
 import pytest
@@ -79,9 +78,18 @@ def harness(tmp_path, monkeypatch):
         monkeypatch.setattr(executor, "_wait_hybrid_worker_ready", lambda wid, **kw: dict(receipt))
         monkeypatch.setattr(executor, "_queue_activation", lambda replica, ack: ack)
         from RL_Framework.infra.elastic import rollout_lending
-        monkeypatch.setattr(rollout_lending, "wait_hybrid_stopped", lambda executor, wid, request_id=None: {
-            "worker_id": wid, "request_id": request_id, "exited": True,
-        })
+        def acknowledge_stop(executor, wid, request_id=None):
+            # The controller consumes a launch only after matching its owner.
+            # Runtime must leave it present until that controller operation.
+            launch = tmp_path / f".launch_{wid}.json"
+            stop = json.loads((tmp_path / f".stop_{wid}.json").read_text())
+            if launch.exists():
+                record = json.loads(launch.read_text())
+                assert record.get("launch_owner", "") == stop["launch_owner"]
+                assert record.get("generation", 0) == stop["generation"]
+                launch.unlink()
+            return {"worker_id": wid, "request_id": request_id, "exited": True}
+        monkeypatch.setattr(rollout_lending, "wait_hybrid_stopped", acknowledge_stop)
         h = SimpleNamespace(executor=executor, pool=pool, processes=processes, popen=popen, path=tmp_path)
         instances.append(h)
         return h
