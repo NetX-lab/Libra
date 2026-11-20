@@ -26,11 +26,13 @@ def _ensure_registry():
     from RL_Framework.infra.scheduling.cmlfq_scheduler import CMLFQScheduler
     from RL_Framework.infra.scheduling.cmlfq_cost_scheduler import CMLFQCostScheduler
     from RL_Framework.infra.scheduling.load_balance import LoadBalanceScheduler
+    from RL_Framework.infra.scheduling.cmlfq_kv_cost_scheduler import CMLFQDynamicKVCostScheduler
 
     register_scheduler("length_aware", LengthAwareScheduler)
     register_scheduler("la_mlfq", LAMLFQScheduler)
     register_scheduler("cmlfq", CMLFQScheduler)
     register_scheduler("cmlfq_cost", CMLFQCostScheduler)
+    register_scheduler("cmlfq_cost_kv_dynamic", CMLFQDynamicKVCostScheduler)
     register_scheduler("load_balance", LoadBalanceScheduler)
 
 

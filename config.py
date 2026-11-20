@@ -283,7 +283,7 @@ class HeterogeneousInstanceConfig:
 class SchedulingConfig:
     """Scheduling config implementation."""
 
-    scheduler_type: str = "length_aware"  # length_aware / la_mlfq / cmlfq / cmlfq_cost / load_balance
+    scheduler_type: str = "length_aware"  # length_aware / la_mlfq / cmlfq / cmlfq_cost / cmlfq_cost_kv_dynamic / load_balance
 
 
 
