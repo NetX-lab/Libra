@@ -1047,9 +1047,7 @@ class AsyncRLTrainer:
             print(f"Training complete. Total time: {total_time:.1f}s")
             print("=" * 60)
 
-        if self.is_main_process and self.runtime_elastic_executor is not None:
-            self.runtime_elastic_executor.wait_for_hybrid_training_tasks()
-        self._cleanup()
+        self._cleanup(wait_for_hybrid_tasks=True)
 
     def _periodic_weight_sync(self, step):
         """Global publication boundary; specialized publication may overlap it."""
@@ -1861,8 +1859,15 @@ class AsyncRLTrainer:
             except Exception as e:
                 print(f"WARNING: Failed to delete weights {version_dir_map[v]}: {e}")
 
-    def _cleanup(self):
+    def _cleanup(self, *, wait_for_hybrid_tasks=False):
         """Cleanup."""
+        if self.dispatcher is not None:
+            self.dispatcher.destroy()
+        elif self.async_runner is not None:
+            self.async_runner.destroy()
+        self.dispatcher = self.async_runner = None
+        if self.runtime_elastic_executor is not None:
+            self.runtime_elastic_executor.dispatcher = None
         self._runtime_follow_stop.set()
         if self._runtime_follow_thread is not None:
             self._runtime_follow_thread.join(timeout=2.0)
@@ -1875,6 +1880,12 @@ class AsyncRLTrainer:
 
         protocol = self._runtime_boundary_protocol
         if self.is_main_process:
+            failure = None
+            if wait_for_hybrid_tasks and self.runtime_elastic_executor is not None:
+                try:
+                    self.runtime_elastic_executor.wait_for_hybrid_training_tasks()
+                except Exception as exc:
+                    failure = exc
             try:
                 if self.runtime_elastic_executor is not None:
                     self.runtime_elastic_executor.close()
@@ -1883,13 +1894,20 @@ class AsyncRLTrainer:
                     self._elastic_gradient_server.close()
                 self._elastic_gradient_server = None
             except Exception as exc:
+                if failure is None:
+                    failure = exc
+                else:
+                    print(f"Runtime executor cleanup after Hybrid task failure: {exc}", flush=True)
+            try:
                 if protocol is not None and not self._runtime_done_published:
-                    protocol.publish_runtime_done(status="failed", error=str(exc))
+                    if failure is None:
+                        protocol.publish_runtime_done(status="success")
+                    else:
+                        protocol.publish_runtime_done(status="failed", error=str(failure))
                     self._runtime_done_published = True
-                raise
-            if protocol is not None and not self._runtime_done_published:
-                protocol.publish_runtime_done(status="success")
-                self._runtime_done_published = True
+            finally:
+                if failure is not None:
+                    raise failure
         else:
             if protocol is not None:
                 planner_cfg = getattr(self.config, "global_resource_planner", None)
@@ -1916,11 +1934,6 @@ class AsyncRLTrainer:
 
         if self.history_collector is not None:
             self.history_collector.finalize()
-
-        if self.dispatcher is not None:
-            self.dispatcher.destroy()
-        elif self.async_runner is not None:
-            self.async_runner.destroy()
 
         # Tear down the independent rollout-weight TCPStore/NCCL objects while
         # torch and CUDA are still fully initialized.  Leaving this cache to
@@ -2113,7 +2126,8 @@ class AsyncRLTrainer:
         if callable(setter):
             setter(float(getattr(planner_cfg, "hybrid_active_gradient_timeout_s", 300.0)))
         task_dir = Path(getattr(planner_cfg, "hybrid_worker_task_dir", "./logs/elastic_training_tasks"))
-        endpoint_dir = task_dir / "core_endpoints"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        endpoint_dir = Path(getattr(planner_cfg, "hybrid_worker_endpoint_dir", "") or task_dir) / "core_endpoints"
         endpoint_dir.mkdir(parents=True, exist_ok=True)
         server = ElasticGradientServer(
             host=str(getattr(planner_cfg, "gradient_server_host", "0.0.0.0")),
@@ -2934,7 +2948,8 @@ class AsyncRLTrainer:
                 if role in {"hybrid_rollout", "core_rollout"}:
                     domain.detach(worker_id, membership_epoch=epoch)
                 else:
-                    if epoch > self._elastic_membership_epochs.get(worker_id, -1):
+                    if (epoch > self._elastic_membership_epochs.get(worker_id, -1)
+                            or domain.membership_epoch(worker_id) != epoch):
                         domain.request_join(worker_id, target, membership_epoch=epoch)
                     if role == "hybrid_training" and domain.is_joining(worker_id):
                         domain.mark_active(worker_id, membership_epoch=epoch)
@@ -2963,9 +2978,12 @@ class AsyncRLTrainer:
             if worker_id in frozen_epochs and int(state.get("membership_epoch", 0)) != int(frozen_epochs[worker_id]):
                 raise RuntimeError(f"active hybrid generation changed before dispatch: {worker_id}")
             task_path = task_dir / f"{worker_id}.step_{step}.pt"
+            for suffix in ("", ".done", ".failed", ".error", ".cancelled"):
+                existing = Path(str(task_path) + suffix)
+                if existing.exists():
+                    raise RuntimeError(f"hybrid task or terminal already exists: {existing}")
             tmp_path = task_path.with_suffix(task_path.suffix + ".tmp")
-            torch.save(
-                {
+            task_data = {
                     "trajectories": trajectories,
                     "grpo_objective": getattr(self.config, "grpo_objective", "legacy"),
                     "step": int(step),
@@ -2974,10 +2992,26 @@ class AsyncRLTrainer:
                     "sample_count": len(trajectories),
                     "global_sample_count": int(self.config.batch_size),
                     "snapshot_path": "" if lockstep else str(self.train_engine.get_elastic_state_snapshot_path(state_version)),
-                },
-                tmp_path,
-            )
-            tmp_path.replace(task_path)
+                }
+            executor = self.runtime_elastic_executor
+            if executor is not None:
+                task_data.update(executor.hybrid_task_identity(worker_id))
+                task_data["membership_run_id"] = self._elastic_membership_run_id
+            registered = False
+            try:
+                torch.save(task_data, tmp_path)
+                if executor is not None:
+                    executor.record_hybrid_task_assignment(worker_id, task_data, task_path)
+                    registered = True
+                tmp_path.replace(task_path)
+            except BaseException:
+                if registered:
+                    executor.forget_hybrid_task_assignment(worker_id, task_data)
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass  # Keep the original save/publication failure.
+                raise
         self._pending_hybrid_training_batches.clear()
 
     def _runtime_length_profile_path(self) -> str:
