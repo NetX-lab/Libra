@@ -293,5 +293,8 @@ def test_new_physical_session_rebuilds_then_releases_old_group(session_transport
     assert first.comm is None and first.group is None
     assert set(nccl_weight_sync._COMMUNICATOR_CACHE.values()) == {second, other}
     assert ('abort', 'other') not in fixture.events
+    nccl_weight_sync.clear_communicator_cache(keys=[('127.0.0.1', 29620, 3, 0, 'cpu')])
+    assert second.comm is None
+    assert other.comm is not None
     nccl_weight_sync.clear_communicator_cache()
     assert second.comm is other.comm is None

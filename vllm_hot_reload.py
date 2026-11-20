@@ -121,3 +121,10 @@ class InplaceReloadWorkerExtension:
     def _attest_reload(self, result):
         self._libra_service_generation = getattr(self, '_libra_service_generation', 0) + 1
         return dict(result, service_generation=self._libra_service_generation)
+
+    def dependency_enable_behavior_capture(self):
+        from vllm.distributed import get_tensor_model_parallel_rank
+        from RL_Framework.scripts.behavior_sampling import install_behavior_sampler, install_behavior_batch_metadata
+        install_behavior_sampler()
+        install_behavior_batch_metadata()
+        return dict(tp_rank=get_tensor_model_parallel_rank(), installed=True)

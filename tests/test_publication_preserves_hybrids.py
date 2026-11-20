@@ -19,7 +19,7 @@ def publication(tmp_path, monkeypatch):
     members = ('hybrid-b',)
     client = NS(scheduler=NS(_instances=[NS(instance_id=inst.instance_id, is_ready=True)
         for inst in instances]))
-    config = NS(weight_sync_mode='nccl', heterogeneous_rollout=NS(instances=instances),
+    config = NS(weight_sync_mode='nccl', heterogeneous_rollout=NS(enabled=True, instances=instances),
         rollout_weight_sync_control_dir=str(tmp_path), rollout_nccl_host='core',
         rollout_nccl_port=29620, rollout_nccl_chunk_mb=1, rollout_nccl_rate_limit_gbps=0,
         rollout_weight_sync_timeout_s=2, rollout_weight_sync_poll_interval_s=.001,
@@ -27,6 +27,7 @@ def publication(tmp_path, monkeypatch):
     dispatcher = NS(paused=False)
     dispatcher.pause = lambda: setattr(dispatcher, 'paused', True)
     dispatcher.resume = lambda: setattr(dispatcher, 'paused', False)
+    dispatcher.is_paused = lambda: dispatcher.paused
     dispatcher.cancel_queued = lambda: dict(dispatcher_queue=0, runner_queue=0)
     dispatcher.get_runtime_metrics = lambda: dict(staleness_running=0)
     dispatcher.wait_until_idle = lambda **kwargs: None
@@ -59,13 +60,15 @@ def publication(tmp_path, monkeypatch):
         setattr(trainer, name, getattr(AsyncRLTrainer, name).__get__(trainer))
     h = NS(trainer=trainer, instances=instances, endpoints=endpoints, client=client,
         calls=calls, requests=requests, status_urls=status_urls, exported=exported,
-        expected=['a', 'c'], directory=tmp_path, members=members)
+        expected=['a', 'c'], directory=tmp_path, members=members, stale_receiver=None)
 
     def status(url, timeout):
         status_urls.append(url)
         identity = next(identity for identity, endpoint in endpoints.items()
             if url == endpoint + '/publication/status')
-        return io.StringIO(json.dumps(dict(server_instance_id='service-' + identity)))
+        return io.StringIO(json.dumps(dict(server_instance_id='service-' + identity,
+            server_generation=0, server_generation_verified=True,
+            tp_size=next(inst.tp for inst in instances if inst.instance_id == identity))))
 
     def send(weights, spec, **kwargs):
         tensors = list(weights)
@@ -88,9 +91,11 @@ def publication(tmp_path, monkeypatch):
             workers = [dict(rank=rank, nccl_rank=expected_offsets[identity] + rank + 1,
                 received_tensors=len(tensors), receive_complete=True, loaded_parameters=1,
                 service_generation=1) for rank in range(inst.tp)]
-            record = dict(version=request['version'], snapshot_id=request['snapshot_id'],
+            record = dict(instance_id=identity, version=request['version'], snapshot_id=request['snapshot_id'],
                 optimizer_revision=request['optimizer_revision'], server_response=dict(
-                    service_instance_id='service-' + identity, service_generation=1,
+                    snapshot_id=request['snapshot_id'], optimizer_revision=request['optimizer_revision'],
+                    service_instance_id='retired-service' if identity == h.stale_receiver else 'service-' + identity,
+                    service_generation=1,
                     prefix_cache_cleared=True, workers=workers))
             (tmp_path / f'ack_{identity}_{request["version"]}.json').write_text(json.dumps(record))
 
@@ -104,7 +109,10 @@ def test_periodic_publication_keeps_hybrid_members_and_existing_rollout_client(p
     h = publication
     # Exercise the real periodic + ordinary publication lifecycle separately
     # from the sender's receiver selection, covered below.
-    h.trainer._sync_weights_nccl = lambda version: h.calls.append(('publish', version))
+    def publish(version):
+        h.calls.append(('publish', version))
+        return {'version': version}
+    h.trainer._sync_weights_nccl = publish
     AsyncRLTrainer._periodic_weight_sync(h.trainer, 7)
     assert ('publish', 8) in h.calls
     assert ('restore',) not in h.calls
@@ -121,15 +129,20 @@ def test_native_publication_targets_only_live_or_explicitly_returned_receivers(
         publication, borrowed, restored):
     h = publication
     h.trainer._rollout_unavailable_ids = {borrowed}
+    h.trainer.runtime_elastic_executor._lent_rollout = {
+        'engines': [inst for inst in h.instances if inst.instance_id == borrowed]
+    }
     if restored:
+        h.trainer.runtime_elastic_executor._lent_rollout = None
         h.trainer._restored_rollouts_pending_publication = {borrowed}
     h.expected = [inst.instance_id for inst in h.instances
         if inst.instance_id != borrowed or restored]
     h.trainer._sync_weights(8)
     assert len(h.requests) == 1
     assert h.status_urls == [h.endpoints[identity] + '/publication/status' for identity in h.expected]
-    assert [(row[0], row[1], row[2]) for row in h.trainer._nccl_session_members] == [
-        (inst.instance_id, h.endpoints[inst.instance_id], inst.tp)
+    membership, _ = h.trainer._nccl_publication_session
+    assert [(row[0], row[1], row[2]) for row in membership] == [
+        (inst.instance_id, h.endpoints[inst.instance_id].removeprefix('http://'), inst.tp)
         for inst in h.instances if inst.instance_id in h.expected]
     assert ('restore',) not in h.calls
     assert h.trainer.rollout_engine is h.client
@@ -144,16 +157,19 @@ def test_publication_session_resolves_filtered_receivers_by_instance_identity(pu
         if inst.instance_id != borrowed:
             offsets[inst.instance_id] = offset
             offset += inst.tp
-    publication_session.prepare_nccl_session(h.trainer, offsets)
+    targets = publication_session.publication_targets(h.trainer.config, instance_ids=offsets)
+    publication_session.prepare_nccl_session(h.trainer, targets, offsets)
     assert h.status_urls == [h.endpoints[identity] + '/publication/status' for identity in offsets]
-    assert [(row[0], row[1], row[2], row[3]) for row in h.trainer._nccl_session_members] == [
-        (inst.instance_id, h.endpoints[inst.instance_id], inst.tp, offsets[inst.instance_id])
+    membership, _ = h.trainer._nccl_publication_session
+    assert [(row[0], row[1], row[2], row[3]) for row in membership] == [
+        (inst.instance_id, h.endpoints[inst.instance_id].removeprefix('http://'), inst.tp, offsets[inst.instance_id])
         for inst in h.instances if inst.instance_id in offsets]
 
 
 def test_publication_with_every_receiver_lent_keeps_admission_paused_without_sender_only_group(publication):
     h = publication
     h.trainer._rollout_unavailable_ids = set(h.endpoints)
+    h.trainer.runtime_elastic_executor._lent_rollout = {'engines': h.instances}
     h.expected = []
     AsyncRLTrainer._periodic_weight_sync(h.trainer, 7)
     assert not h.requests and not h.status_urls and not h.exported
@@ -164,11 +180,21 @@ def test_publication_with_every_receiver_lent_keeps_admission_paused_without_sen
     assert ('restore',) not in h.calls
 
 
+def test_publication_rejects_acknowledgement_from_replaced_receiver(publication):
+    h = publication
+    h.stale_receiver = 'a'
+    with pytest.raises(RuntimeError, match='Invalid physical-engine ACK identity'):
+        h.trainer._sync_weights(8)
+    assert not hasattr(h.trainer, 'last_publication')
+    assert h.trainer._rollout_unavailable_ids == {'b'}
+
+
 def test_extension_rollback_publishes_only_explicit_receivers():
     trainer = AsyncRLTrainer.__new__(AsyncRLTrainer)
-    trainer.config = NS(heterogeneous_rollout=NS(instances=[
-        NS(instance_id='old-loan', tp=1), NS(instance_id='returned', tp=2),
-        NS(instance_id='still-serving', tp=1)]))
+    trainer.config = NS(heterogeneous_rollout=NS(enabled=True, instances=[
+        NS(instance_id='old-loan', host='a', port=8000, tp=1),
+        NS(instance_id='returned', host='b', port=8000, tp=2),
+        NS(instance_id='still-serving', host='c', port=8000, tp=1)]))
     trainer.rollout_engine = None
     trainer._use_heterogeneous = True
     trainer._rollout_unavailable_ids = {'old-loan', 'returned'}

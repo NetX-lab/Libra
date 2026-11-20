@@ -40,20 +40,23 @@ checkpoints without raw observations cannot supply a distribution: requests
 stay in place until traces have populated it. Bootstrap a new tree from the
 offline profiler for useful routing from the first training step.
 
-For every ready instance with capacity, evaluate:
+For every ready instance that fits the next call's context and generation
+budget, estimate the expected decode time with the current load. The score
+adds one prefill estimate when staying, or the full recompute or transfer
+estimate when moving. Exact ties prefer staying, then lower load and instance
+index. Load comes from local generation reservations and fresh vLLM running
+and waiting counts when available. Trajectories waiting on tools hold their
+routes but do not add to this generation load.
 
-`sum(bin_probability * decode_seconds(TP, bin)) + movement_seconds(source, target)`
-
-Staying on the current instance has zero movement cost. Exact ties prefer staying,
-then lower load and instance index. Unavailable/full destinations are excluded,
-and candidates are re-evaluated just before execution. New-mode initial placement
-also respects queue limits and `enable_fallback`. This is not a distributed atomic
-reservation across ranks: the existing shared-load snapshots remain advisory.
+If the current instance is unavailable or cannot fit the next call and no
+eligible instance has a finite score, recompute on the least-loaded eligible
+instance. When all services are temporarily withdrawn, generation waits for
+readiness. Initial placement still respects its own queue and fallback policy.
 
 With no measured decode table, `HeterogeneousRolloutEngine.from_config` binds the
 configured planner's **analytic** rollout model (hardware, model architecture and
-profiling parameters). It integrates decode step time over the representative
-residual length and estimates chunked prefill for recomputation. It does not
+profiling parameters). It estimates decode for a representative batch
+and estimates chunked prefill for recomputation. It does not
 automatically reuse an external Vidur/Sailor backend or calibrate a new model.
 Applications may inject `CMLFQRoutingCosts` or its rollout model explicitly.
 
@@ -106,7 +109,9 @@ non-streaming completion. On failure or cancellation, release the target
 reservation and retain the source route. Finishing/cancelling a request also
 cleans pending intent and reservations. Concurrent generation for one request
 is rejected. Metadata in `_schedule_info` includes planned and actual execution
-paths, estimated costs and any transfer fallback reason.
+paths, estimated costs and any transfer fallback reason. The migration field
+contains the full recompute or transfer quote for a move; the separate prefill
+field is the estimate charged when staying.
 
 `recompute` works with the existing ordinary vLLM completions endpoint. It sends
 the full updated workflow transcript to the target, which performs prefill before

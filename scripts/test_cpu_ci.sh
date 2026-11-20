@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
+python -m pytest -v -o faulthandler_timeout=60 --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_config_parsing.py \
   tests/test_qwen3_config.py \
   tests/test_planner_global_batch_workload.py \
+  tests/test_finite_rollout_cost.py \
+  tests/test_r2e_cluster_placement.py \
   tests/test_async_task_runner.py \
+  tests/test_async_rl_trainer_weight_sync.py \
   tests/test_sync_drain_prefetch.py \
   tests/test_rollout_credit.py \
   tests/test_phase_tracer.py \
@@ -16,6 +19,8 @@ python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_nccl_weight_sync.py \
   tests/test_publication_sessions.py \
   tests/test_serving_protocol.py \
+  tests/test_serving_behavior_sampling.py \
+  tests/test_behavior_capture_v2.py \
   tests/test_collective_weight_export.py \
   tests/test_cmlfq_scheduler.py \
   tests/test_cmlfq_cost_scheduler.py \
@@ -23,9 +28,12 @@ python -m pytest -q --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_cmlfq_rebind_state.py \
   tests/test_hetero_cmlfq_integration.py \
   tests/test_rollout_engine.py \
+  tests/test_r2e_rollout_sampling.py \
   tests/test_cpu_offload_backend.py \
   tests/test_r2e_patch_harness.py \
   tests/test_r2e_gym_workflow.py \
+  tests/test_decoupled_workflow_v2.py \
+  tests/test_decoupled_grpo_v2.py \
   tests/test_optimizer_state.py \
   tests/test_elastic_optimizer_state.py \
   tests/test_ehp_dp_resharding.py \

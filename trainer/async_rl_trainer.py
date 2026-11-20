@@ -25,7 +25,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-from RL_Framework.config import AsyncRLConfig, HeterogeneousInstanceConfig
+from RL_Framework.config import AsyncRLConfig, HeterogeneousInstanceConfig, validate_grpo_objective
 from RL_Framework.infra.elastic.batch_partition import (
     complete_group_sample_counts, partition_complete_grpo_groups,
 )
@@ -44,6 +44,7 @@ from RL_Framework.infra.observability.history_collector import HistoryDataCollec
 from RL_Framework.infra.observability.phase_tracer import PhaseTracer
 from RL_Framework.infra.sync.staleness import StalenessManager
 from RL_Framework.infra.sync.weight_sync import WeightSyncFactory
+from RL_Framework.workflow.behavior import SamplingEvidenceError
 
 
 @dataclass
@@ -184,6 +185,12 @@ class AsyncRLTrainer:
             }
             for _ in range(probe_count)
         ]
+        if getattr(self.config, "grpo_objective", "legacy") == "decoupled":
+            # Synthetic rows belong only to the memory preflight. Real training
+            # trajectories must carry their original sampler evidence.
+            for trajectory in trajectories:
+                trajectory["loss_mask"][:, 0] = 0
+                trajectory["behavior_logprobs"] = torch.zeros_like(trajectory["logprobs"])
 
         if self.is_main_process:
             print(
@@ -223,8 +230,19 @@ class AsyncRLTrainer:
         if self.is_main_process:
             print("[GRP memory preflight] passed", flush=True)
 
+    def _configure_training_objective(self, workflow):
+        validate_grpo_objective(self.config)
+        if getattr(self.config, "grpo_objective", "legacy") != "decoupled":
+            return
+        from RL_Framework.workflow.r2e_gym import R2EGymWorkflow
+
+        if not isinstance(workflow, R2EGymWorkflow):
+            raise ValueError("decoupled GRPO currently requires R2EGymWorkflow")
+        workflow.configure_objective("decoupled", seed=self.config.seed)
+
     def setup(self, workflow):
         """Setup."""
+        self._configure_training_objective(workflow)
         self.workflow = workflow
 
         planner_cfg = getattr(self.config, "global_resource_planner", None)
@@ -412,6 +430,7 @@ class AsyncRLTrainer:
         staleness_manager = self.staleness_manager
         train_engine = self.train_engine
         max_staleness = self.config.max_head_offpolicyness
+        exact_sampling = getattr(self.config, "grpo_objective", "legacy") == "decoupled"
 
         async def _execute():
             try:
@@ -436,9 +455,15 @@ class AsyncRLTrainer:
                 trajectory["grpo_rollout_index"] = task_input.rollout_index
 
 
-                current_version = train_engine.get_version()
-                traj_version = trajectory.get("versions", torch.tensor([task_input.version]))
-                version_val = traj_version.min().item()
+                if exact_sampling:
+                    current_version = train_engine.optimizer_revision
+                    version_val = trajectory.get("sample_revision")
+                    if type(version_val) is not int or not 0 <= version_val <= current_version:
+                        raise SamplingEvidenceError("Invalid actual sampling revision")
+                else:
+                    current_version = train_engine.get_version()
+                    traj_version = trajectory.get("versions", torch.tensor([task_input.version]))
+                    version_val = traj_version.min().item()
                 staleness = current_version - version_val
 
                 if staleness <= max_staleness:
@@ -470,6 +495,10 @@ class AsyncRLTrainer:
                 }
             except Exception as e:
                 staleness_manager.on_rollout_rejected()
+                if exact_sampling or isinstance(e, SamplingEvidenceError):
+                    if self.dispatcher is not None:
+                        self.dispatcher.report_fatal_error(e)
+                    raise
                 if self.is_main_process:
                     print(f"ERROR: Rollout task_id={task_input.task_id} failed: {e}")
                 return None
@@ -861,6 +890,10 @@ class AsyncRLTrainer:
             )
             self._trace_train_phase(step, "collect_batch_done", batch_size=len(batch))
 
+            if getattr(self.config, "grpo_objective", "legacy") == "decoupled":
+                # Padding, advantages and anchors belong to this training view.
+                batch = [dict(row) for row in batch]
+
             align_trajectories = getattr(
                 self.train_engine,
                 "align_distributed_trajectories",
@@ -1234,22 +1267,32 @@ class AsyncRLTrainer:
         from RL_Framework.infra.elastic.rollout_lifecycle import reopen_after_publication
         reopen_after_publication(self)
 
-    def _sync_weights(self, target_version: int):
+    def _sync_weights(self, target_version: int, *, reopen_restored: bool = True, instance_ids=None):
         """Sync weights."""
+        if instance_ids is None:
+            selected = getattr(self, "_publication_target_ids", None)
+            if selected is not None:
+                instance_ids = sorted(selected)
         if self.config.weight_sync_mode == "nccl":
-            self._sync_weights_nccl(target_version)
-            self._reopen_restored_rollouts()
-            return
+            receipt = (self._sync_weights_nccl(target_version) if instance_ids is None else
+                       self._sync_weights_nccl(target_version, instance_ids=instance_ids))
+            if reopen_restored and instance_ids is None and receipt is not None:
+                self._reopen_restored_rollouts()
+            return receipt
         if self.config.weight_sync_mode == "disk":
             if self.is_main_process:
                 print(f"Synchronizing weights (step={self.global_step})")
 
             mode = str(getattr(self.config, "rollout_weight_sync_mode", "none"))
+            if instance_ids is not None and mode != "restart":
+                raise ValueError("Checkpoint subset publication requires restart weight sync")
             with self._rollout_export_only_context(mode):
                 self.train_engine.save_weights(self.config.sync_path, self.global_step)
             self._record_weight_sync_phase("checkpoint_ready")
             if mode == "restart":
-                self._sync_rollout_restart_with_sentinel(target_version)
+                self._sync_rollout_restart_with_sentinel(target_version, instance_ids=instance_ids)
+                if reopen_restored and instance_ids is None:
+                    self._reopen_restored_rollouts()
             else:
                 if self.is_main_process:
                     self._cleanup_old_weights()
@@ -1265,224 +1308,157 @@ class AsyncRLTrainer:
 
 
     def _nccl_rollout_topology(self) -> tuple[int, dict[str, int]]:
-        """Return NCCL world size and per-instance rank offsets."""
-        # Batch-source ranks own a live rollout client, while other training
-        # ranks intentionally keep ``self.rollout_engine`` unset.  NCCL weight
-        # synchronization still runs on every training rank, so derive the
-        # topology from the committed planner config. A drained old client may
-        # still describe the previous engine layout during publication.
-        rollout_engine = self.rollout_engine
-        hetero_cfg = getattr(self.config, "heterogeneous_rollout", None)
-        configured_instances = getattr(hetero_cfg, "instances", []) if hetero_cfg else []
-        if self._use_heterogeneous or configured_instances:
-            instance_configs = None
-            if configured_instances:
-                instance_configs = [
-                    {
-                        "instance_id": str(getattr(cfg, "instance_id", f"instance_{index}")),
-                        "tp_degree": int(getattr(cfg, "tp", 1)),
-                    }
-                    for index, cfg in enumerate(configured_instances)
-                ]
-            else:
-                instance_configs = getattr(rollout_engine, "instance_configs", [])
-            entries = [
-                (str(cfg["instance_id"]), int(cfg.get("tp_degree", 1)))
-                for cfg in instance_configs
-            ]
-        else:
-            tp = int(getattr(self.config, "vllm_tp_size", 1) or 1)
-            num_instances = int(
-                getattr(rollout_engine, "num_instances", 0)
-                or getattr(self.config, "vllm_num_instances", 0)
-                or max(1, int(self.config.rollout_gpus) // max(1, tp))
-            )
-            entries = [
-                (f"instance_{index}", tp)
-                for index in range(num_instances)
-            ]
-        offsets: dict[str, int] = {}
-        next_rank = 0
-        borrowed = set(getattr(self, "_rollout_unavailable_ids", ())) - set(
-            getattr(self, "_restored_rollouts_pending_publication", ())
-        )
+        """Derive ordered ranks from the eligible services in the committed config."""
+        from RL_Framework.infra.sync.publication_session import publication_inventory
+
+        targets = publication_inventory(self)["targets"]
         selected = getattr(self, "_publication_target_ids", None)
-        for instance_id, tp_degree in entries:
-            if selected is not None and instance_id not in selected:
+        offsets, next_rank = {}, 0
+        for target in targets:
+            if selected is not None and target["instance_id"] not in selected:
                 continue
-            if instance_id in borrowed:
-                continue
-            offsets[instance_id] = next_rank
-            next_rank += max(1, tp_degree)
+            offsets[target["instance_id"]] = next_rank
+            next_rank += target["tp_size"]
         return 1 + next_rank, offsets
 
-    def _sync_weights_nccl(self, target_version: int) -> None:
-        """Stream Megatron Bridge tensors directly to all rollout workers."""
+    def _sync_weights_nccl(self, target_version: int, *, read_state=None, instance_ids=None):
+        """Export collectively, then wait for this request's installation ACKs."""
         if str(getattr(self.train_engine, "train_backend", "")) != "megatron_core":
             raise ValueError("Direct NCCL rollout sync requires train_backend=megatron_core")
-        control_dir_value = str(
-            getattr(self.config, "rollout_weight_sync_control_dir", "") or ""
-        )
-        if not control_dir_value:
+        directory_value = str(getattr(self.config, "rollout_weight_sync_control_dir", "") or "")
+        if not directory_value:
             raise ValueError("NCCL weight synchronization requires rollout_weight_sync_control_dir")
-        control_dir = Path(control_dir_value).resolve()
-
+        directory = Path(directory_value).resolve()
+        from RL_Framework.infra.sync.publication_session import (
+            publication_inventory, publication_targets, prepare_nccl_session, verify_nccl_publication,
+        )
+        from RL_Framework.infra.sync.nccl_weight_sync import NcclReloadSpec, send_weights
+        from RL_Framework.infra.sync.collective_export import stream_export_with_consensus
         import socket
 
-        host = (
-            str(getattr(self.config, "rollout_nccl_host", "") or "")
-            or os.environ.get("MASTER_ADDR", "")
-            or socket.gethostbyname(socket.gethostname())
-        )
-        # Reuse one communicator across refreshes. The per-rank broadcast
-        # counters provide generation ordering; changing the port here would
-        # pay NCCL/TCPStore bootstrap on every training version.
-        port = int(getattr(self.config, "rollout_nccl_port", 29620))
-        world_size, offsets = self._nccl_rollout_topology()
-        if not offsets:
-            return
-        request = {
-            "mode": "nccl",
-            "version": int(target_version),
-            "nccl_host": host,
-            "nccl_port": port,
-            "nccl_world_size": world_size,
-            "nccl_rank_offsets": offsets,
-            "nccl_chunk_bytes": int(
-                getattr(self.config, "rollout_nccl_chunk_mb", 256)
-            )
-            * 1024
-            * 1024,
-            "reload_strategy": str(
-                getattr(self.config, "rollout_weight_reload_strategy", "parallel")
-            ),
-            "created_at": time.time(),
-        }
-        preparation_error = None
+        def command(value):
+            packet = [value]
+            if dist.is_initialized():
+                dist.broadcast_object_list(packet, src=0, group=getattr(self, "control", None))
+            if packet[0].get("error"):
+                raise RuntimeError(packet[0]["error"])
+            return packet[0]
+
+        prepared = None
         if self.is_main_process:
             try:
-                from RL_Framework.infra.sync.publication_session import prepare_nccl_session
-
-                request.update(
-                    prepare_nccl_session(self, offsets),
-                    snapshot_id=uuid.uuid4().hex,
-                    optimizer_revision=int(self.train_engine.optimizer_revision),
-                )
-                control_dir.mkdir(parents=True, exist_ok=True)
-                for instance_id in offsets:
-                    (control_dir / f"ack_{instance_id}_{target_version}.json").unlink(
-                        missing_ok=True
-                    )
-                    (control_dir / f"error_{instance_id}_{target_version}.json").unlink(
-                        missing_ok=True
-                    )
-                self._write_json_atomic(control_dir / "reload_request.json", request)
+                targets = (publication_inventory(self)["targets"] if instance_ids is None else
+                           publication_targets(self.config, instance_ids=instance_ids))
+                offsets, next_rank = {}, 0
+                for target in targets:
+                    offsets[target["instance_id"]] = next_rank
+                    next_rank += target["tp_size"]
+                if not targets:
+                    prepared = dict(skip=True)
+                else:
+                    revision = self.train_engine.optimizer_revision
+                    if type(revision) is not int or revision < 0:
+                        raise ValueError("Publication requires the current optimizer revision")
+                    request = dict(mode="nccl", version=int(target_version), snapshot_id=uuid.uuid4().hex,
+                        optimizer_revision=revision,
+                        nccl_host=str(getattr(self.config, "rollout_nccl_host", "") or "")
+                            or os.environ.get("MASTER_ADDR", "") or socket.gethostbyname(socket.gethostname()),
+                        nccl_port=int(getattr(self.config, "rollout_nccl_port", 29620)),
+                        nccl_world_size=1 + next_rank, nccl_rank_offsets=offsets,
+                        nccl_chunk_bytes=int(getattr(self.config, "rollout_nccl_chunk_mb", 256)) * 1024**2,
+                        reload_strategy=str(getattr(self.config, "rollout_weight_reload_strategy", "parallel")),
+                        created_at=time.time())
+                    session, previous = prepare_nccl_session(self, targets, offsets, read_state=read_state)
+                    request.update(session)
+                    directory.mkdir(parents=True, exist_ok=True)
+                    for name in offsets:
+                        for prefix in ("ack", "error"):
+                            (directory / f"{prefix}_{name}_{target_version}.json").unlink(missing_ok=True)
+                    self._write_json_atomic(directory / "reload_request.json", request)
+                    prepared = dict(request=request, snapshot_id=request["snapshot_id"])
             except Exception as exc:
-                preparation_error = f"{type(exc).__name__}: {exc}"
-        preparation = [preparation_error]
-        if dist.is_initialized():
-            dist.broadcast_object_list(preparation, src=0, group=getattr(self, "control", None))
-        if preparation[0]:
-            raise RuntimeError(f"Rollout publication preparation failed: {preparation[0]}")
-
-        from RL_Framework.infra.sync.nccl_weight_sync import (
-            NcclReloadSpec,
-            send_weights,
-        )
-
+                prepared = dict(error=f"Rollout publication preparation failed: {type(exc).__name__}: {exc}")
+        prepared = command(prepared)
+        if prepared.get("skip"):
+            return None
+        request = prepared["request"]
+        world, offsets = request["nccl_world_size"], request["nccl_rank_offsets"]
+        keepalive = []
         started = time.perf_counter()
         transferred_bytes = 0
-        transport_keepalive: list[object] = []
 
-        def record_tensor(_name: str, size_bytes: int) -> None:
+        def record_tensor(_name, size_bytes):
             nonlocal transferred_bytes
             transferred_bytes += size_bytes
 
         def send_export(weights):
-            send_weights(
-                weights,
-                NcclReloadSpec(
-                    host=host,
-                    port=port,
-                    world_size=world_size,
-                    rank=0,
-                    device=torch.cuda.current_device(),
-                    timeout_s=float(
-                        getattr(self.config, "rollout_weight_sync_timeout_s", 1200.0)
-                    ),
-                    chunk_bytes=request["nccl_chunk_bytes"],
-                    session_id=request["nccl_session_id"],
-                    rate_limit_gbps=float(
-                        getattr(self.config, "rollout_nccl_rate_limit_gbps", 0.0)
-                    ),
-                ),
-                on_tensor=record_tensor,
-                keepalive=transport_keepalive,
-            )
+            send_weights(weights, NcclReloadSpec(host=request["nccl_host"], port=request["nccl_port"],
+                world_size=world, rank=0, device=torch.cuda.current_device(),
+                timeout_s=float(getattr(self.config, "rollout_weight_sync_timeout_s", 1200.0)),
+                chunk_bytes=request["nccl_chunk_bytes"], session_id=request["nccl_session_id"],
+                rate_limit_gbps=float(getattr(self.config, "rollout_nccl_rate_limit_gbps", 0.0))),
+                on_tensor=record_tensor, keepalive=keepalive)
 
-        from RL_Framework.infra.sync.collective_export import stream_export_with_consensus
-        stream_export_with_consensus(
-            self.train_engine.stream_rollout_weights,
-            is_sender=self.is_main_process, send=send_export,
-            group=getattr(self, "control", None),
-        )
-
-        failure = None
-        if self.is_main_process:
-            try:
-                timeout = float(getattr(self.config, "rollout_weight_sync_timeout_s", 1200.0))
-                deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
-                pending = set(offsets)
-                while pending and time.monotonic() < deadline:
-                    failures = {
-                        instance_id: (control_dir / f"error_{instance_id}_{target_version}.json").read_text(
-                            encoding="utf-8"
-                        )
-                        for instance_id in pending
-                        if (control_dir / f"error_{instance_id}_{target_version}.json").exists()
-                    }
-                    if failures:
-                        raise RuntimeError(f"vLLM NCCL reload failed: {failures}")
-                    pending = {
-                        instance_id
-                        for instance_id in pending
-                        if not (control_dir / f"ack_{instance_id}_{target_version}.json").exists()
-                    }
-                    if pending:
-                        time.sleep(
-                            float(
-                                getattr(
-                                    self.config,
-                                    "rollout_weight_sync_poll_interval_s",
-                                    0.05,
-                                )
-                            )
-                        )
-                if pending:
-                    raise TimeoutError(f"Timed out waiting for NCCL reload: {sorted(pending)}")
-                self._record_rollout_weight_version(
-                    target_version=target_version,
-                    checkpoint_path="",
-                    instance_ids=list(offsets),
-                )
-                print(
-                    f"Direct NCCL rollout refresh complete: version={target_version}, "
-                    f"world_size={world_size}, model_bytes={transferred_bytes}, "
-                    f"fanout_bytes={transferred_bytes * (world_size - 1)}, "
-                    f"seconds={time.perf_counter() - started:.3f}",
-                    flush=True,
-                )
-                transport_keepalive.clear()
-            except Exception as exc:
-                failure = f"{type(exc).__name__}: {exc}"
-        outcome = [failure]
+        try:
+            stream_export_with_consensus(self.train_engine.stream_rollout_weights,
+                is_sender=self.is_main_process, send=send_export,
+                group=getattr(self, "control", None))
+            outcome = None
+            if self.is_main_process:
+                try:
+                    timeout = float(getattr(self.config, "rollout_weight_sync_timeout_s", 1200.0))
+                    deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
+                    pending = set(offsets)
+                    records = {}
+                    while pending:
+                        for name in tuple(pending):
+                            failure = directory / f"error_{name}_{target_version}.json"
+                            if failure.exists():
+                                error = json.loads(failure.read_text(encoding="utf-8"))
+                                if (error.get("snapshot_id") == request["snapshot_id"]
+                                        and error.get("optimizer_revision") == request["optimizer_revision"]
+                                        and error.get("instance_id") == name):
+                                    raise RuntimeError(f"{name}: {error['error']}")
+                            ack_path = directory / f"ack_{name}_{target_version}.json"
+                            if ack_path.exists():
+                                record = json.loads(ack_path.read_text())
+                                if record.get("snapshot_id") == request["snapshot_id"]:
+                                    records[name] = record
+                                    pending.remove(name)
+                        if pending:
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError(f"Timed out waiting for NCCL reload: {sorted(pending)}")
+                            time.sleep(float(getattr(self.config, "rollout_weight_sync_poll_interval_s", .05)))
+                    rows = verify_nccl_publication(request, targets, previous, read_ack=records.__getitem__)
+                    receipt = dict(version=target_version, snapshot_id=request["snapshot_id"],
+                        optimizer_revision=request["optimizer_revision"], targets=targets,
+                        target_ids=[target["instance_id"] for target in targets], acknowledgements=rows,
+                        expected_service_instance_ids=request["expected_service_instance_ids"], transport="nccl",
+                        **{key: request[key] for key in ("nccl_session_id", "nccl_rank_offsets", "nccl_world_size")})
+                    if instance_ids is None:
+                        self._record_rollout_weight_version(target_version=target_version,
+                            checkpoint_path="", instance_ids=list(offsets))
+                    print(
+                        f"Direct NCCL rollout refresh complete: version={target_version}, "
+                        f"world_size={world}, model_bytes={transferred_bytes}, "
+                        f"fanout_bytes={transferred_bytes * (world - 1)}, "
+                        f"seconds={time.perf_counter() - started:.3f}",
+                        flush=True,
+                    )
+                    outcome = dict(receipt=receipt)
+                except Exception as exc:
+                    outcome = dict(error=f"Rollout publication failed: {type(exc).__name__}: {exc}")
+            receipt = command(outcome)["receipt"]
+        finally:
+            keepalive.clear()
+        if instance_ids is None:
+            self.last_publication = receipt
         if dist.is_initialized():
-            dist.broadcast_object_list(outcome, src=0, group=getattr(self, "control", None))
-        if outcome[0]:
-            raise RuntimeError(f"Rollout publication failed: {outcome[0]}")
-        if dist.is_initialized():
-            dist.barrier()
-        self._record_weight_sync_phase("sync_complete")
+            dist.barrier(group=getattr(self, "control", None))
+        recorder = getattr(self, "_record_weight_sync_phase", None)
+        if callable(recorder):
+            recorder("sync_complete")
+        return receipt
 
     @contextmanager
     def _rollout_export_only_context(self, mode: str):
@@ -1505,7 +1481,7 @@ class AsyncRLTrainer:
             else:
                 os.environ["MEGATRON_ROLLOUT_EXPORT_ONLY"] = old_value
 
-    def _sync_rollout_restart_with_sentinel(self, target_version: int) -> None:
+    def _sync_rollout_restart_with_sentinel(self, target_version: int, *, instance_ids=None) -> None:
         """Reload rollout servers without parking non-zero ranks in NCCL."""
         control_dir_value = str(
             getattr(self.config, "rollout_weight_sync_control_dir", "") or ""
@@ -1516,11 +1492,13 @@ class AsyncRLTrainer:
         if self.is_main_process:
             control_dir.mkdir(parents=True, exist_ok=True)
 
-        done_path = control_dir / f"reload_done_{target_version}.json"
-        error_path = control_dir / f"reload_error_{target_version}.json"
+        packet = [uuid.uuid4().hex if self.is_main_process else None]
+        if dist.is_initialized():
+            dist.broadcast_object_list(packet, src=0, group=getattr(self, "control", None))
+        snapshot_id = packet[0]
+        done_path = control_dir / f"reload_done_{target_version}_{snapshot_id}.json"
+        error_path = control_dir / f"reload_error_{target_version}_{snapshot_id}.json"
         if self.is_main_process:
-            done_path.unlink(missing_ok=True)
-            error_path.unlink(missing_ok=True)
             checkpoint_path = os.path.abspath(
                 os.path.join(self.config.sync_path, f"v{self.global_step}")
             )
@@ -1530,6 +1508,8 @@ class AsyncRLTrainer:
                 self._reload_rollout_from_checkpoint(
                     checkpoint_path=checkpoint_path,
                     target_version=target_version,
+                    instance_ids=instance_ids,
+                    snapshot_id=snapshot_id,
                 )
                 self._record_weight_sync_phase("after_rollout_reload")
                 self._write_json_atomic(
@@ -1541,11 +1521,12 @@ class AsyncRLTrainer:
                         "completed_at": time.time(),
                     },
                 )
-                self._record_rollout_weight_version(
-                    target_version=target_version,
-                    checkpoint_path=checkpoint_path,
-                    instance_ids=self._current_rollout_instance_ids(),
-                )
+                if instance_ids is None:
+                    self._record_rollout_weight_version(
+                        target_version=target_version,
+                        checkpoint_path=checkpoint_path,
+                        instance_ids=self._current_rollout_instance_ids(),
+                    )
             except Exception as exc:
                 self._write_json_atomic(
                     error_path,
@@ -1602,6 +1583,9 @@ class AsyncRLTrainer:
         self,
         checkpoint_path: str,
         target_version: int,
+        *,
+        instance_ids=None,
+        snapshot_id=None,
     ) -> None:
         mode = str(getattr(self.config, "rollout_weight_sync_mode", "none"))
         required = bool(getattr(self.config, "require_rollout_weight_sync", False))
@@ -1623,7 +1607,14 @@ class AsyncRLTrainer:
         control_dir = Path(control_dir_value).resolve()
         control_dir.mkdir(parents=True, exist_ok=True)
 
-        instance_ids = self._current_rollout_instance_ids()
+        if instance_ids is None:
+            instance_ids = self._current_rollout_instance_ids()
+        else:
+            from RL_Framework.infra.sync.publication_session import publication_targets
+            instance_ids = [target['instance_id'] for target in
+                            publication_targets(self.config, instance_ids=instance_ids)]
+        if not instance_ids:
+            return
         reload_method = str(
             getattr(self.config, "rollout_weight_reload_method", "restart")
         ).lower()
@@ -1656,6 +1647,8 @@ class AsyncRLTrainer:
             "instance_ids": sorted(instance_ids),
             "created_at": time.time(),
         }
+        if snapshot_id is not None:
+            request["snapshot_id"] = snapshot_id
         request_tmp = control_dir / "reload_request.json.tmp"
         request_path = control_dir / "reload_request.json"
         request_tmp.write_text(json.dumps(request), encoding="utf-8")
@@ -1666,23 +1659,31 @@ class AsyncRLTrainer:
         )
         deadline = time.monotonic() + timeout
         pending = set(instance_ids)
+        acknowledgements = {}
+
+        def read_current(path):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                return None
+            if snapshot_id is None or record.get("snapshot_id") == snapshot_id:
+                return record
+            return None
+
         while pending and time.monotonic() < deadline:
             failures = {}
-            for instance_id in pending:
-                error_path = control_dir / f"error_{instance_id}_{target_version}.json"
-                if error_path.exists():
-                    failures[instance_id] = error_path.read_text(encoding="utf-8")
+            for instance_id in tuple(pending):
+                failure = read_current(control_dir / f"error_{instance_id}_{target_version}.json")
+                if failure is not None:
+                    failures[instance_id] = failure
+                ack = read_current(control_dir / f"ack_{instance_id}_{target_version}.json")
+                if ack is not None:
+                    acknowledgements[instance_id] = ack
+                    pending.remove(instance_id)
             if failures:
                 raise RuntimeError(
                     f"vLLM failed to loadversion={target_version}failed: {failures}"
                 )
-            pending = {
-                instance_id
-                for instance_id in pending
-                if not (
-                    control_dir / f"ack_{instance_id}_{target_version}.json"
-                ).exists()
-            }
             if pending:
                 time.sleep(2.0)
         if pending:
@@ -1690,15 +1691,7 @@ class AsyncRLTrainer:
                 f"Timed out waiting for vLLM to loadversion={target_version}timed out，unconfirmed instances: "
                 f"{sorted(pending)}"
             )
-        acknowledgements = []
-        for instance_id in instance_ids:
-            ack_path = control_dir / f"ack_{instance_id}_{target_version}.json"
-            try:
-                ack = json.loads(ack_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError(
-                    f"Invalid rollout reload ACK: {ack_path}"
-                ) from exc
+        for instance_id, ack in acknowledgements.items():
             if (
                 str(ack.get("instance_id")) != instance_id
                 or int(ack.get("version", -1)) != int(target_version)
@@ -1709,11 +1702,10 @@ class AsyncRLTrainer:
                 raise RuntimeError(
                     f"Mismatched rollout reload ACK for {instance_id}: {ack}"
                 )
-            acknowledgements.append(ack)
 
         reload_seconds = [
             float(ack["total_seconds"])
-            for ack in acknowledgements
+            for ack in acknowledgements.values()
             if "total_seconds" in ack
         ]
         timing = (
@@ -2993,6 +2985,7 @@ class AsyncRLTrainer:
             tmp_path = task_path.with_suffix(task_path.suffix + ".tmp")
             task_data = {
                     "trajectories": trajectories,
+                    "grpo_objective": getattr(self.config, "grpo_objective", "legacy"),
                     "step": int(step),
                     "state_version": state_version,
                     "membership_epoch": int(state.get("membership_epoch", 0)),
