@@ -104,6 +104,7 @@ def test_evaluation_reuses_the_published_survivor_and_writes_its_report(tmp_path
         log_dir=tmp_path,
         model_path="model",
         heterogeneous_rollout=SimpleNamespace(
+            enabled=True,
             vllm_host="localhost",
             instances=[
                 SimpleNamespace(instance_id="kept", host="localhost", port=8000, tp=1),
