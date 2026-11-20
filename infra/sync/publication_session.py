@@ -1,6 +1,7 @@
 """NCCL membership sessions follow physical services, independently of weights."""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import urllib.request
@@ -45,13 +46,25 @@ def publication_targets(config, *, instance_ids=None):
     return [by_id[name] for name in selected]
 
 
+def topology_identity(config, targets=None):
+    targets = publication_targets(config) if targets is None else targets
+    return dict(target_ids=[target['instance_id'] for target in targets], targets=targets)
+
+
 def publication_inventory(owner):
-    """Select the configured services that are available for publication."""
+    """Resolve eligible services from current inventory and actual loan ownership."""
     inventory = publication_targets(owner.config)
     names = {target['instance_id'] for target in inventory}
     unavailable = set(getattr(owner, '_rollout_unavailable_ids', ()))
     restored = set(getattr(owner, '_restored_rollouts_pending_publication', ()))
     borrowed = unavailable - restored
+    executor = getattr(owner, 'runtime_elastic_executor', None)
+    loan = getattr(executor, '_lent_rollout', None)
+    if executor is not None:
+        owned = {meta.instance_id for meta in loan['engines']} if loan else set()
+        if owned != borrowed:
+            raise RuntimeError('Rollout availability differs from actual Hybrid loan ownership')
+        borrowed = owned
     if not (unavailable | restored | borrowed).issubset(names):
         raise RuntimeError('Rollout ownership names services outside the committed inventory')
     targets = [target for target in inventory if target['instance_id'] not in borrowed]
@@ -110,3 +123,34 @@ def verify_nccl_publication(request, targets, previous, *, read_ack):
             server_instance_id=reply['service_instance_id'], server_generation=reply['service_generation'],
             expected_tp_size=target['tp_size']))
     return receipts
+
+
+def verify_live_publication_target(target, ack, *, read_state=None):
+    """Check current installation once when reusing an earlier transaction."""
+    read_state = read_state or live_publication_state
+    state = read_state(target['endpoint'])
+    if (ack.get('endpoint') != target['endpoint'] or ack.get('expected_tp_size') != target['tp_size']
+            or not isinstance(state, dict) or state.get('server_generation_verified') is not True
+            or state.get('closed') is not False or state.get('failed')
+            or any(state.get(key) != ack.get(key) for key in
+                   ('server_instance_id', 'server_generation', 'snapshot_id', 'optimizer_revision'))
+            or state.get('tp_size') != target['tp_size']):
+        raise RuntimeError('Live physical-engine state differs from installation ACK: ' + target['instance_id'])
+    return copy.deepcopy(state)
+
+
+def attest_nccl_publication(config, receipt, *, targets=None, read_state=None):
+    """Recheck a verified transaction against the currently eligible services."""
+    targets = publication_targets(config) if targets is None else targets
+    topology = topology_identity(config, targets)
+    if any(receipt.get(key) != value for key, value in topology.items()):
+        raise RuntimeError('Publication receipt belongs to an old rollout topology')
+    acks = receipt.get('acknowledgements', [])
+    by_id = {ack['instance_id']: ack for ack in acks}
+    if len(acks) != len(targets) or set(by_id) != set(topology['target_ids']):
+        raise RuntimeError('Missing or duplicate physical-engine ACK coverage')
+    states = []
+    for target in targets:
+        state = verify_live_publication_target(target, by_id[target['instance_id']], read_state=read_state)
+        states.append(dict(state, instance_id=target['instance_id'], endpoint=target['endpoint']))
+    return states

@@ -26,9 +26,6 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from RL_Framework.config import AsyncRLConfig, HeterogeneousInstanceConfig, validate_grpo_objective
-from RL_Framework.infra.elastic.batch_partition import (
-    complete_group_sample_counts, partition_complete_grpo_groups,
-)
 from RL_Framework.engine.rollout_engine import MockRolloutEngine, MultiInstanceRolloutEngine
 from RL_Framework.engine.heterogeneous_engine import HeterogeneousRolloutEngine
 from RL_Framework.engine.train_engine import TrainEngine
@@ -36,6 +33,9 @@ from RL_Framework.engine.train_factory import create_train_engine
 from RL_Framework.infra.cost_model.global_resource_planner import CoreRuntimeCapabilities, GlobalResourcePlanner
 from RL_Framework.infra.cost_model.startup_profile import load_length_profile_records
 from RL_Framework.infra.elastic.runtime_executor import RuntimeElasticExecutor
+from RL_Framework.infra.elastic.batch_partition import (
+    complete_group_sample_counts, partition_complete_grpo_groups,
+)
 from RL_Framework.infra.elastic.runtime_boundary import RuntimeBoundaryProtocol, read_record
 from RL_Framework.infra.elastic.gradient_ipc import ElasticGradientServer, GradientUpdate
 from RL_Framework.infra.execution.async_runner import AsyncTaskRunner
@@ -61,8 +61,6 @@ class AsyncRLTrainer:
 
     def __init__(self, config: AsyncRLConfig):
         self.config = config
-
-
         self.rank = int(os.getenv("RANK", "0"))
         self.local_rank = int(os.getenv("LOCAL_RANK", "0"))
         self.world_size = int(os.getenv("WORLD_SIZE", "1"))
@@ -76,6 +74,8 @@ class AsyncRLTrainer:
         self.async_runner: AsyncTaskRunner | None = None
         self.staleness_manager: StalenessManager | None = None
         self.dispatcher: BatchTaskDispatcher | None = None
+        self._bounded_rollout_production = False
+        self._pending_grpo_groups: dict[str, list[dict[str, Any]]] = {}
 
 
         self.dataloader: DataLoader | None = None
@@ -94,8 +94,6 @@ class AsyncRLTrainer:
 
 
         self._task_counter = 0
-        self._bounded_rollout_production = False
-        self._pending_grpo_groups: dict[str, list[dict[str, Any]]] = {}
 
         # WandB
         self.wandb_run = None
@@ -118,7 +116,6 @@ class AsyncRLTrainer:
         self._runtime_announced_coord_id = ""
         self._runtime_handled_request_ids: set[str] = set()
         self._runtime_done_published = False
-        self._rollout_engine_rebind_lock = threading.RLock()
         self._trace_train_phases = os.environ.get("RL_TRAIN_PHASE_TRACE", "0") == "1"
         trace_enabled = self._trace_train_phases or bool(
             getattr(config, "phase_trace_enabled", False)
@@ -244,22 +241,15 @@ class AsyncRLTrainer:
     def _configure_rollout_production(self):
         """Use reservations when optimizer updates and verified publications align."""
         cfg = self.config
-        planner = getattr(cfg, "global_resource_planner", None)
-        runtime_reconfiguration = getattr(planner, "enabled", False) and (
-            getattr(planner, "runtime_dynamic_reconfiguration_enabled", True)
-            or getattr(planner, "hybrid_training_prewarm_enabled", False)
-        )
         # Objective validation already establishes the exact-sampling workflow,
         # single optimizer update, and physical NCCL publication path.
         self._bounded_rollout_production = (
             cfg.grpo_objective == "decoupled"
             and cfg.sync_interval == 1
             and cfg.require_rollout_weight_sync
-            and not runtime_reconfiguration
             and getattr(self.train_engine, "optimizer_revision", None)
                 == self.train_engine.get_version() == self.start_step
         )
-
 
     def setup(self, workflow):
         """Setup."""
@@ -454,8 +444,6 @@ class AsyncRLTrainer:
 
         async def _execute():
             try:
-                if not bounded:
-                    self._refresh_rollout_engine_from_manifest_for_task()
                 rollout_engine = self.rollout_engine
                 if rollout_engine is None:
                     raise RuntimeError("rollout engine is not initialized")
@@ -492,12 +480,6 @@ class AsyncRLTrainer:
                         sample_revision = versions.min().item() if versions is not None else task_input.version
                     age = current_revision - sample_revision
                     if age > self.config.max_head_offpolicyness:
-                        if self.is_main_process and self.config.enable_rollout_tracing:
-                            print(
-                                f"REJECT rollout task_id={task_input.task_id}: "
-                                f"version={sample_revision}, current={current_revision}, "
-                                f"staleness={age} > {self.config.max_head_offpolicyness}"
-                            )
                         return None
                 return trajectory
 
@@ -535,6 +517,7 @@ class AsyncRLTrainer:
             num_replicas=int(getattr(self, "_rollout_source_world_size", self.train_engine.get_data_parallel_world_size())),
             rank=int(getattr(self, "_rollout_source_rank", self.train_engine.get_data_parallel_rank()) or 0),
             shuffle=True,
+            seed=int(getattr(self.config, "seed", 0)),
         )
 
         dataloader = DataLoader(
@@ -582,7 +565,6 @@ class AsyncRLTrainer:
         batch = self.dispatcher.collect_batch(batch_size, revision)
         self._source_training_batch = batch
         return batch
-
 
     def _collect_legacy_grpo_batch(self, data_gen, batch_size: int):
         """Consume ready groups and pull work using the configured legacy cadence."""
@@ -745,8 +727,8 @@ class AsyncRLTrainer:
         )
 
         timeout = float(os.environ.get("ROLLOUT_RANK_READY_TIMEOUT", "86400"))
-        poll_interval = float(os.environ.get("ROLLOUT_RANK_READY_POLL_INTERVAL", "2"))
-        deadline = time.monotonic() + timeout
+        poll_interval = float(os.environ.get("ROLLOUT_RANK_READY_POLL_INTERVAL", "0.05"))
+        deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
         expected = [step_dir / f"rank_{rank}.json" for rank in range(self.world_size)]
         while True:
             missing = [path.name for path in expected if not path.exists()]
@@ -790,7 +772,7 @@ class AsyncRLTrainer:
                 "rank": int(self.rank),
                 "local_rank": int(self.local_rank),
                 "world_size": int(self.world_size),
-                "is_batch_source": bool(self.train_engine.is_batch_source()),
+                "is_batch_source": bool(self._is_rollout_source()),
                 "ready_at": time.time(),
             },
         )
@@ -802,9 +784,9 @@ class AsyncRLTrainer:
             )
         )
         poll_interval = float(
-            os.environ.get("WEIGHT_SYNC_RANK_READY_POLL_INTERVAL", "2")
+            os.environ.get("WEIGHT_SYNC_RANK_READY_POLL_INTERVAL", "0.05")
         )
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
         expected = [step_dir / f"rank_{rank}.json" for rank in range(self.world_size)]
         while True:
             missing = [path.name for path in expected if not path.exists()]
@@ -877,10 +859,7 @@ class AsyncRLTrainer:
             step_start = time.time()
             self._trace_train_phase(step, "step_start")
             if not self._bounded_rollout_production:
-                self._configure_sync_aware_rollout_prefetch(
-                    step=step,
-                    batch_size=local_batch_size,
-                )
+                self._configure_sync_aware_rollout_prefetch(step=step, batch_size=local_batch_size)
 
             if self.is_main_process:
                 # Reconcile late hybrid joins and publish their membership before
@@ -892,9 +871,8 @@ class AsyncRLTrainer:
                 self._trace_train_phase(step, "follow_reconfig_start")
                 self._runtime_reconfiguration_boundary(step, "pre")
                 self._trace_train_phase(step, "follow_reconfig_done")
-            if getattr(self.config.global_resource_planner, "runtime_reconfigure_training", False):
-                from RL_Framework.infra.elastic.rollout_lifecycle import ensure_batch_supply
-                ensure_batch_supply(self)
+            from RL_Framework.infra.elastic.rollout_lifecycle import ensure_batch_supply
+            ensure_batch_supply(self)
             active_hybrid_ids = self._prepare_elastic_training_step(step)
             # Reconfiguration can change the number of DP data sources.
             local_batch_size = self._source_batch_sample_count()
@@ -908,7 +886,6 @@ class AsyncRLTrainer:
                 data_gen, local_batch_size, active_hybrid_ids,
             )
             self._trace_train_phase(step, "collect_batch_done", batch_size=len(batch))
-
             if getattr(self.config, "grpo_objective", "legacy") == "decoupled":
                 # Padding, advantages and anchors belong to this training view.
                 batch = [dict(row) for row in batch]
@@ -950,10 +927,7 @@ class AsyncRLTrainer:
 
             train_start = time.time()
             self._trace_train_phase(step, "grpo_update_start")
-            stats = self.train_engine.grpo_update(
-                batch,
-                ppo_epochs=self.config.ppo_epochs,
-            )
+            stats = self.train_engine.grpo_update(batch, ppo_epochs=self.config.ppo_epochs)
             reward_start = time.time()
             self._trace_train_phase(step, "reward_compute_start")
             reward_values = torch.cat(
@@ -992,10 +966,11 @@ class AsyncRLTrainer:
                     self.dispatcher = self.async_runner = None
                     if self.runtime_elastic_executor is not None:
                         self.runtime_elastic_executor.dispatcher = None
+            should_sync = self.config.sync_interval > 0 and (step + 1) % self.config.sync_interval == 0
+            publish_after_post = should_sync and self._bounded_rollout_production
             weight_sync_time, rollout_sync_drain = 0.0, None
-            if self.config.sync_interval > 0 and (step + 1) % self.config.sync_interval == 0:
+            if should_sync and not publish_after_post:
                 weight_sync_time, rollout_sync_drain = self._periodic_weight_sync(step)
-
             step_total_time = time.time() - step_start
 
 
@@ -1004,24 +979,30 @@ class AsyncRLTrainer:
             stats["rollout_time"] = rollout_time
             stats["train_time"] = train_time
             stats["weight_sync_time"] = weight_sync_time
+            if rollout_sync_drain is not None:
+                stats["rollout_sync_drain"] = rollout_sync_drain
             stats["advantage_time"] = advantage_time
             stats["recompute_logprob_time"] = recompute_time
             stats["step_time"] = step_total_time
             stats["version"] = self.train_engine.get_version()
-            if rollout_sync_drain is not None:
-                stats["rollout_sync_drain"] = rollout_sync_drain
             stats.update(getattr(self, "_advantage_stats", {}))
             self.stats = stats
 
 
-            self._log_to_wandb(stats, step)
-
-
+            profiled_sequences = None
+            history_resource_config = None
             if self.is_main_process:
-                self._record_history_step(step, global_batch, stats,
-                                          rollout_time, train_time,
-                                          weight_sync_time, advantage_time,
-                                          recompute_time, step_total_time)
+                if publish_after_post:
+                    if self.history_collector is not None:
+                        # The update used the topology before the POST boundary.
+                        history_resource_config = self._resource_config_snapshot
+                        profiled_sequences = self._history_sequence_records(global_batch)
+                        self.history_collector.record_length_profile(step, profiled_sequences)
+                else:
+                    self._record_history_step(step, global_batch, stats,
+                                              rollout_time, train_time,
+                                              weight_sync_time, advantage_time,
+                                              recompute_time, step_total_time)
                 self._trace_train_phase(step, "resource_planner_start")
                 self._run_global_resource_planner_at_boundary(step, global_batch, stats)
                 self._trace_train_phase(step, "resource_planner_done")
@@ -1031,6 +1012,19 @@ class AsyncRLTrainer:
                 self._trace_train_phase(step, "follow_reconfig_after_step_done")
 
 
+            if publish_after_post:
+                weight_sync_time, _ = self._periodic_weight_sync(step)
+            stats["weight_sync_time"] = weight_sync_time
+            stats["step_time"] = time.time() - step_start
+            stats["version"] = self.train_engine.get_version()
+            if profiled_sequences is not None:
+                self._record_history_step(step, global_batch, stats,
+                                          rollout_time, train_time,
+                                          weight_sync_time, advantage_time,
+                                          recompute_time, stats["step_time"],
+                                          profiled_sequences=profiled_sequences,
+                                          resource_config=history_resource_config)
+            self._log_to_wandb(stats, step)
             self._run_periodic_evaluation(workflow, dataset, step)
 
 
@@ -1071,131 +1065,87 @@ class AsyncRLTrainer:
                 self._save_checkpoint()
 
 
+        total_time = time.time() - start_time
+        self._cleanup(wait_for_hybrid_tasks=True)
         if self.is_main_process:
-            total_time = time.time() - start_time
             print("\n" + "=" * 60)
             print(f"Training complete. Total time: {total_time:.1f}s")
             print("=" * 60)
 
-        self._cleanup(wait_for_hybrid_tasks=True)
-
     def _periodic_weight_sync(self, step):
-        """Publish weights, draining legacy rollout work before the transfer."""
+        """Synchronize via the drain and publication path selected at setup."""
+        from RL_Framework.infra.elastic.rollout_lifecycle import reopen_after_publication
+
+        self._trace_train_phase(step, "weight_sync_start")
         bounded = getattr(self, "_bounded_rollout_production", False)
         rollout_sync_drain = None
-        self._trace_train_phase(step, "weight_sync_start")
+        paused_here = False
         if not bounded and self.dispatcher is not None:
-            drain_started = time.time()
-            self.dispatcher.pause()
+            started = time.time()
+            paused_here = not self.dispatcher.is_paused()
+            if paused_here:
+                self.dispatcher.pause()
             cancelled = self.dispatcher.cancel_queued()
-            metrics = self.dispatcher.get_runtime_metrics()
-            active_to_drain = int(metrics.get("staleness_running", 0))
+            active = self.dispatcher.get_runtime_metrics()["staleness_running"]
             self.dispatcher.wait_until_idle(
-                timeout=float(
-                    getattr(
-                        self.config,
-                        "rollout_weight_sync_timeout_s",
-                        1200.0,
-                    )
-                )
+                timeout=float(getattr(self.config, "rollout_weight_sync_timeout_s", 1200.0)),
             )
             rollout_sync_drain = {
-                "cancelled_dispatcher_queue": int(cancelled["dispatcher_queue"]),
-                "cancelled_runner_queue": int(cancelled["runner_queue"]),
-                "active_to_drain": active_to_drain,
-                "drain_seconds": time.time() - drain_started,
+                "cancelled_dispatcher_queue": cancelled["dispatcher_queue"],
+                "cancelled_runner_queue": cancelled["runner_queue"],
+                "active_to_drain": active,
+                "drain_seconds": time.time() - started,
             }
             if self.is_main_process:
                 print(
-                    "[RolloutDrain] "
-                    f"step={step} active={active_to_drain} "
+                    f"[RolloutDrain] step={step} active={active} "
                     f"cancelled_dispatcher={cancelled['dispatcher_queue']} "
                     f"cancelled_runner={cancelled['runner_queue']} "
                     f"seconds={rollout_sync_drain['drain_seconds']:.3f}",
                     flush=True,
                 )
-
         self._wait_for_all_ranks_before_weight_sync(step)
         sync_start = time.time()
         skip_rollout_sync = (
-            str(getattr(self.config, "rollout_weight_sync_mode", "")).lower()
-            == "none"
-            and not bool(
-                getattr(self.config, "require_rollout_weight_sync", True)
-            )
+            str(getattr(self.config, "rollout_weight_sync_mode", "")).lower() == "none"
+            and not bool(getattr(self.config, "require_rollout_weight_sync", True))
         )
-        installed = False
         if skip_rollout_sync:
             self._record_weight_sync_phase("sync_skipped")
+            installed = False
         else:
-            installed = self._sync_weights(target_version=step + 1)
-        weight_sync_time = time.time() - sync_start
-
-        new_version = step + 1
+            receipt = self._sync_weights(target_version=step + 1, reopen_restored=False)
+            installed = getattr(self.config, "weight_sync_mode", None) != "nccl" or receipt is not None
+        elapsed = time.time() - sync_start
+        # A failed install exits above, before either routing or reservations open.
         if installed or not bounded:
-            self.train_engine.set_version(new_version)
-        if bounded:
-            if installed and self.dispatcher is not None and self.staleness_manager.group_reservations_enabled:
-                self.dispatcher.on_publication(new_version)
-        else:
-            if not getattr(self, "_rollout_unavailable_ids", ()):
-                self._rebind_rollout_engine_from_config(reason="after_weight_sync")
+            self.train_engine.set_version(step + 1)
+        if installed:
+            reopen_after_publication(self)
+            if bounded and self.dispatcher is not None and self.staleness_manager.group_reservations_enabled:
+                self.dispatcher.on_publication(step + 1)
+        if not bounded and not getattr(self, "_rollout_unavailable_ids", ()):
+            self._rebind_rollout_engine_from_config(reason="after_weight_sync")
+        if paused_here:
             self._resume_rollout_pipeline()
         self._trace_train_phase(step, "weight_sync_done")
+        return elapsed, rollout_sync_drain
 
-        if self.is_main_process and self.config.enable_rollout_tracing:
-            sm_stats = (
-                self.staleness_manager.get_stats()
-                if self.staleness_manager is not None
-                else None
-            )
-            print(
-                f"Weight synchronization complete: version={new_version}, "
-                f"running={getattr(sm_stats, 'running', 0)}, "
-                f"accepted={getattr(sm_stats, 'accepted', 0)}"
-            )
-
-        return weight_sync_time, rollout_sync_drain
-
-    def _sync_aware_rollout_limit(
-        self,
-        *,
-        step: int,
-        batch_size: int,
-    ) -> int | None:
-        """Return a temporary in-flight cap near the next weight sync."""
+    def _sync_aware_rollout_limit(self, *, step: int, batch_size: int) -> int | None:
         interval = int(getattr(self.config, "sync_interval", 0) or 0)
-        lead_steps = int(
-            getattr(self.config, "rollout_sync_drain_lead_steps", 0) or 0
-        )
+        lead_steps = int(getattr(self.config, "rollout_sync_drain_lead_steps", 0) or 0)
         if interval <= 0 or lead_steps <= 0:
             return None
-        remainder = step % interval
-        steps_until_sync = interval - remainder
+        steps_until_sync = interval - step % interval
         if steps_until_sync > lead_steps:
             return None
-        prefetch_batches = max(1, steps_until_sync)
-        return min(
-            int(getattr(self.config, "max_concurrent_rollouts", batch_size)),
-            max(1, int(batch_size)) * prefetch_batches,
-        )
+        return min(int(getattr(self.config, "max_concurrent_rollouts", batch_size)),
+                   max(1, batch_size) * steps_until_sync)
 
-    def _configure_sync_aware_rollout_prefetch(
-        self,
-        *,
-        step: int,
-        batch_size: int,
-    ) -> None:
-        if self.staleness_manager is None:
-            return
-        limit = self._sync_aware_rollout_limit(step=step, batch_size=batch_size)
-        self.staleness_manager.set_runtime_max_concurrent_rollouts(limit)
-        if self.is_main_process and limit is not None:
-            print(
-                f"[RolloutDrain] step={step} prefetch_limit={limit}",
-                flush=True,
-            )
-
+    def _configure_sync_aware_rollout_prefetch(self, *, step: int, batch_size: int) -> None:
+        if self.staleness_manager is not None:
+            limit = self._sync_aware_rollout_limit(step=step, batch_size=batch_size)
+            self.staleness_manager.set_runtime_max_concurrent_rollouts(limit)
 
     def _run_periodic_evaluation(self, workflow, dataset, step: int):
         """Run rank-0 evaluation while other ranks wait outside NCCL collectives."""
@@ -1344,7 +1294,7 @@ class AsyncRLTrainer:
 
 
     def _nccl_rollout_topology(self) -> tuple[int, dict[str, int]]:
-        """Derive ordered ranks from the eligible services in the committed config."""
+        """Derive ordered ranks from committed services and actual loan ownership."""
         from RL_Framework.infra.sync.publication_session import publication_inventory
 
         targets = publication_inventory(self)["targets"]
@@ -1373,6 +1323,9 @@ class AsyncRLTrainer:
         import socket
 
         def command(value):
+            experiment_command = getattr(self, "command", None)
+            if callable(experiment_command):
+                return experiment_command(value)
             packet = [value]
             if dist.is_initialized():
                 dist.broadcast_object_list(packet, src=0, group=getattr(self, "control", None))
@@ -1910,6 +1863,8 @@ class AsyncRLTrainer:
             self._runtime_follow_thread = None
         if self._grp_executor is not None:
             self._grp_executor.shutdown(wait=False, cancel_futures=True)
+            if self._grp_future is not None:
+                self._clear_runtime_reconfiguration_pending()
             self._grp_executor = None
             self._grp_future = None
             self._grp_future_step = None
@@ -2003,6 +1958,7 @@ class AsyncRLTrainer:
                     "model_path": self.config.model_path,
                     "learning_rate": self.config.learning_rate,
                     "ppo_epochs": self.config.ppo_epochs,
+                    "grpo_objective": getattr(self.config, "grpo_objective", "legacy"),
                     "batch_size": self.config.batch_size,
                     "kl_coef": self.config.kl_coef,
                     "clip_epsilon": self.config.clip_epsilon,
@@ -2074,7 +2030,9 @@ class AsyncRLTrainer:
             return
 
         self.global_resource_planner = GlobalResourcePlanner.from_config(self.config)
-        self.global_resource_planner.runtime_capabilities = CoreRuntimeCapabilities.from_engine(self.train_engine)
+        self.global_resource_planner.runtime_capabilities = CoreRuntimeCapabilities.from_engine(
+            self.train_engine,
+        )
         self.runtime_elastic_executor = RuntimeElasticExecutor(
             config=self.config,
             planner=self.global_resource_planner,
@@ -2165,6 +2123,7 @@ class AsyncRLTrainer:
         task_dir.mkdir(parents=True, exist_ok=True)
         endpoint_dir = Path(getattr(planner_cfg, "hybrid_worker_endpoint_dir", "") or task_dir) / "core_endpoints"
         endpoint_dir.mkdir(parents=True, exist_ok=True)
+
         server = ElasticGradientServer(
             host=str(getattr(planner_cfg, "gradient_server_host", "0.0.0.0")),
             port=0,
@@ -2323,26 +2282,30 @@ class AsyncRLTrainer:
         self._runtime_post_boundary = step
         self._runtime_boundary_published = False
         try:
+            if step + 1 >= self.config.total_steps:
+                return
+            self._run_global_resource_planner(step, batch, stats)
             executor = self.runtime_elastic_executor
-            if executor is not None and executor.has_pending_boundary_work():
+            if (not self._runtime_boundary_published
+                    and not getattr(self, "_runtime_decision_applied", False)
+                    and executor is not None and executor.has_pending_boundary_work()):
                 from RL_Framework.infra.cost_model.global_resource_planner import PlannerDecision
                 planner = self.global_resource_planner
-                plan = planner._build_current_plan(self.config, planner._history)
+                plan = (None if getattr(planner, "elastic_hybrid_planning_enabled", False)
+                        else planner._build_current_plan(self.config, planner._history))
                 decision = PlannerDecision(
                     step=step, should_reconfigure=True, reason="hybrid_boundary_maintenance",
                     current_plan=plan, candidate_plan=plan,
                     resource_should_reconfigure=False,
                 )
                 self._apply_global_resource_planner_decision(step, decision, stats)
-                return
-            # The only result-consumption location remains the existing POST path.
-            self._run_global_resource_planner(step, batch, stats)
         finally:
             try:
                 if not self._runtime_boundary_published:
                     self._runtime_reconfiguration_boundary(step, "post")
             finally:
                 self._runtime_post_boundary = None
+                self._runtime_decision_applied = False
 
     def _follow_runtime_reconfiguration_if_requested(self, *, expected_coord_id: str = "") -> None:
         # The main boundary and background follower can observe the same request.
@@ -2383,22 +2346,23 @@ class AsyncRLTrainer:
             self._follow_applied_runtime_reconfiguration_if_available(coord_dir)
             return
 
-        # Rank 0 deliberately skips peer draining when this option is false.
-        # Followers must stay non-blocking too; otherwise their dispatcher
-        # drain waits can deadlock with the main loop's post-rollout barrier.
-        # The background follower will apply applied.json on a later poll.
-        if not bool(
-            getattr(planner_cfg, "runtime_drain_before_reconfigure", True)
-        ):
+        resource_reconfiguration = bool(request.get("resource_reconfiguration", True))
+        drain_topology = resource_reconfiguration and bool(
+            getattr(planner_cfg, "runtime_drain_before_reconfigure", True))
+        if resource_reconfiguration and not drain_topology and not expected_coord_id:
             self._follow_applied_runtime_reconfiguration_if_available(coord_dir)
             return
 
+        # An announced full topology change may need all Core ranks at the
+        # publication collective while allowing rollout clients to keep work.
+        drain_rollout = bool(request.get("rollout_drain_required", drain_topology))
         paused = False
         state = None
         try:
-            if self.dispatcher is not None and hasattr(self.dispatcher, "pause"):
-                self.dispatcher.pause()
-                paused = True
+            if drain_rollout and self.dispatcher is not None and hasattr(self.dispatcher, "pause"):
+                paused = not getattr(self.dispatcher, "is_paused", lambda: False)()
+                if paused:
+                    self.dispatcher.pause()
                 if hasattr(self.dispatcher, "wait_until_idle"):
                     self.dispatcher.wait_until_idle(
                         timeout=float(
@@ -2406,7 +2370,7 @@ class AsyncRLTrainer:
                         )
                     )
             if (
-                self.rollout_engine is not None
+                drain_rollout and self.rollout_engine is not None
                 and hasattr(self.rollout_engine, "wait_until_idle")
             ):
                 self.rollout_engine.wait_until_idle(
@@ -2435,11 +2399,11 @@ class AsyncRLTrainer:
             tmp_ready.replace(ready_path)
 
             timeout = float(getattr(planner_cfg, "runtime_drain_timeout_s", 3600.0))
-            deadline = time.monotonic() + timeout
+            deadline = time.monotonic() + timeout if timeout > 0 else None
             applied_path = coord_dir / "applied.json"
             aborted_path = coord_dir / "aborted.json"
             state: dict[str, Any] | None = None
-            while time.monotonic() < deadline:
+            while deadline is None or time.monotonic() < deadline:
                 from RL_Framework.infra.elastic.core_reconfiguration import follow_core_command
                 follow_core_command(self, coord_dir, coord_id)
                 if aborted_path.exists():
@@ -2468,12 +2432,17 @@ class AsyncRLTrainer:
                     f"timed out waiting for runtime reconfiguration {coord_id} to apply"
                 )
             self._apply_runtime_reconfiguration_state(state)
-            self._reset_rollout_pipeline_after_reconfigure()
             self._runtime_reconfiguration_coord_id = coord_id
             self._runtime_handled_request_ids.add(coord_id)
         finally:
-            if paused and state is not None:
-                self._resume_rollout_pipeline()
+            loan_paused = getattr(self, "_paused_for_rollout_loan", False)
+            if state is not None and (paused or loan_paused):
+                ids = {item.instance_id for item in self.config.heterogeneous_rollout.instances}
+                self._paused_for_rollout_loan = bool(ids) and ids.issubset(
+                    getattr(self, "_rollout_unavailable_ids", set()),
+                )
+                if not self._paused_for_rollout_loan:
+                    self._resume_rollout_pipeline()
 
     def _follow_applied_runtime_reconfiguration_if_available(self, coord_dir: Path) -> None:
         """Apply a completed non-draining runtime reconfiguration on peer ranks."""
@@ -2505,22 +2474,8 @@ class AsyncRLTrainer:
         ):
             return
 
-        paused = False
-        try:
-            self._pause_rollout_pipeline()
-            paused = self.dispatcher is not None
-            self._reset_rollout_pipeline_after_reconfigure()
-            self._apply_runtime_reconfiguration_state(state)
-            self._reset_rollout_pipeline_after_reconfigure()
-            self._runtime_reconfiguration_coord_id = coord_id
-            print(
-                "[RuntimeElasticExecutor] peer applied completed runtime "
-                f"reconfiguration rank={self.rank} coord_id={coord_id} "
-                f"endpoints={sorted(desired_endpoints)}"
-            )
-        finally:
-            if paused:
-                self._resume_rollout_pipeline()
+        self._apply_runtime_reconfiguration_state(state)
+        self._runtime_reconfiguration_coord_id = coord_id
 
     def _runtime_reconfiguration_endpoint_keys(
         self,
@@ -2545,61 +2500,6 @@ class AsyncRLTrainer:
             endpoint = str(url).removeprefix("http://").removeprefix("https://")
             endpoints.add(endpoint.rstrip("/"))
         return endpoints
-
-    def _refresh_rollout_engine_from_manifest_for_task(self) -> None:
-        """Best-effort task-time rollout endpoint refresh for batch-source ranks."""
-        if not self._use_heterogeneous:
-            return
-        state = self._runtime_reconfiguration_state_from_manifest()
-        if state is None:
-            return
-        desired_endpoints = self._runtime_reconfiguration_endpoint_keys(state)
-        if not desired_endpoints or desired_endpoints == self._rollout_engine_endpoint_keys():
-            return
-        with self._rollout_engine_rebind_lock:
-            if desired_endpoints == self._rollout_engine_endpoint_keys():
-                return
-            self._apply_training_reconfiguration_state(state.get("training") or {})
-            instances = state.get("instances") or []
-            hetero = self.config.heterogeneous_rollout
-            hetero.instances = [
-                HeterogeneousInstanceConfig(
-                    instance_id=str(inst.get("instance_id", f"runtime_{idx}")),
-                    tp=int(inst.get("tp", 1)),
-                    gpus=[int(gpu) for gpu in inst.get("gpus", [])],
-                    host=str(inst.get("host") or hetero.vllm_host),
-                    port=int(inst.get("port") or (hetero.vllm_base_port + idx)),
-                    description="runtime_reconfiguration_task_refresh",
-                )
-                for idx, inst in enumerate(instances)
-            ]
-            old_engine = self.rollout_engine
-            try:
-                for engine in getattr(old_engine, "engines", []):
-                    if hasattr(engine, "close_sync"):
-                        engine.close_sync()
-            except Exception as exc:
-                print(
-                    "[RuntimeElasticExecutor] warning: failed to close old "
-                    f"rollout clients during task refresh: {exc}"
-                )
-            self.rollout_engine = HeterogeneousRolloutEngine.from_config(self.config)
-            if hasattr(self.rollout_engine, "wait_for_ready"):
-                self.rollout_engine.wait_for_ready(
-                    timeout=float(
-                        getattr(
-                            self.config.global_resource_planner,
-                            "vllm_ready_timeout_s",
-                            300.0,
-                        )
-                    )
-                )
-            self._runtime_reconfiguration_coord_id = str(state.get("coord_id", ""))
-            print(
-                "[RuntimeElasticExecutor] task refreshed rollout engine "
-                f"rank={self.rank} endpoints={sorted(desired_endpoints)}",
-                flush=True,
-            )
 
     def _runtime_reconfiguration_state_from_manifest(self) -> dict[str, Any] | None:
         manifest_path = Path(self.config.log_dir) / "global_resource_rollout_manifest.json"
@@ -2631,7 +2531,6 @@ class AsyncRLTrainer:
         if state is None:
             return
         self._apply_runtime_reconfiguration_state(state)
-        self._reset_rollout_pipeline_after_reconfigure()
         self._runtime_reconfiguration_coord_id = str(state.get("coord_id", ""))
         if self.is_main_process:
             instances = state.get("instances") or []
@@ -2672,8 +2571,7 @@ class AsyncRLTrainer:
             if callable(close_shared):
                 close_shared()
             # Preserve learned scheduler state (output-length EMA, history
-            # tables) across the rebind: weight sync rebuilds the engine
-            # every sync step and an unconditional reset would zero the
+            # tables) across physical topology changes. An unconditional reset would zero the
             # EMA back to its prior each time.
             old_scheduler = getattr(old_engine, "scheduler", None)
             self.rollout_engine = HeterogeneousRolloutEngine.from_config(
@@ -2695,7 +2593,6 @@ class AsyncRLTrainer:
         executor = getattr(self, "runtime_elastic_executor", None)
         if executor is not None:
             executor.rollout_engine = self.rollout_engine
-        self._reset_rollout_pipeline_after_reconfigure()
         if self.is_main_process:
             instances = getattr(self.config.heterogeneous_rollout, "instances", [])
             default_host = (
@@ -2714,31 +2611,37 @@ class AsyncRLTrainer:
                 f"reason={reason} endpoints={endpoints}"
             )
 
-    def _apply_runtime_reconfiguration_state(self, state: dict[str, Any]) -> None:
+    def _apply_runtime_reconfiguration_state(self, state: dict[str, Any], *, rebind: bool = True) -> None:
         self._apply_training_reconfiguration_state(state.get("training") or {})
         from RL_Framework.infra.elastic.rollout_lifecycle import apply_availability
-        unavailable = state.get("unavailable_rollout_ids", [])
+        self._restored_rollouts_pending_publication = set(state.get("restored_rollout_ids", ()))
+        unavailable = state.get("unavailable_rollout_ids", ())
         apply_availability(self, unavailable)
         instances = state.get("instances") or []
         if not instances:
             return
         hetero = self.config.heterogeneous_rollout
-        hetero.instances = [
+        desired = [
             HeterogeneousInstanceConfig(
                 instance_id=str(inst.get("instance_id", f"runtime_{idx}")),
-                tp=int(inst.get("tp", 1)),
-                gpus=[int(gpu) for gpu in inst.get("gpus", [])],
+                tp=int(inst.get("tp", 1)), gpus=[int(gpu) for gpu in inst.get("gpus", [])],
                 host=str(inst.get("host") or hetero.vllm_host),
                 port=int(inst.get("port") or (hetero.vllm_base_port + idx)),
                 description="runtime_reconfiguration_peer_apply",
-            )
-            for idx, inst in enumerate(instances)
+            ) for idx, inst in enumerate(instances)
         ]
-        if (not unavailable and
-            self.rollout_engine is not None
-            and hasattr(self.rollout_engine, "reconfigure_from_plan")
+        previous = hetero.instances
+        same_layout = len(previous) == len(desired) and all(
+            (old.instance_id, old.tp, old.gpus, old.host, old.port)
+            == (new.instance_id, new.tp, new.gpus, new.host, new.port)
+            for old, new in zip(previous, desired)
+        )
+        hetero.instances = desired
+        if rebind and not unavailable and (
+            not same_layout
+            or self._runtime_reconfiguration_endpoint_keys(state) != self._rollout_engine_endpoint_keys()
         ):
-            self._rebind_rollout_engine_from_config(reason="runtime_state_apply")
+            self._rebind_rollout_engine_from_config(reason="runtime_topology_change")
 
     def _apply_training_reconfiguration_state(self, state: dict[str, Any]) -> None:
         if not state or not bool(state.get("enabled", False)):
@@ -2825,9 +2728,9 @@ class AsyncRLTrainer:
         return active_hybrid_ids
 
     def _initialize_rollout_source_layout(self) -> None:
-        """Register one stable data producer per initialized Core DP replica.
+        """Register stable data producers for the initialized Core DP replicas.
 
-        Keep source identities and admitted groups across rollout client
+        Preserve their samplers and admitted groups across rollout client
         rebindings and elastic Hybrid membership changes.
         """
         source = None
@@ -3090,10 +2993,13 @@ class AsyncRLTrainer:
         if self.global_resource_planner is None:
             return
 
-        self._consume_global_resource_planner_result(stats)
+        if self._consume_global_resource_planner_result(stats, step=step):
+            return
 
         planner_cfg = self.config.global_resource_planner
         runtime_profile_path = self._runtime_length_profile_path()
+        if runtime_profile_path:
+            self.global_resource_planner.observe_training_batch(batch)
         if not getattr(planner_cfg, "runtime_async_planning", True):
             profile_records = self._refresh_global_resource_history_from_profile(
                 step=step,
@@ -3112,6 +3018,7 @@ class AsyncRLTrainer:
                 step_stats={
                     **self._planner_step_stats(stats),
                     "max_concurrent_rollouts": self.config.max_concurrent_rollouts,
+                    "remaining_updates": max(0, int(self.config.total_steps) - step - 1),
                     **(
                         self.runtime_elastic_executor.hybrid_runtime_state()
                         if self.runtime_elastic_executor is not None
@@ -3148,6 +3055,7 @@ class AsyncRLTrainer:
             step_stats={
                 **self._planner_step_stats(stats),
                 "max_concurrent_rollouts": self.config.max_concurrent_rollouts,
+                "remaining_updates": max(0, int(self.config.total_steps) - step - 1),
                 **(
                     self.runtime_elastic_executor.hybrid_runtime_state()
                     if self.runtime_elastic_executor is not None
@@ -3230,11 +3138,11 @@ class AsyncRLTrainer:
         }
         return {key: value for key, value in stats.items() if key not in excluded}
 
-    def _consume_global_resource_planner_result(self, stats: dict):
+    def _consume_global_resource_planner_result(self, stats: dict, *, step=None):
         if self._grp_future is None or not self._grp_future.done():
             return
 
-        step = self._grp_future_step if self._grp_future_step is not None else -1
+        step = self.global_step if step is None else step
         future = self._grp_future
         self._grp_future = None
         self._grp_future_step = None
@@ -3252,10 +3160,36 @@ class AsyncRLTrainer:
 
         try:
             self._apply_global_resource_planner_decision(step, decision, stats)
+            self._runtime_decision_applied = True
+            return True
         finally:
             self._clear_runtime_reconfiguration_pending()
 
     def _apply_global_resource_planner_decision(self, step: int, decision, stats: dict):
+        planner = self.global_resource_planner
+        recheck = getattr(planner, "recheck_elastic_signal", None)
+        member_only = getattr(decision, "resource_should_reconfigure", None) is False
+        elastic_planning = (getattr(planner, "elastic_hybrid_planning_enabled", False)
+                            or getattr(decision, "elastic_hybrid_signal", None) is not None)
+        if member_only and elastic_planning and callable(recheck):
+            metrics = planner.observe_runtime(
+                step=step,
+                dispatcher_metrics=self.dispatcher.get_runtime_metrics() if self.dispatcher is not None else {},
+                step_stats={
+                    **self._planner_step_stats(stats),
+                    "max_concurrent_rollouts": self.config.max_concurrent_rollouts,
+                    "remaining_updates": max(0, int(self.config.total_steps) - step - 1),
+                    **(self.runtime_elastic_executor.hybrid_runtime_state()
+                       if self.runtime_elastic_executor is not None else {}),
+                },
+            )
+            signal = recheck(step=step, config=self.config, runtime_metrics=metrics, decision=decision)
+            decision.step = step
+            decision.runtime_metrics = metrics
+            decision.elastic_hybrid_signal = signal
+            decision.candidate_plan = decision.current_plan
+            decision.should_reconfigure = bool(signal is not None and signal.should_adjust)
+            decision.reason = signal.reason if signal is not None else "no_elastic_estimate"
         stats["global_resource_planner"] = decision.to_dict()
 
         requested_reconfiguration = bool(
@@ -3285,6 +3219,7 @@ class AsyncRLTrainer:
             prepared = self.runtime_elastic_executor.prepare_transaction(decision)
             pre_reset = bool(
                 prepared.should_execute
+                and prepared.resource_reconfiguration
                 and self._should_pre_reset_rollout_pipeline_for_reconfigure()
             )
             paused_for_reset = False
@@ -3326,9 +3261,8 @@ class AsyncRLTrainer:
                                     )
                                 )
                             )
-                        self._reset_rollout_pipeline_after_reconfigure()
                         print(
-                            "[RuntimeElasticExecutor] rollout pipeline drained and reset "
+                            "[RuntimeElasticExecutor] rollout pipeline drained "
                             "before runtime reconfiguration"
                         )
                     if prepared.drain_required:
@@ -3345,25 +3279,13 @@ class AsyncRLTrainer:
                 stats["global_resource_planner_runtime"] = result.to_dict()
                 self._record_runtime_reconfiguration_event(step, decision, result)
                 if result.applied:
-                    planner_cfg = self.config.global_resource_planner
-                    rollout_runtime_enabled = bool(
-                        getattr(planner_cfg, "apply_to_runtime", True)
-                        or getattr(
-                            planner_cfg,
-                            "runtime_manage_rollout_processes",
-                            False,
-                        )
-                    )
-                    if rollout_runtime_enabled and not getattr(self, "_rollout_unavailable_ids", ()):
+                    # The attached executor's collective topology publish has
+                    # already installed the weights and rebuilt these clients.
+                    if (prepared.resource_reconfiguration and prepared.rollout_runtime_enabled
+                            and getattr(self.runtime_elastic_executor, "trainer", None) is not self
+                            and not getattr(self, "_rollout_unavailable_ids", ())):
                         self._rebind_rollout_engine_from_config(
                             reason="after_runtime_reconfiguration"
-                        )
-                        if not pre_reset:
-                            self._reset_rollout_pipeline_after_reconfigure()
-                    else:
-                        print(
-                            "[RuntimeElasticExecutor] preserved externally managed "
-                            "rollout endpoints after training-pool reconfiguration"
                         )
                     print(
                         "[RuntimeElasticExecutor] applied actions="
@@ -3383,16 +3305,6 @@ class AsyncRLTrainer:
             self._resource_config_snapshot = HistoryDataCollector.snapshot_resource_config(
                 self.config
             )
-
-    def _reset_rollout_pipeline_after_reconfigure(self) -> None:
-        """Preserve admitted work when a client or compute topology is rebound.
-
-        Pending input tasks resolve the rollout client at execution time. Existing
-        result queues and partially assembled complete groups contain valid
-        sampled trajectories, so clearing them would silently drop work and
-        restart the logical input stream unevenly between configurations.
-        """
-        return
 
     def _pause_rollout_pipeline(self) -> None:
         if self.dispatcher is not None and hasattr(self.dispatcher, "pause"):
@@ -3522,6 +3434,32 @@ class AsyncRLTrainer:
                 self._resource_config_snapshot.train_dp,
             )
 
+    @staticmethod
+    def _history_sequence_records(batch: list) -> list[dict[str, Any]]:
+        sequence_records = []
+        for traj in batch:
+            if isinstance(traj, dict):
+                pl = traj.get("input_len", 0)
+                gl = traj.get("output_len", 0)
+                if pl > 0 or gl > 0:
+                    record = {
+                        "input_len": int(pl),
+                        "output_len": int(gl),
+                        "sequence_length": int(traj["input_ids"].shape[-1]),
+                    }
+                    for key in (
+                        "n_turns",
+                        "prompt_id",
+                        "tool_returns",
+                        "cmlfq_request_id",
+                    ):
+                        if key in traj:
+                            record[key] = traj[key]
+                    if "total_output_tokens" in traj:
+                        record["total_output_tokens"] = int(traj["total_output_tokens"])
+                    sequence_records.append(record)
+        return sequence_records
+
     def _record_history_step(
         self,
         step: int,
@@ -3533,35 +3471,19 @@ class AsyncRLTrainer:
         advantage_time: float,
         recompute_time: float,
         step_total_time: float,
+        *,
+        profiled_sequences: list[dict[str, Any]] | None = None,
+        resource_config: ResourceConfig | None = None,
     ):
         """Record history step."""
         if self.history_collector is None:
             return
-
-
-        sequence_pairs = []
-        sequence_records = []
-        for traj in batch:
-            if isinstance(traj, dict):
-                pl = traj.get("input_len", 0)
-                gl = traj.get("output_len", 0)
-                if pl > 0 or gl > 0:
-                    sequence_pairs.append((int(pl), int(gl)))
-                    record = {
-                        "input_len": int(pl),
-                        "output_len": int(gl),
-                    }
-                    for key in (
-                        "prompt_id",
-                        "total_output_tokens",
-                        "tool_returns",
-                        "cmlfq_request_id",
-                    ):
-                        if key in traj:
-                            record[key] = traj[key]
-                    sequence_records.append(record)
-
-
+        write_length_profile = profiled_sequences is None
+        if write_length_profile:
+            sequence_records = AsyncRLTrainer._history_sequence_records(batch)
+            resource_config = self._resource_config_snapshot
+        else:
+            sequence_records = profiled_sequences
         sm_stats = self.staleness_manager.get_stats() if self.staleness_manager else None
         control_plane = {}
         for key in (
@@ -3574,7 +3496,6 @@ class AsyncRLTrainer:
 
         self.history_collector.record_step(
             step=step,
-            sequence_pairs=sequence_pairs,
             sequence_records=sequence_records,
             rollout_time=rollout_time,
             train_time=train_time,
@@ -3587,6 +3508,7 @@ class AsyncRLTrainer:
             pipeline_accepted=getattr(sm_stats, "accepted", 0) if sm_stats else 0,
             pipeline_rejected=getattr(sm_stats, "rejected", 0) if sm_stats else 0,
             model_version=stats.get("version", 0),
-            resource_config=self._resource_config_snapshot,
+            resource_config=resource_config,
             control_plane=control_plane,
+            write_length_profile=write_length_profile,
         )

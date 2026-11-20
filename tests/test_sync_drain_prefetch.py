@@ -17,17 +17,13 @@ class _VersionProvider:
         return 0
 
 
-@pytest.mark.parametrize(
-    "objective, dynamic, expected",
-    [("legacy", False, False), ("decoupled", False, True), ("decoupled", True, False)],
-)
-def test_sync1_r2e_requires_exact_sampling_and_fixed_runtime_layout(objective, dynamic, expected):
+@pytest.mark.parametrize("objective, expected", [("legacy", False), ("decoupled", True)])
+def test_sync1_r2e_requires_exact_sampling_to_enable_reservations(objective, expected):
     trainer = AsyncRLTrainer.__new__(AsyncRLTrainer)
     trainer.config = SimpleNamespace(
         grpo_objective=objective, train_backend="megatron_core", rollout_backend="vllm",
         sync_interval=1, ppo_epochs=1, weight_sync_mode="nccl",
         rollout_weight_sync_mode="nccl", require_rollout_weight_sync=True,
-        global_resource_planner=SimpleNamespace(enabled=True, runtime_dynamic_reconfiguration_enabled=dynamic),
     )
     trainer.start_step = 0
     trainer.train_engine = SimpleNamespace(optimizer_revision=0, get_version=lambda: 0)
@@ -155,7 +151,6 @@ def test_legacy_collector_keeps_training_without_sample_revision_between_publica
         global_resource_planner=SimpleNamespace(runtime_batch_collection_timeout_s=4),
     )
     trainer.is_main_process = True
-    trainer._use_heterogeneous = False
     trainer._pending_grpo_groups = {}
     trainer.train_engine = _VersionProvider()
     trainer.rollout_engine = object()

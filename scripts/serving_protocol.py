@@ -19,6 +19,7 @@ class ServingState:
         self.optimizer_revision = 0
         self.workers = []
         self.active_requests = 0
+        self.kv_leases = set()
         self.closed = False
         self.failed = None
         self.condition = asyncio.Condition()
@@ -27,13 +28,28 @@ class ServingState:
         return dict(server_instance_id=self.server_instance_id, server_generation=self.server_generation,
             snapshot_id=self.snapshot_id, optimizer_revision=self.optimizer_revision,
             tp_size=self.tp_size, workers=self.workers, active_requests=self.active_requests,
-            closed=self.closed, failed=self.failed,
+            kv_leases=len(self.kv_leases), closed=self.closed, failed=self.failed,
             server_generation_verified=self.failed is None and not self.closed,
             server_monotonic=time.monotonic())
 
-    async def enter(self):
+    async def acquire_kv_lease(self, lease_id=None):
         async with self.condition:
-            await self.condition.wait_for(lambda: not self.closed or self.failed)
+            if self.closed or self.failed:
+                raise RuntimeError('Rollout service is unavailable for a new KV lease')
+            lease_id = lease_id or uuid.uuid4().hex
+            self.kv_leases.add(lease_id)
+            return dict(self.status(), lease_id=lease_id)
+
+    async def release_kv_lease(self, lease_id):
+        async with self.condition:
+            self.kv_leases.discard(lease_id)
+            self.condition.notify_all()
+
+    async def enter(self, lease_id=None):
+        async with self.condition:
+            if lease_id is not None and lease_id not in self.kv_leases:
+                raise RuntimeError('Unknown or expired KV lease')
+            await self.condition.wait_for(lambda: not self.closed or lease_id in self.kv_leases or self.failed)
             if self.failed:
                 raise RuntimeError('Rollout service is quarantined: ' + self.failed)
             self.active_requests += 1
@@ -51,7 +67,7 @@ class ServingState:
             if self.closed or self.failed:
                 raise RuntimeError('Rollout service is unavailable for reload')
             self.closed = True
-            wait = self.condition.wait_for(lambda: self.active_requests == 0)
+            wait = self.condition.wait_for(lambda: self.active_requests == 0 and not self.kv_leases)
             try:
                 if timeout > 0:
                     await asyncio.wait_for(wait, timeout)
@@ -126,8 +142,9 @@ class GenerationMiddleware:
             return await self.app(scope, receive, send)
         headers = dict(scope.get('headers', []))
         request_id = headers.get(b'x-libra-request-id', uuid.uuid4().hex.encode()).decode()
+        lease = headers.get(b'x-libra-kv-lease')
         try:
-            generation = await self.state.enter()
+            generation = await self.state.enter(lease.decode() if lease else None)
         except RuntimeError as exc:
             body = json.dumps(dict(detail=str(exc))).encode()
             await send(dict(type='http.response.start', status=409, headers=[(b'content-type', b'application/json')]))

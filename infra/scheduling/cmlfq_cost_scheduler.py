@@ -40,6 +40,7 @@ class CMLFQCostScheduler(CMLFQScheduler):
         super().__init__(*args, **kwargs)
         self.name = "C-MLFQ-Cost"
         self._lock = threading.RLock()
+        self._generation_condition = threading.Condition(self._lock)
         tps = [cfg.get("tp_degrees", []) for cfg in self._buckets.values()]
         if any(len(tp) != 1 for tp in tps) or len({tp[0] for tp in tps}) != len(tps):
             raise ValueError("cmlfq_cost requires one distinct TP degree per bucket")
@@ -55,6 +56,46 @@ class CMLFQCostScheduler(CMLFQScheduler):
         self._input_lengths: dict[str, int] = {}
         self._pending_cost_routes: set[str] = set()
         self._reservations: dict[str, CostRoutingDecision] = {}
+
+    def set_instances_available(self, indices, available):
+        """Change route admission under the generation-reservation lock."""
+        with self._lock:
+            for index in indices:
+                self.get_instance_handle(index).is_ready = bool(available)
+            self._generation_condition.notify_all()
+
+    def withdraw_instances(self, indices):
+        self.set_instances_available(indices, False)
+
+    def generation_reservation_counts(self):
+        """Current generate ownership, including requests not yet in HTTP."""
+        with self._lock:
+            counts = {handle.instance_id: 0 for handle in self._instances}
+            for reservation in self._reservations.values():
+                indices = {reservation.target_instance_index}
+                if reservation.execution_path == "transfer":
+                    indices.add(reservation.source_instance_index)
+                for index in indices:
+                    counts[self.get_instance_handle(index).instance_id] += 1
+            return counts
+
+    def wait_for_generations(self, indices, timeout=None):
+        """Wait for reservations already assigned to the withdrawn services.
+
+        This includes a reservation before its HTTP request starts. Complete
+        traces and tool waits have no reservation and do not delay lending.
+        """
+        indices = set(indices)
+        def drained():
+            return not any(
+                reservation.target_instance_index in indices
+                or (reservation.execution_path == "transfer"
+                    and reservation.source_instance_index in indices)
+                for reservation in self._reservations.values()
+            )
+        with self._generation_condition:
+            if not self._generation_condition.wait_for(drained, timeout):
+                raise TimeoutError("Timed out waiting for target generate reservations")
 
     def configure_runtime(self, topology: list[dict], transfer_supported=None):
         self._topology = {index: dict(cfg) for index, cfg in enumerate(topology)}
@@ -89,7 +130,7 @@ class CMLFQCostScheduler(CMLFQScheduler):
             if target is None and self._enable_fallback:
                 target = self._try_select(rule["fallback_tp_degrees"], counts, eligible=eligible)
             if target is None:
-                if self._instances and not any(handle.is_ready for handle in self._instances):
+                if not any(handle.is_ready for handle in self._instances):
                     raise NoAvailableRolloutError("all rollout services are withdrawn")
                 self._stats.failed_routes += 1
                 return SchedulingResult(-1, 0, bucket, False, "no_available_instance")
@@ -274,12 +315,14 @@ class CMLFQCostScheduler(CMLFQScheduler):
                 self._migration_count += 1
                 self._stats.migrated_routes += 1
             self._pending_cost_routes.discard(request_id)
+            self._generation_condition.notify_all()
 
     def rollback_generation(self, request_id: str):
         with self._lock:
             reservation = self._reservations.pop(request_id, None)
             if reservation is not None and reservation.should_migrate:
                 self._decrement_active(self.get_instance_handle(reservation.target_instance_index))
+            self._generation_condition.notify_all()
 
     def cancel_request(self, request_id: str):
         with self._lock:

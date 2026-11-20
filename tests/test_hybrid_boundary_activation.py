@@ -195,3 +195,31 @@ def test_worker_installation_ack_still_has_its_existing_deadline(
             replica_world_size=1, snapshot_path=str(manifest), target_core_id="dp0",
             **({"timeout_s": 180} if cold else {}))
     assert clock.now == seconds
+
+
+def test_planner_sees_the_number_of_ready_replicas_among_pending_joins():
+    config = AsyncRLConfig(model_path='/not-loaded', train_gpus=2, rollout_gpus=4,
+        n_total_gpus=6, train_tp_size=2, train_dp_size=1)
+    runtime = RuntimeElasticExecutor(config=config, planner=NS())
+    runtime._pending_hybrid_joins = {
+        'ready-one':NS(done=lambda:False), 'still-loading':NS(done=lambda:False)}
+    runtime._pending_activations = {'ready-one':{}}
+    state = runtime.hybrid_runtime_state()
+    assert state['pending_hybrid_replica_joins'] == 2
+    assert state['activation_ready_replicas'] == 1
+
+
+def test_runtime_exposes_current_generates_separately_from_trace_load():
+    from RL_Framework.infra.scheduling.cmlfq_cost_scheduler import CMLFQCostScheduler
+
+    scheduler = CMLFQCostScheduler()
+    scheduler.register_instance(0, 'a', 1)
+    scheduler.register_instance(1, 'b', 1)
+    generating = scheduler.schedule(100, 'p').request_id
+    scheduler.schedule(100, 'tool-wait')
+    scheduler.reserve_generation(generating)
+    config = AsyncRLConfig(model_path='/not-loaded', train_gpus=2, rollout_gpus=2,
+        n_total_gpus=4, train_tp_size=2, train_dp_size=1)
+    executor = RuntimeElasticExecutor(config=config, planner=NS(), rollout_engine=NS(scheduler=scheduler))
+
+    assert executor.hybrid_runtime_state()['generate_reservations_by_instance'] == {'a': 1, 'b': 0}

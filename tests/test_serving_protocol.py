@@ -292,28 +292,6 @@ def test_real_http_partial_tp_failure_quarantines_service(monkeypatch):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('expected_service', [None, 'retired-service'])
-def test_nccl_session_rejects_missing_or_stale_uuid_before_drain_and_rpc(monkeypatch, expected_service):
-    import httpx
-    app = load_serving_app(monkeypatch, tp=1)
-    state = app.state.serving_state
-
-    async def unexpected(*args, **kwargs):
-        pytest.fail('Rejected service identity must not drain or enter a worker RPC')
-
-    monkeypatch.setattr(state, 'begin_reload', unexpected)
-    app.state.client.collective_rpc = unexpected
-
-    async def run():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://service') as client:
-            response = await client.post('/reload_weights_nccl', json=dict(host='train', port=29620,
-                world_size=2, rank_offset=0, session_id='new-members',
-                expected_service_instance_id=expected_service))
-            assert response.status_code == 409
-        assert state.server_generation == 0 and state.failed is None and not state.closed
-
-    asyncio.run(run())
-
 @pytest.mark.parametrize('session_id', ['', 'run-global-new-members'])
 @pytest.mark.parametrize('tensor_count', [None, 3])
 def test_nccl_session_wire_from_request_file_through_http_rpc_and_worker_spec(
@@ -409,6 +387,56 @@ def test_nccl_session_wire_from_request_file_through_http_rpc_and_worker_spec(
     state = app.state.serving_state.status()
     assert state['server_generation_verified'] and state['optimizer_revision'] == 2
     assert state['server_generation'] == 1 and not state['closed']
+
+
+def test_reload_drains_inflight_requests_and_reserved_dispatch_before_install():
+    async def run():
+        state = ServingState(2)
+        lease = await state.acquire_kv_lease()
+        assert await state.enter() == 0
+        installing = asyncio.create_task(state.begin_reload(0))
+        await asyncio.sleep(0)
+        assert state.closed and not installing.done()
+        with pytest.raises(RuntimeError):
+            await state.acquire_kv_lease()
+        waiting = asyncio.create_task(state.enter())
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        assert await state.enter(lease['lease_id']) == 0  # A previously reserved request progresses.
+        await state.leave()
+        await state.leave()
+        assert not installing.done()
+        await state.release_kv_lease(lease['lease_id'])
+        await installing
+        state.install(snapshot_id='new', optimizer_revision=1, workers=workers(2))
+        await state.reopen()
+        assert await waiting == 1
+        await state.leave()
+        assert state.active_requests == 0
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('expected_service', [None, 'retired-service'])
+def test_nccl_session_rejects_missing_or_stale_uuid_before_drain_and_rpc(monkeypatch, expected_service):
+    import httpx
+    app = load_serving_app(monkeypatch, tp=1)
+    state = app.state.serving_state
+
+    async def unexpected(*args, **kwargs):
+        pytest.fail('Rejected service identity must not drain or enter a worker RPC')
+
+    monkeypatch.setattr(state, 'begin_reload', unexpected)
+    app.state.client.collective_rpc = unexpected
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://service') as client:
+            response = await client.post('/reload_weights_nccl', json=dict(host='train', port=29620,
+                world_size=2, rank_offset=0, session_id='new-members',
+                expected_service_instance_id=expected_service))
+            assert response.status_code == 409
+        assert state.server_generation == 0 and state.failed is None and not state.closed
+
+    asyncio.run(run())
 
 
 def test_http_capture_is_opt_in_and_prepares_each_tp_worker_once(monkeypatch):

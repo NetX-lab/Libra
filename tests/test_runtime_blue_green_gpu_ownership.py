@@ -15,7 +15,7 @@ def process(name, gpus, port, *, host='node-a', pid=11):
 class Executor(RuntimeElasticExecutor):
     def __init__(self, current, desired, *, fail_stop=None):
         config = NS(global_resource_planner=NS(runtime_drain_before_reconfigure=True),
-            heterogeneous_rollout=NS(vllm_base_port=8000, instances=[
+            heterogeneous_rollout=NS(enabled=True, vllm_base_port=8000, instances=[
                 NS(instance_id=meta.instance_id, port=meta.port) for meta in desired]))
         super().__init__(config=config, planner=None)
         self.desired = desired
@@ -90,6 +90,8 @@ def test_split_releases_tp2_once_before_either_tp1_starts():
 
 
 def test_1911493_tp2_split_keeps_distinct_publication_endpoints_and_survivors():
+    from RL_Framework.infra.sync.publication_session import publication_targets
+
     survivors = [process('grp_tp2_0', [2, 3], 8000, host='node-a'),
                  process('grp_tp2_1', [0, 1], 8001, host='node-b')]
     old = process('grp_tp2_2', [2, 3], 8002, host='node-b')
@@ -103,8 +105,7 @@ def test_1911493_tp2_split_keeps_distinct_publication_endpoints_and_survivors():
 
     stopped, started = executor._blue_green_reconfigure_rollout_processes(None)
 
-    targets = [dict(instance_id=instance.instance_id, endpoint=f'{instance.host}:{instance.port}',
-                    tp_size=instance.tp) for instance in executor.config.heterogeneous_rollout.instances]
+    targets = publication_targets(executor.config)
     assert len(targets) == 4
     assert len({meta.port for meta in started}) == 2
     assert {meta.port for meta in started}.isdisjoint({8000, 8001, 8002})
