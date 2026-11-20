@@ -15,7 +15,6 @@ if _PROJECT_ROOT not in sys.path:
 
 import torch
 import torch.distributed as dist
-from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from RL_Framework import AsyncRLTrainer, parse_args_and_load_config
@@ -40,8 +39,13 @@ def _normalize_modified_files(value):
     return parsed if isinstance(parsed, list) else [str(parsed)]
 
 
-def main():
-    config = parse_args_and_load_config()
+def main(*, config=None, data_path=None, trainer_factory=AsyncRLTrainer, workflow_env=None):
+    from datasets import load_dataset
+
+    if config is None:
+        config = parse_args_and_load_config()
+    if workflow_env is None:
+        workflow_env = os.environ
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if (
@@ -71,7 +75,7 @@ def main():
     rank = dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", "0"))
     is_main_process = rank == 0
 
-    data_path = os.environ.get(
+    data_path = data_path or workflow_env.get(
         "R2E_GYM_INDEX",
         os.path.join(_PROJECT_ROOT, "data", "r2e_gym_v1", "index.jsonl"),
     )
@@ -88,16 +92,16 @@ def main():
         print(f"Scheduler: {config.heterogeneous_rollout.scheduling.scheduler_type}")
 
     dataset = load_dataset("json", data_files=data_path, split="train")
-    patch_mode = os.environ.get("R2E_PATCH_EXECUTION", "0") == "1"
-    patch_backend = os.environ.get("R2E_PATCH_BACKEND", "docker").lower()
+    patch_mode = workflow_env.get("R2E_PATCH_EXECUTION", "0") == "1"
+    patch_backend = workflow_env.get("R2E_PATCH_BACKEND", "docker").lower()
     if patch_mode:
         if patch_backend not in {"docker", "singularity"}:
             raise ValueError("R2E_PATCH_BACKEND must be docker or singularity")
         if shutil.which(patch_backend) is None:
             raise RuntimeError(f"R2E patch mode requires {patch_backend} on this worker")
-        repo_root = os.environ.get("R2E_REPO_ROOT")
-        sif_root = os.environ.get("R2E_SIF_ROOT")
-        test_command_json = os.environ.get("R2E_TEST_COMMAND_JSON")
+        repo_root = workflow_env.get("R2E_REPO_ROOT")
+        sif_root = workflow_env.get("R2E_SIF_ROOT")
+        test_command_json = workflow_env.get("R2E_TEST_COMMAND_JSON")
         if (patch_backend == "docker" and not repo_root) or (patch_backend == "singularity" and not sif_root) or not test_command_json:
             raise ValueError("Patch mode requires R2E_TEST_COMMAND_JSON and the selected backend's repo/image root")
         test_command = json.loads(test_command_json)
@@ -152,26 +156,26 @@ def main():
     workflow = R2EGymWorkflow(
         reward_fn=r2e_gym_reward_fn,
         tokenizer=tokenizer,
-        max_turns=int(os.environ.get("R2E_MAX_TURNS", str(config.r2e_max_turns))),
+        max_turns=int(workflow_env.get("R2E_MAX_TURNS", str(config.r2e_max_turns))),
         max_new_tokens=config.max_new_tokens,
         max_seq_length=config.max_seq_length,
         max_prompt_tokens=(
-            int(os.environ["R2E_MAX_PROMPT_TOKENS"])
-            if os.environ.get("R2E_MAX_PROMPT_TOKENS")
+            int(workflow_env["R2E_MAX_PROMPT_TOKENS"])
+            if workflow_env.get("R2E_MAX_PROMPT_TOKENS")
             else (config.r2e_max_prompt_tokens or None)
         ),
         stop_reward=float(
-            os.environ.get("R2E_STOP_REWARD", str(config.r2e_stop_reward))
+            workflow_env.get("R2E_STOP_REWARD", str(config.r2e_stop_reward))
         ),
         temperature=config.temperature,
         top_p=config.top_p,
         n_samples=config.n_samples,
         patch_harness=(R2ESingularityPatchHarness if patch_backend == "singularity" else R2EPatchExecutionHarness)(
-            timeout=int(os.environ.get("R2E_PATCH_TIMEOUT", "300"))
+            timeout=int(workflow_env.get("R2E_PATCH_TIMEOUT", "300"))
         ) if patch_mode else None,
     )
 
-    trainer = AsyncRLTrainer(config)
+    trainer = trainer_factory(config)
     trainer.train(workflow=workflow, dataset=dataset)
 
 
