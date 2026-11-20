@@ -1,0 +1,17 @@
+# Official DeepSeek-V4-Flash. Its packed FP4/FP8 checkpoint is loaded into BF16.
+num_params: 285.0e+9
+active_num_params: 13.0e+9
+d_model: 4096
+n_layers: 43
+n_heads: 64
+n_kv_heads: 1
+head_dim: 512
+vocab_size: 129280
+intermediate_size: 2048
+dtype_bytes: 2
+is_moe: true
+num_experts: 256
+num_shared_experts: 1
+num_activated_experts: 6
+expert_intermediate_size: 2048
+shared_expert_intermediate_size: 2048

@@ -35,6 +35,9 @@ from RL_Framework.infra.elastic import (
 class MegatronCoreTrainEngine:
     """MCore TP/EP/DDP backend with streaming HF interoperability."""
 
+    supports_pipeline_parallelism = False
+    dependency_guide = "requirements-megatron.txt"
+
     def __init__(
         self,
         *,
@@ -171,7 +174,7 @@ class MegatronCoreTrainEngine:
             raise ValueError(
                 "optimizer_offload_fraction requires optimizer_cpu_offload=True"
             )
-        if self.train_pp_size != 1:
+        if self.train_pp_size != 1 and not self.supports_pipeline_parallelism:
             raise ValueError(
                 "MegatronCoreTrainEngine currently supports PP=1; use TP/EP/DP "
                 "for Qwen3-30B-A3B"
@@ -184,17 +187,19 @@ class MegatronCoreTrainEngine:
             from megatron.bridge import AutoBridge
             from megatron.core.distributed import DistributedDataParallelConfig
             from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-            from RL_Framework.engine.megatron_core_attention import (
-                apply_megatron_core_014_compatibility,
-                torch_sdpa_layer_spec,
-            )
+            if not self.supports_pipeline_parallelism:
+                from RL_Framework.engine.megatron_core_attention import (
+                    apply_megatron_core_014_compatibility,
+                )
+            if not self.use_transformer_engine:
+                from RL_Framework.engine.megatron_core_attention import torch_sdpa_layer_spec
         except ImportError as exc:
             raise RuntimeError(
-                "Megatron-Core dependencies are unavailable. Install the pinned "
-                "packages from requirements-megatron.txt."
+                f"Megatron-Core dependencies are unavailable. See {self.dependency_guide}."
             ) from exc
         init_phase("imports_complete")
-        apply_megatron_core_014_compatibility()
+        if not self.supports_pipeline_parallelism:
+            apply_megatron_core_014_compatibility()
 
         init_phase("tokenizer_load_start")
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -206,10 +211,7 @@ class MegatronCoreTrainEngine:
         init_phase("tokenizer_load_complete")
 
         init_phase("bridge_load_start")
-        self.bridge = AutoBridge.from_hf_pretrained(
-            self.model_path,
-            trust_remote_code=True,
-        )
+        self.bridge = self._load_bridge(AutoBridge)
         init_phase("bridge_load_complete")
         init_phase("provider_build_start")
         self.provider = self.bridge.to_megatron_provider(load_weights=True)
@@ -306,6 +308,9 @@ class MegatronCoreTrainEngine:
                 f"{self.optimizer_offload_fraction if initialize_optimizer else 0.0}",
                 flush=True,
             )
+
+    def _load_bridge(self, auto_bridge):
+        return auto_bridge.from_hf_pretrained(self.model_path, trust_remote_code=True)
 
     def _configure_provider(self, max_seq_length: int) -> None:
         provider = self.provider

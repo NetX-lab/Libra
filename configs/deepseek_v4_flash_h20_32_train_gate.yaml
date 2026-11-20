@@ -1,0 +1,32 @@
+model_path: deepseek-ai/DeepSeek-V4-Flash
+hardware_config: hardware_config/h20_3e_141g.yaml
+model_arch_config: model_arch_config/deepseek-v4-flash.yaml
+train_backend: megatron_core
+megatron_model_family: deepseek_v4
+train_gpus: 32
+rollout_gpus: 0
+train_tp_size: 1
+train_pp_size: 4
+train_cp_size: 1
+train_ep_size: 8
+expert_tensor_parallel_size: 1
+sequence_parallel: false
+megatron_use_transformer_engine: true
+use_distributed_optimizer: true
+megatron_use_precision_aware_optimizer: true
+megatron_optimizer_cpu_offload: true
+megatron_optimizer_offload_fraction: 1.0
+megatron_optimizer_pin_cpu_params: false
+megatron_optimizer_pin_cpu_grads: false
+megatron_streaming_export: false
+global_resource_planner:
+  enabled: false
+rollout_weight_sync_mode: none
+sync_interval: 0
+batch_size: 16
+n_samples: 2
+micro_batch_size: 1
+recompute_micro_batch_size: 1
+max_seq_length: 1024
+learning_rate: 0.001  # Smoke-test update, chosen to observe changes in BF16 weights.
+total_steps: 1

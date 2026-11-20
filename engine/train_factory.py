@@ -40,7 +40,12 @@ def create_train_engine(config: AsyncRLConfig) -> TrainEngine:
         )
 
     if backend == "megatron_core":
-        return MegatronCoreTrainEngine(
+        engine_type = MegatronCoreTrainEngine
+        if getattr(config, "megatron_model_family", "default") == "deepseek_v4":
+            from RL_Framework.engine.deepseek_v4_train_engine import DeepSeekV4TrainEngine
+
+            engine_type = DeepSeekV4TrainEngine
+        return engine_type(
             model_path=config.model_path,
             grpo_objective=getattr(config, "grpo_objective", "legacy"),
             learning_rate=config.learning_rate,

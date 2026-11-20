@@ -713,6 +713,7 @@ class AsyncRLConfig:
     virtual_pipeline_model_parallel_size: int = 0
     sequence_parallel: bool = True
     use_distributed_optimizer: bool = True
+    megatron_model_family: str = "default"  # default | deepseek_v4
     megatron_grad_reduce_in_fp32: bool = False
     megatron_use_precision_aware_optimizer: bool = False
     megatron_optimizer_cpu_offload: bool = False
@@ -836,6 +837,28 @@ class AsyncRLConfig:
         default_factory=GlobalResourcePlannerConfig
     )
 
+    def _validate_deepseek_v4_training(self) -> None:
+        if self.train_backend != "megatron_core" or not self.megatron_use_transformer_engine:
+            raise ValueError("DeepSeek V4 requires Megatron-Core with Transformer Engine")
+        if (self.train_tp_size, self.train_cp_size, self.expert_tensor_parallel_size) != (1, 1, 1):
+            raise ValueError("The CUDA DeepSeek V4 provider requires TP=CP=ETP=1")
+        if self.train_pp_size < 2:
+            raise ValueError("The CUDA DeepSeek V4 training path requires PP >= 2")
+        if self.train_dp_size < 1 or self.n_samples < 1:
+            raise ValueError("DeepSeek V4 requires positive DP size and GRPO group size")
+        if self.batch_size % (self.train_dp_size * self.n_samples):
+            raise ValueError("DeepSeek V4 requires an equal number of complete GRPO groups per DP rank")
+        local_batch = self.batch_size // self.train_dp_size
+        if self.recompute_micro_batch_size < 1 or local_batch % self.recompute_micro_batch_size:
+            raise ValueError("DeepSeek V4 requires complete recompute microbatches")
+        if self.rollout_weight_sync_mode != "none" or self.require_rollout_weight_sync:
+            raise ValueError("DeepSeek V4 rollout weight publication has not been validated")
+        if self.megatron_streaming_export:
+            raise ValueError("Set megatron_streaming_export=false for DeepSeek V4 training checkpoints")
+        planner = self.global_resource_planner
+        if planner.enabled:
+            raise ValueError("DeepSeek V4 requires a static training topology until GRP/EHP validation")
+
     def __post_init__(self):
         """Post init."""
         if not self.tokenizer_path:
@@ -861,6 +884,10 @@ class AsyncRLConfig:
                     f"train_gpus={self.train_gpus}, model_parallel={denom}"
                 )
             self.train_dp_size = self.train_gpus // denom
+        if self.megatron_model_family not in {"default", "deepseek_v4"}:
+            raise ValueError("Unknown megatron_model_family")
+        if self.megatron_model_family == "deepseek_v4":
+            self._validate_deepseek_v4_training()
         if self.train_backend not in ["fsdp", "megatron3d", "megatron_core"]:
             raise ValueError(
                 "train_backend must be 'fsdp', 'megatron3d', or 'megatron_core'"
@@ -949,7 +976,7 @@ class AsyncRLConfig:
                     "megatron_optimizer_offload_fraction requires "
                     "megatron_optimizer_cpu_offload=true"
                 )
-            if self.train_pp_size != 1:
+            if self.train_pp_size != 1 and self.megatron_model_family != "deepseek_v4":
                 raise ValueError(
                     "MegatronCoreTrainEngine currently requires train_pp_size=1"
                 )
