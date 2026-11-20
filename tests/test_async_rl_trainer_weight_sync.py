@@ -140,17 +140,21 @@ def test_periodic_publication_preserves_work_and_opens_window_only_after_ack(ins
     trainer._wait_for_all_ranks_before_weight_sync = lambda step: events.append(("ranks", step))
     trainer._restored_rollouts_pending_publication = set()
 
-    def install(*, target_version, reopen_restored):
-        assert not reopen_restored
+    def install(target_version):
         events.append(("install", target_version))
         if install_outcome == "error":
             raise RuntimeError("install failed")
         if install_outcome == "no_targets":
             return None
         events.append(("all_ack", target_version))
-        return {"optimizer_revision": target_version}
+        return {"optimizer_revision": target_version, "acknowledgements": ["rollout"]}
 
-    trainer._sync_weights = install
+    def publish(*, target_version, reopen_restored):
+        assert not reopen_restored
+        return AsyncRLTrainer._sync_weights(trainer, target_version, reopen_restored=reopen_restored)
+
+    trainer._sync_weights_nccl = install
+    trainer._sync_weights = publish
     if install_outcome == "error":
         with pytest.raises(RuntimeError, match="install failed"):
             trainer._periodic_weight_sync(2)

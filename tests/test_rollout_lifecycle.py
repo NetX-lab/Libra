@@ -65,7 +65,7 @@ def trainer(rank, *, ready_groups=2, loan=True, publish_failure=False):
         is_main_process=rank == 0, control=SimpleNamespace(rank=rank),
         runtime_elastic_executor=executor if rank == 0 else None,
         config=SimpleNamespace(
-            n_samples=4, heterogeneous_rollout=SimpleNamespace(instances=instances),
+            n_samples=4, heterogeneous_rollout=SimpleNamespace(enabled=True, instances=instances),
             global_resource_planner=SimpleNamespace(
                 enabled=True, runtime_reconfigure_training=True,
                 hybrid_worker_launch_enabled=True, runtime_training_pool_plan_only=False,
@@ -298,7 +298,7 @@ def test_repartition_publication_uses_new_topology_before_client_reopen():
             {"instance_id": "old-engine-a", "tp_degree": 2},
             {"instance_id": "old-engine-b", "tp_degree": 2},
         ]),
-        config=SimpleNamespace(heterogeneous_rollout=SimpleNamespace(instances=[
+        config=SimpleNamespace(heterogeneous_rollout=SimpleNamespace(enabled=True, instances=[
             SimpleNamespace(instance_id="new-engine", tp=4, host="new", port=8000),
         ])),
     )
@@ -313,7 +313,7 @@ def test_resource_repartition_publishes_current_config_targets(monkeypatch):
     commands = []
     monkeypatch.setattr(core_reconfiguration, "dispatch_core_command", lambda executor, operation, **kwargs:
                         commands.append((operation, kwargs)))
-    state = SimpleNamespace(config=SimpleNamespace(heterogeneous_rollout=SimpleNamespace(instances=[
+    state = SimpleNamespace(config=SimpleNamespace(heterogeneous_rollout=SimpleNamespace(enabled=True, instances=[
         SimpleNamespace(instance_id="new-engine", tp=4, gpus=[0, 1, 2, 3], host="rollout-node", port=8200),
     ])))
     RuntimeElasticExecutor._publish_current_rollout_weights(state)

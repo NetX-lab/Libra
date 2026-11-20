@@ -19,7 +19,7 @@ def publication(tmp_path, monkeypatch):
     members = ('hybrid-b',)
     client = NS(scheduler=NS(_instances=[NS(instance_id=inst.instance_id, is_ready=True)
         for inst in instances]))
-    config = NS(weight_sync_mode='nccl', heterogeneous_rollout=NS(instances=instances),
+    config = NS(weight_sync_mode='nccl', heterogeneous_rollout=NS(enabled=True, instances=instances),
         rollout_weight_sync_control_dir=str(tmp_path), rollout_nccl_host='core',
         rollout_nccl_port=29620, rollout_nccl_chunk_mb=1, rollout_nccl_rate_limit_gbps=0,
         rollout_weight_sync_timeout_s=2, rollout_weight_sync_poll_interval_s=.001,
@@ -191,7 +191,7 @@ def test_publication_rejects_acknowledgement_from_replaced_receiver(publication)
 
 def test_extension_rollback_publishes_only_explicit_receivers():
     trainer = AsyncRLTrainer.__new__(AsyncRLTrainer)
-    trainer.config = NS(heterogeneous_rollout=NS(instances=[
+    trainer.config = NS(heterogeneous_rollout=NS(enabled=True, instances=[
         NS(instance_id='old-loan', host='a', port=8000, tp=1),
         NS(instance_id='returned', host='b', port=8000, tp=2),
         NS(instance_id='still-serving', host='c', port=8000, tp=1)]))

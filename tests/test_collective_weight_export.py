@@ -56,7 +56,7 @@ def _worker(rank, rendezvous, directory):
                     rollout_nccl_port=29620, rollout_nccl_chunk_mb=1,
                     rollout_nccl_rate_limit_gbps=0, rollout_weight_sync_timeout_s=2,
                     rollout_weight_sync_poll_interval_s=0.001,
-                    heterogeneous_rollout=SimpleNamespace(instances=[
+                    heterogeneous_rollout=SimpleNamespace(enabled=True, instances=[
                         SimpleNamespace(instance_id="engine", host="127.0.0.1", port=8000, tp=2),
                     ]),
                 )

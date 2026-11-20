@@ -85,7 +85,7 @@ def test_shared_episode_orders_generation_score_feedback_and_finish(objective, f
                     sampling_parameters={key: kwargs[key] for key in ('seed', 'temperature', 'top_p')})
             return result
 
-        def route_cmlfq_tool_return(self, request_id, event, length):
+        def record_cmlfq_tool_return(self, request_id, event, length):
             events.append(('tool', event['payload_tokens'], length))
 
         def finish_cmlfq_request(self, request_id, length, *, generated_tokens=None):

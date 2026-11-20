@@ -51,6 +51,7 @@ class CMLFQCostScheduler(CMLFQScheduler):
             raise ValueError("bucket thresholds must be positive and distinct")
         self.routing_costs = routing_costs or CMLFQRoutingCosts()
         self._topology: dict[int, dict] = {}
+        self._max_model_len: int | None = None
         self._transfer_supported: Callable[[int, int], bool] = lambda src, dst: False
         self._input_lengths: dict[str, int] = {}
         self._pending_cost_routes: set[str] = set()
@@ -121,10 +122,13 @@ class CMLFQCostScheduler(CMLFQScheduler):
         with self._lock:
             counts = self._get_global_active_counts()
             rule = self._bucket_rules[bucket]
-            target = self._try_select(rule["preferred_tp_degrees"], counts)
+            def eligible(handle):
+                return self._fits(handle, input_tokens)
+
+            target = self._try_select(rule["preferred_tp_degrees"], counts, eligible=eligible)
             fallback = target is None
             if target is None and self._enable_fallback:
-                target = self._try_select(rule["fallback_tp_degrees"], counts)
+                target = self._try_select(rule["fallback_tp_degrees"], counts, eligible=eligible)
             if target is None:
                 if not any(handle.is_ready for handle in self._instances):
                     raise NoAvailableRolloutError("all rollout services are withdrawn")
@@ -168,77 +172,93 @@ class CMLFQCostScheduler(CMLFQScheduler):
                 # generation waits asynchronously for publication to reopen.
                 return CostRoutingDecision(False, "await_available", state.current_bucket)
 
-    def _choose(self, request_id: str, context_tokens: int | None = None) -> CostRoutingDecision:
+    def _fits(self, handle, required_tokens: int) -> bool:
+        if self._max_model_len and required_tokens > self._max_model_len:
+            return False
+        capacity = self.kv_capacity_of(handle)
+        if capacity > 0:
+            return required_tokens <= capacity
+        model = self.routing_costs.rollout_model
+        return model is None or not model.check_oom(required_tokens, handle.tp_degree)
+
+    def _generation_loads(self) -> dict[int, int]:
+        loads = dict.fromkeys((handle.index for handle in self._instances), 0)
+        for reservation in self._reservations.values():
+            loads[reservation.target_instance_index] += 1
+            if reservation.execution_path == "transfer":
+                loads[reservation.source_instance_index] += 1
+        if self._metrics_feed is not None:
+            for handle in self._instances:
+                snapshot = self._metrics_feed.get(handle.instance_id)
+                running = getattr(snapshot, "running", -1)
+                waiting = getattr(snapshot, "waiting", -1)
+                if running >= 0 and waiting >= 0:
+                    # Local reservations may not have reached vLLM yet. Do not
+                    # add them to server counts that may already include them.
+                    loads[handle.index] = max(loads[handle.index], running + waiting)
+        return loads
+
+    def _choose(self, request_id: str, context_tokens: int | None = None,
+                max_new_tokens: int | None = None) -> CostRoutingDecision:
         state = self._request_states[request_id]
         source = self.get_instance_handle(state.current_instance_index)
-        if not any(handle.is_ready for handle in self._instances):
-            raise NoAvailableRolloutError("all rollout services are withdrawn")
         context = (self._input_lengths[request_id] + state.generated_tokens
                    if context_tokens is None else context_tokens)
-        stay = CostRoutingDecision(
-            False, "no_distribution_or_cost", state.current_bucket,
-            target_bucket=state.current_bucket,
-            source_instance_index=source.index, target_instance_index=source.index,
-        )
+        required = context + max(0, max_new_tokens or 0)
+        ready = [handle for handle in self._instances if handle.is_ready]
+        if not ready:
+            raise NoAvailableRolloutError("all rollout services are withdrawn")
+        eligible = [handle for handle in ready if self._fits(handle, required)]
+        if not eligible:
+            raise RuntimeError(f"no ready rollout instance can fit {required} tokens")
+        source_fits = source in eligible
+        loads = self._generation_loads()
         distribution = self.prefix_tree.residual_distribution(
             state.prompt_id, state.collected_return_states, self._bucket_thresholds,
         )
-        if not distribution:
-            if source.is_ready:
-                return stay
-            # Recompute carries the full transcript, so no tree evidence is
-            # needed to continue a trace after its previous service is lent.
-            ready = [handle for handle in self._instances if handle.is_ready]
-            target = min(ready, key=lambda handle: (handle.active_requests, handle.index))
-            return CostRoutingDecision(
-                True, "source_withdrawn", state.current_bucket,
-                target_bucket=self.bucket_for_tp(target.tp_degree),
-                source_instance_index=source.index, target_instance_index=target.index,
-                execution_path="recompute",
-            )
-        global_counts = self._get_global_active_counts()
         choices = []
-        for handle in self._instances:
+        for handle in eligible if distribution else ():
             same = handle.index == source.index
-            if not handle.is_ready:
+            load = loads[handle.index]
+            if source_fits and not same and 0 < self._max_queue_length <= load:
                 continue
-            if source.is_ready and not same and self._max_queue_length > 0 and self._active_count(
-                handle, global_counts
-            ) >= self._max_queue_length:
-                continue
-            other_requests = max(0, self._active_count(handle, global_counts) - int(same))
-            generation = sum(
-                probability * self.routing_costs.completion_seconds(
-                    handle.tp_degree, name, remaining, context, other_requests,
+            decode = sum(
+                probability * self.routing_costs.decode_work_seconds(
+                    handle.tp_degree, name,
+                    remaining if max_new_tokens is None else min(remaining, max_new_tokens),
+                    context, load,
                 ) for name, probability, remaining in distribution
             )
-            prefill = self.routing_costs.prefill_seconds(handle.tp_degree, context)
-            decode = generation - prefill
-            path, movement = "stay", 0.0
-            if not same:
+            path, movement, prefill = "stay", 0.0, 0.0
+            if same:
+                prefill = self.routing_costs.prefill_seconds(handle.tp_degree, context)
+            else:
                 if source.index not in self._topology or handle.index not in self._topology:
                     continue
                 path, movement = self.routing_costs.migration_seconds(
                     self._topology[source.index], self._topology[handle.index], context,
-                    source.is_ready and self._transfer_supported(source.index, handle.index),
+                    source_fits and self._transfer_supported(source.index, handle.index),
                 )
-                # The completion estimate already includes the target's
-                # recompute prefill, for staying and moving alike.
-                movement -= prefill
-            total = generation + movement
-            if not math.isfinite(total) or total < 0:
-                continue
-            # Stable ties prefer staying, then the least-loaded instance.
-            choices.append((total, not same, self._active_count(handle, global_counts),
-                            handle.index, decode, movement, path, prefill))
-        if not choices:
-            if not source.is_ready:
-                raise RuntimeError("no available instance with a finite routing cost")
-            return stay
-        _, _, _, index, decode, movement, path, prefill = min(choices)
+            total = decode + movement + prefill
+            if math.isfinite(total):
+                choices.append((total, not same, load, handle.index, decode, movement, path, prefill))
+        if choices:
+            _, _, _, index, decode, movement, path, prefill = min(choices)
+            reason = "distribution_cost"
+        elif source_fits:
+            index, path, reason = source.index, "stay", "no_distribution_or_cost"
+            decode = movement = prefill = 0.0
+        else:
+            # Recomputing the transcript requires a usable destination, even
+            # when the history or the migration profile cannot price the move.
+            index = min(eligible, key=lambda handle: (loads[handle.index], handle.index)).index
+            path = "recompute"
+            reason = "source_capacity" if source.is_ready else "source_withdrawn"
+            decode = prefill = 0.0
+            movement = self.routing_costs.prefill_seconds(self.get_instance_handle(index).tp_degree, context)
         target = self.get_instance_handle(index)
         return CostRoutingDecision(
-            index != source.index, "distribution_cost", state.current_bucket,
+            index != source.index, reason, state.current_bucket,
             target_bucket=self.bucket_for_tp(target.tp_degree),
             source_instance_index=source.index, target_instance_index=index,
             execution_path=path, decode_seconds=decode, migration_seconds=movement,
@@ -255,14 +275,18 @@ class CMLFQCostScheduler(CMLFQScheduler):
             self._pending_cost_routes.add(request_id)
             return self.get_request_route(request_id)
 
-    def reserve_generation(self, request_id: str, context_tokens: int | None = None):
+    def reserve_generation(self, request_id: str, context_tokens: int | None = None,
+                           max_new_tokens: int | None = None):
         with self._lock:
             if request_id in self._reservations:
                 raise RuntimeError("concurrent generation for the same request")
             state = self._request_states[request_id]
-            if (request_id in self._pending_cost_routes
-                    or not self.get_instance_handle(state.current_instance_index).is_ready):
-                decision = self._choose(request_id, context_tokens)
+            source = self.get_instance_handle(state.current_instance_index)
+            context = (self._input_lengths[request_id] + state.generated_tokens
+                       if context_tokens is None else context_tokens)
+            if (request_id in self._pending_cost_routes or not source.is_ready
+                    or not self._fits(source, context + max(0, max_new_tokens or 0))):
+                decision = self._choose(request_id, context, max_new_tokens)
             else:
                 decision = CostRoutingDecision(
                     False, "resume", state.current_bucket, target_bucket=state.current_bucket,
@@ -321,4 +345,5 @@ class CMLFQCostScheduler(CMLFQScheduler):
         scheduler.routing_costs = CMLFQRoutingCosts(
             getattr(hetero_config.scheduling, "cmlfq_cost_profile_path", "")
         )
+        scheduler._max_model_len = getattr(hetero_config, "max_model_len", None)
         return scheduler
