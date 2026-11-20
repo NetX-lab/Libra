@@ -92,7 +92,7 @@ class CMLFQDynamicKVCostScheduler(CMLFQCostScheduler):
         with self._lock:
             snapshot = self._capture_snapshot()
             self._update_boundary(snapshot)
-            eligible, rejected = self._eligible(snapshot, source_index=None)
+            eligible, rejected = self._eligible(snapshot, source_index=None, required_tokens=input_tokens)
             preferred = [
                 handle for handle in eligible
                 if self.bucket_for_tp(handle.tp_degree) == bucket
@@ -196,7 +196,7 @@ class CMLFQDynamicKVCostScheduler(CMLFQCostScheduler):
             "complete": complete, "epoch": epoch,
         }
 
-    def _eligible(self, snapshot, source_index):
+    def _eligible(self, snapshot, source_index, required_tokens):
         counts = self._get_global_active_counts()
         eligible, rejected = [], []
         for handle in self._instances:
@@ -208,6 +208,8 @@ class CMLFQDynamicKVCostScheduler(CMLFQCostScheduler):
                 self._active_count(handle, counts) >= self._max_queue_length
             ):
                 reasons.append("capacity")
+            if handle.is_ready and not self._fits(handle, required_tokens):
+                reasons.append("token_capacity")
             if handle.is_ready:
                 if not info["fresh"]:
                     reasons.append(info["reason"] or "missing_snapshot")
@@ -225,7 +227,7 @@ class CMLFQDynamicKVCostScheduler(CMLFQCostScheduler):
     @staticmethod
     def _no_healthy_reason(rejected):
         reasons = {reason for row in rejected for reason in row["reasons"]}
-        if "capacity" in reasons:
+        if "capacity" in reasons or "token_capacity" in reasons:
             return "no_fresh_healthy_instance:capacity"
         if "stale_snapshot" in reasons:
             return "no_fresh_healthy_instance:stale_metrics"
@@ -272,23 +274,25 @@ class CMLFQDynamicKVCostScheduler(CMLFQCostScheduler):
         return (self._sorted_bucket_names[0] if mean <= self._dynamic_boundary
                 else self._sorted_bucket_names[-1])
 
-    def _choose(self, request_id: str, context_tokens: int | None = None):
+    def _choose(self, request_id: str, context_tokens: int | None = None,
+                max_new_tokens: int | None = None):
         with self._lock:
             snapshot = self._capture_snapshot()
             self._update_boundary(snapshot)
-            return self._choose_with_snapshot(request_id, context_tokens, snapshot)
+            return self._choose_with_snapshot(request_id, context_tokens, max_new_tokens, snapshot)
 
-    def _choose_with_snapshot(self, request_id, context_tokens, snapshot):
+    def _choose_with_snapshot(self, request_id, context_tokens, max_new_tokens, snapshot):
         state = self._request_states[request_id]
         source = self.get_instance_handle(state.current_instance_index)
         context = (
             self._input_lengths[request_id] + state.generated_tokens
             if context_tokens is None else context_tokens
         )
+        required_tokens = context + max(0, max_new_tokens or 0)
         distribution = self._distribution(request_id)
         remaining_mean = self._remaining_mean(distribution)
         preferred = self._preferred_bucket(remaining_mean)
-        eligible, rejected = self._eligible(snapshot, state.current_instance_index)
+        eligible, rejected = self._eligible(snapshot, state.current_instance_index, required_tokens)
         fallback_reason = ""
         if not distribution:
             fallback_reason = "no_distribution"
@@ -298,7 +302,7 @@ class CMLFQDynamicKVCostScheduler(CMLFQCostScheduler):
             fallback_reason = self._no_healthy_reason(rejected)
         if fallback_reason:
             return self._baseline_fallback(
-                request_id, context_tokens, snapshot, eligible, rejected,
+                request_id, context, max_new_tokens, snapshot, eligible, rejected,
                 preferred, remaining_mean, fallback_reason,
             )
 
@@ -316,7 +320,9 @@ class CMLFQDynamicKVCostScheduler(CMLFQCostScheduler):
             try:
                 decode = float(sum(
                     float(probability) * float(self.routing_costs.decode_seconds(
-                        handle.tp_degree, name, remaining, context,
+                        handle.tp_degree, name,
+                        remaining if max_new_tokens is None else min(remaining, max_new_tokens),
+                        context,
                     ))
                     for name, probability, remaining in distribution
                 ))
@@ -356,7 +362,7 @@ class CMLFQDynamicKVCostScheduler(CMLFQCostScheduler):
 
         if not raw_rows:
             return self._baseline_fallback(
-                request_id, context_tokens, snapshot, eligible, rejected,
+                request_id, context, max_new_tokens, snapshot, eligible, rejected,
                 preferred, remaining_mean, "no_finite_healthy_cost",
                 candidate_costs=candidate_costs,
             )
@@ -383,7 +389,7 @@ class CMLFQDynamicKVCostScheduler(CMLFQCostScheduler):
 
         if not choices:
             return self._baseline_fallback(
-                request_id, context_tokens, snapshot, eligible, rejected,
+                request_id, context, max_new_tokens, snapshot, eligible, rejected,
                 preferred, remaining_mean, "no_finite_healthy_cost",
                 candidate_costs=candidate_costs,
             )
@@ -412,10 +418,10 @@ class CMLFQDynamicKVCostScheduler(CMLFQCostScheduler):
         )
         return decision
 
-    def _baseline_fallback(self, request_id, context_tokens, snapshot, eligible,
+    def _baseline_fallback(self, request_id, context_tokens, max_new_tokens, snapshot, eligible,
                            rejected, preferred, remaining_mean, reason,
                            candidate_costs=None):
-        decision = super()._choose(request_id, context_tokens)
+        decision = super()._choose(request_id, context_tokens, max_new_tokens)
         decision.reason = f"kv_baseline_fallback:{reason}"
         decision.kv_routing = self._routing_metadata(
             snapshot, eligible, rejected, decision.target_instance_index,
@@ -672,25 +678,29 @@ class CMLFQDynamicKVCostScheduler(CMLFQCostScheduler):
         info = snapshot["instances"][handle.instance_id]
         return handle.is_ready and info["fresh"] and info["kv"] < self.KV_LIMIT
 
-    def reserve_generation(self, request_id: str, context_tokens: int | None = None):
+    def reserve_generation(self, request_id: str, context_tokens: int | None = None,
+                           max_new_tokens: int | None = None):
         with self._lock:
             state = self._request_states[request_id]
             snapshot = self._capture_snapshot()
             self._update_boundary(snapshot)
+            source = self.get_instance_handle(state.current_instance_index)
+            context = (self._input_lengths[request_id] + state.generated_tokens
+                       if context_tokens is None else context_tokens)
+            required_tokens = context + max(0, max_new_tokens or 0)
             first_generation = request_id in self._first_generation
             pending = request_id in self._pending_cost_routes
             preserve_initial = (
                 first_generation and not pending
-                and self._is_healthy(
-                    self.get_instance_handle(state.current_instance_index), snapshot,
-                )
+                and self._is_healthy(source, snapshot)
+                and self._fits(source, required_tokens)
             )
             added_pending = False
             if first_generation and not pending and not preserve_initial:
                 self._pending_cost_routes.add(request_id)
                 added_pending = True
             try:
-                decision = super().reserve_generation(request_id, context_tokens)
+                decision = super().reserve_generation(request_id, context, max_new_tokens)
             except Exception:
                 if added_pending:
                     self._pending_cost_routes.discard(request_id)
@@ -698,7 +708,7 @@ class CMLFQDynamicKVCostScheduler(CMLFQCostScheduler):
             if preserve_initial:
                 decision.reason = "initial_route_preserved"
             if not hasattr(decision, "kv_routing"):
-                eligible, rejected = self._eligible(snapshot, state.current_instance_index)
+                eligible, rejected = self._eligible(snapshot, state.current_instance_index, required_tokens)
                 decision.kv_routing = self._routing_metadata(
                     snapshot, eligible, rejected, decision.target_instance_index,
                     candidate_indices=[handle.index for handle in eligible],

@@ -575,6 +575,8 @@ class TestSingleDynamicIntegration(unittest.IsolatedAsyncioTestCase):
         engine.add_instance("short", "127.0.0.1", 8000, 1)
         engine.add_instance("long", "127.0.0.1", 8001, 2)
         class Costs:
+            rollout_model = None
+
             def decode_seconds(self, tp, *args):
                 return 10.0 if tp == 1 else 1.0
             def migration_seconds(self, *args):

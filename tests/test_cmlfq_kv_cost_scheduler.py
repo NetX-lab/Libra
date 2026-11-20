@@ -35,7 +35,7 @@ class FixedCosts:
         return self.decode_by_tp[tp]
     def prefill_seconds(self, tp, context):
         return 0.0
-    def completion_seconds(self, tp, bin_name, remaining, context, other_requests):
+    def decode_work_seconds(self, tp, bin_name, remaining, context, other_requests):
         return self.decode_seconds(tp, bin_name, remaining, context)
     def migration_seconds(self, source, target, context, allow_transfer):
         return "recompute", self.migration
@@ -43,6 +43,8 @@ class Feed:
     def __init__(self):
         self.values = {}
         self.reads = 0
+    def get(self, instance_id):
+        return self.values.get(instance_id)
     def snapshots(self):
         self.reads += 1
         return dict(self.values)
@@ -159,6 +161,24 @@ class KVRouterTest(unittest.TestCase):
         resumed = s.reserve_generation(request)
         self.assertEqual(resumed.kv_routing["snapshots"]["l0"]["kv"], 0.90)
         s.rollback_generation(request)
+    def test_generation_budget_applies_to_kv_candidates_and_baseline_fallback(self):
+        for use_history in (True, False):
+            with self.subTest(use_history=use_history):
+                scheduler, _ = self.make_scheduler(lengths=(1000,) if use_history else ())
+                scheduler.get_instance_handle(0).kv_capacity_tokens = 119
+                scheduler.get_instance_handle(1).kv_capacity_tokens = 119
+                scheduler.get_instance_handle(2).kv_capacity_tokens = 120
+                request = self.start_request(scheduler)
+                if use_history:
+                    scheduler.on_tool_return(request, EVENT, 0, preview=False)
+                with self.assertRaisesRegex(RuntimeError, "fit 121 tokens"):
+                    scheduler.reserve_generation(request, 100, 21)
+                decision = scheduler.reserve_generation(request, 100, 20)
+                self.assertEqual(decision.target_instance_index, 2)
+                expected = "kv_distribution_cost" if use_history else "kv_baseline_fallback:no_distribution"
+                self.assertEqual(decision.reason, expected)
+                scheduler.cancel_request(request)
+
     def test_first_generation_rechecks_pressured_source_before_reserving(self):
         scheduler, feed = self.make_scheduler()
         scheduler.routing_costs = FixedCosts({1: 1.0, 2: 5.0}, migration=1.0)
