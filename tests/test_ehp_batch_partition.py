@@ -82,6 +82,7 @@ def make_trainer(tmp_path, rank=0, dp_size=1, dp_rank=0, source=True, hybrids=()
     trainer.start_step = 0
     trainer.runtime_elastic_executor = None
     trainer._use_heterogeneous = False
+    trainer._bounded_rollout_production = False
     trainer.staleness_manager = None
     trainer._pending_hybrid_training_batches = {}
     trainer._elastic_membership_run_id = "fixed-b-test"

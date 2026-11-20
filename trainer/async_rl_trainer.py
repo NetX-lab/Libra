@@ -94,6 +94,7 @@ class AsyncRLTrainer:
 
 
         self._task_counter = 0
+        self._bounded_rollout_production = False
         self._pending_grpo_groups: dict[str, list[dict[str, Any]]] = {}
 
         # WandB
@@ -240,6 +241,26 @@ class AsyncRLTrainer:
             raise ValueError("decoupled GRPO currently requires R2EGymWorkflow")
         workflow.configure_objective("decoupled", seed=self.config.seed)
 
+    def _configure_rollout_production(self):
+        """Use reservations when optimizer updates and verified publications align."""
+        cfg = self.config
+        planner = getattr(cfg, "global_resource_planner", None)
+        runtime_reconfiguration = getattr(planner, "enabled", False) and (
+            getattr(planner, "runtime_dynamic_reconfiguration_enabled", True)
+            or getattr(planner, "hybrid_training_prewarm_enabled", False)
+        )
+        # Objective validation already establishes the exact-sampling workflow,
+        # single optimizer update, and physical NCCL publication path.
+        self._bounded_rollout_production = (
+            cfg.grpo_objective == "decoupled"
+            and cfg.sync_interval == 1
+            and cfg.require_rollout_weight_sync
+            and not runtime_reconfiguration
+            and getattr(self.train_engine, "optimizer_revision", None)
+                == self.train_engine.get_version() == self.start_step
+        )
+
+
     def setup(self, workflow):
         """Setup."""
         self._configure_training_objective(workflow)
@@ -285,6 +306,7 @@ class AsyncRLTrainer:
                     f"model_path={self.config.model_path}",
                     flush=True,
                 )
+        self._configure_rollout_production()
         self._initialize_elastic_communication_domains()
         self._init_nonblocking_elastic_core()
 
@@ -427,14 +449,13 @@ class AsyncRLTrainer:
     def _create_rollout_task(self, task_input: TaskInput):
         """Create rollout task."""
         workflow = self.workflow
-        staleness_manager = self.staleness_manager
-        train_engine = self.train_engine
-        max_staleness = self.config.max_head_offpolicyness
+        bounded = getattr(self, "_bounded_rollout_production", False)
         exact_sampling = getattr(self.config, "grpo_objective", "legacy") == "decoupled"
 
         async def _execute():
             try:
-                self._refresh_rollout_engine_from_manifest_for_task()
+                if not bounded:
+                    self._refresh_rollout_engine_from_manifest_for_task()
                 rollout_engine = self.rollout_engine
                 if rollout_engine is None:
                     raise RuntimeError("rollout engine is not initialized")
@@ -449,38 +470,38 @@ class AsyncRLTrainer:
                     ),
                     timeout=timeout_s,
                 )
+                if "task_id" in trajectory and (
+                        type(trajectory["task_id"]) is not type(task_input.task_id)
+                        or trajectory["task_id"] != task_input.task_id):
+                    raise SamplingEvidenceError("Rollout trajectory task ID differs from its actual dispatched task")
+                trajectory["task_id"] = task_input.task_id
                 trajectory["grpo_group_id"] = (
                     task_input.group_id or f"task:{task_input.task_id}"
                 )
                 trajectory["grpo_rollout_index"] = task_input.rollout_index
 
-
-                if exact_sampling:
-                    current_version = train_engine.optimizer_revision
-                    version_val = trajectory.get("sample_revision")
-                    if type(version_val) is not int or not 0 <= version_val <= current_version:
-                        raise SamplingEvidenceError("Invalid actual sampling revision")
-                else:
-                    current_version = train_engine.get_version()
-                    traj_version = trajectory.get("versions", torch.tensor([task_input.version]))
-                    version_val = traj_version.min().item()
-                staleness = current_version - version_val
-
-                if staleness <= max_staleness:
-                    staleness_manager.on_rollout_accepted()
-                    return trajectory
-                else:
-                    staleness_manager.on_rollout_rejected()
-                    if self.is_main_process and self.config.enable_rollout_tracing:
-                        print(
-                            f"REJECT rollout task_id={task_input.task_id}: "
-                            f"version={version_val}, current={current_version}, "
-                            f"staleness={staleness} > {max_staleness}"
-                        )
-                    return None
+                if not bounded:
+                    if exact_sampling:
+                        current_revision = self.train_engine.optimizer_revision
+                        sample_revision = trajectory.get("sample_revision")
+                        if type(sample_revision) is not int or not 0 <= sample_revision <= current_revision:
+                            raise SamplingEvidenceError("Invalid actual sampling revision")
+                    else:
+                        current_revision = self.train_engine.get_version()
+                        versions = trajectory.get("versions")
+                        sample_revision = versions.min().item() if versions is not None else task_input.version
+                    age = current_revision - sample_revision
+                    if age > self.config.max_head_offpolicyness:
+                        if self.is_main_process and self.config.enable_rollout_tracing:
+                            print(
+                                f"REJECT rollout task_id={task_input.task_id}: "
+                                f"version={sample_revision}, current={current_revision}, "
+                                f"staleness={age} > {self.config.max_head_offpolicyness}"
+                            )
+                        return None
+                return trajectory
 
             except asyncio.TimeoutError:
-                staleness_manager.on_rollout_rejected()
                 if self.is_main_process:
                     print(
                         f"ERROR: Rollout task_id={task_input.task_id} "
@@ -494,14 +515,14 @@ class AsyncRLTrainer:
                     "grpo_group_id": task_input.group_id or f"task:{task_input.task_id}",
                 }
             except Exception as e:
-                staleness_manager.on_rollout_rejected()
-                if exact_sampling or isinstance(e, SamplingEvidenceError):
-                    if self.dispatcher is not None:
-                        self.dispatcher.report_fatal_error(e)
-                    raise
-                if self.is_main_process:
-                    print(f"ERROR: Rollout task_id={task_input.task_id} failed: {e}")
-                return None
+                if not (bounded or exact_sampling or isinstance(e, SamplingEvidenceError)):
+                    if self.is_main_process:
+                        print(f"ERROR: Rollout task_id={task_input.task_id} failed: {e}")
+                    return None
+                dispatcher = getattr(self, "dispatcher", None)
+                if dispatcher is not None:
+                    dispatcher.report_fatal_error(e)
+                raise
 
         return _execute
 
@@ -551,96 +572,93 @@ class AsyncRLTrainer:
                         )
 
     def _collect_complete_grpo_batch(self, data_gen, batch_size: int):
-        """Consume ready complete groups before requesting missing members."""
+        """Wait for complete groups reserved for this optimizer revision."""
+        if not getattr(self, "_bounded_rollout_production", False):
+            return self._collect_legacy_grpo_batch(data_gen, batch_size)
+        if batch_size == 0:
+            return []
+        self.dispatcher.start_production(data_gen, int(self.config.n_samples))
+        revision = int(self.train_engine.optimizer_revision)
+        batch = self.dispatcher.collect_batch(batch_size, revision)
+        self._source_training_batch = batch
+        return batch
+
+
+    def _collect_legacy_grpo_batch(self, data_gen, batch_size: int):
+        """Consume ready groups and pull work using the configured legacy cadence."""
         from RL_Framework.infra.elastic.batch_partition import unique_group_members
 
         n_samples = int(self.config.n_samples)
         if batch_size < 0 or n_samples < 1 or batch_size % n_samples:
             raise ValueError("requested batch must contain complete GRPO groups")
-        selected: list[dict[str, Any]] = []
+        planner_cfg = getattr(self.config, "global_resource_planner", None)
+        collection_timeout = float(getattr(planner_cfg, "runtime_batch_collection_timeout_s", 0.0))
+        timeout = collection_timeout if collection_timeout > 0 else None
+        max_retries = int(getattr(planner_cfg, "runtime_batch_collection_max_retries", 0))
+        pending = self._pending_grpo_groups
         consumed = getattr(self, "_consumed_grpo_group_ids", None)
         if consumed is None:
             consumed = self._consumed_grpo_group_ids = set()
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        collection_timeout = float(getattr(planner_cfg, "runtime_batch_collection_timeout_s", 0.0))
-        max_retries = int(getattr(planner_cfg, "runtime_batch_collection_max_retries", 0))
+        selected = []
         retries = 0
-        is_main_process = getattr(self, "is_main_process", True)
         while len(selected) < batch_size:
-            # This must precede every blocking dispatcher call: after EHP
-            # borrows all engines a complete group may already be assembled.
-            for group_id in list(self._pending_grpo_groups):
+            for group_id, members in list(pending.items()):
                 if str(group_id) in consumed:
-                    del self._pending_grpo_groups[group_id]
+                    del pending[group_id]
                     continue
-                members = unique_group_members(self._pending_grpo_groups[group_id], n_samples)
-                self._pending_grpo_groups[group_id] = members
+                members = unique_group_members(members, n_samples)
                 if len(members) < n_samples:
+                    pending[group_id] = members
                     continue
                 selected.extend(members[:n_samples])
                 consumed.add(str(group_id))
-                del self._pending_grpo_groups[group_id]
+                del pending[group_id]
                 if len(selected) == batch_size:
                     return selected
-            if not is_main_process:
-                self._follow_applied_runtime_reconfiguration_if_available(
-                    self._runtime_reconfiguration_coord_dir()
-                )
+
+            if not self.is_main_process:
+                with self._runtime_follow_lock:
+                    self._follow_applied_runtime_reconfiguration_if_available(
+                        self._runtime_reconfiguration_coord_dir(),
+                    )
             try:
                 peek = getattr(self.dispatcher, "peek_ready_data", None)
-                ready = peek() if callable(peek) else []
-                paused = callable(getattr(self.dispatcher, "is_paused", None)) and self.dispatcher.is_paused()
-                if ready or paused:
-                    # Existing results can be consumed even while production is
-                    # paused. Never enqueue new work while every engine is lent.
-                    count = min(len(ready), batch_size - len(selected)) if ready else 1
+                ready = len(peek()) if callable(peek) else 0
+                is_paused = getattr(self.dispatcher, "is_paused", None)
+                if ready or (callable(is_paused) and is_paused()):
                     results = self.dispatcher.wait_results(
-                        count=count,
-                        timeout=collection_timeout if collection_timeout > 0 else None,
+                        count=min(ready or 1, batch_size - len(selected)), timeout=timeout,
                     )
-                    raw_batch = [result.data for result in results if result.data is not None]
+                    raw_batch = [result.data for result in results]
                 else:
-                    pending_members = sum(len(unique_group_members(members, n_samples))
-                                          for members in self._pending_grpo_groups.values())
+                    pending_members = sum(len(members) for members in pending.values())
                     needed = max(1, batch_size - len(selected) - pending_members)
                     raw_batch = self.dispatcher.active_submit_and_wait(
-                        input_generator=data_gen, batch_size=needed,
-                        timeout=collection_timeout if collection_timeout > 0 else None,
+                        input_generator=data_gen, batch_size=needed, timeout=timeout,
                     )
-            except TimeoutError as exc:
+            except TimeoutError as error:
                 retries += 1
-                if is_main_process:
-                    print(f"[BatchCollection] timeout retry={retries}/{max_retries} error={exc}")
-                self._reset_rollout_pipeline_after_reconfigure()
+                if self.is_main_process:
+                    print(f"[BatchCollection] timeout retry={retries}/{max_retries} error={error}")
                 if retries > max_retries:
-                    # The fixed-B caller propagates this shortfall to all ranks
-                    # and rejects an optimizer update with a partial batch.
                     return selected
                 continue
+
+            successes = [row for row in raw_batch if isinstance(row, dict) and row.get("status") != "failed"]
             if self.staleness_manager is not None:
-                # Timeout notifications already released running credit through
-                # rejection. Every successful result releases accepted credit,
-                # including members later discarded by group filtering.
-                accepted_count = sum(
-                    isinstance(trajectory, dict) and trajectory.get("status") != "failed"
-                    for trajectory in raw_batch
-                )
-                self.staleness_manager.on_batch_consumed(accepted_count)
-            for trajectory in raw_batch:
-                if not isinstance(trajectory, dict) or trajectory.get("status") == "failed":
-                    continue
-                group_id = str(trajectory["grpo_group_id"])
+                self.staleness_manager.on_batch_consumed(len(successes))
+            for row in successes:
+                group_id = str(row["grpo_group_id"])
                 if group_id not in consumed:
-                    self._pending_grpo_groups.setdefault(group_id, []).append(trajectory)
-            # Complete admitted groups remain available for future fixed batches.
-            # Bound abandoned incomplete groups only, preserving their order.
+                    pending.setdefault(group_id, []).append(row)
+            # Bound abandoned incomplete groups while preserving complete inventory.
             max_pending_groups = max(64, batch_size * 8)
-            if len(self._pending_grpo_groups) > max_pending_groups:
-                for group_id in list(self._pending_grpo_groups):
-                    if len(self._pending_grpo_groups) <= max_pending_groups:
+            if len(pending) > max_pending_groups:
+                for group_id, members in list(pending.items()):
+                    if len(pending) <= max_pending_groups:
                         break
-                    if len(unique_group_members(self._pending_grpo_groups[group_id], n_samples)) < n_samples:
-                        del self._pending_grpo_groups[group_id]
+                    if len(unique_group_members(members, n_samples)) < n_samples:
+                        del pending[group_id]
         return selected
 
     def _compute_advantages(self, trajectories):
@@ -858,10 +876,11 @@ class AsyncRLTrainer:
             self.global_step = step
             step_start = time.time()
             self._trace_train_phase(step, "step_start")
-            self._configure_sync_aware_rollout_prefetch(
-                step=step,
-                batch_size=local_batch_size,
-            )
+            if not self._bounded_rollout_production:
+                self._configure_sync_aware_rollout_prefetch(
+                    step=step,
+                    batch_size=local_batch_size,
+                )
 
             if self.is_main_process:
                 # Reconcile late hybrid joins and publish their membership before
@@ -962,6 +981,17 @@ class AsyncRLTrainer:
             )
 
 
+            if self._bounded_rollout_production and self.dispatcher is not None:
+                if local_batch_size:
+                    self.dispatcher.retire_batch(
+                        self._source_training_batch, int(self.train_engine.optimizer_revision),
+                    )
+                    self._source_training_batch = []
+                if step + 1 == self.config.total_steps:
+                    self.dispatcher.destroy()
+                    self.dispatcher = self.async_runner = None
+                    if self.runtime_elastic_executor is not None:
+                        self.runtime_elastic_executor.dispatcher = None
             weight_sync_time, rollout_sync_drain = 0.0, None
             if self.config.sync_interval > 0 and (step + 1) % self.config.sync_interval == 0:
                 weight_sync_time, rollout_sync_drain = self._periodic_weight_sync(step)
@@ -1050,10 +1080,11 @@ class AsyncRLTrainer:
         self._cleanup(wait_for_hybrid_tasks=True)
 
     def _periodic_weight_sync(self, step):
-        """Global publication boundary; specialized publication may overlap it."""
+        """Publish weights, draining legacy rollout work before the transfer."""
+        bounded = getattr(self, "_bounded_rollout_production", False)
         rollout_sync_drain = None
         self._trace_train_phase(step, "weight_sync_start")
-        if self.dispatcher is not None:
+        if not bounded and self.dispatcher is not None:
             drain_started = time.time()
             self.dispatcher.pause()
             cancelled = self.dispatcher.cancel_queued()
@@ -1093,18 +1124,23 @@ class AsyncRLTrainer:
                 getattr(self.config, "require_rollout_weight_sync", True)
             )
         )
+        installed = False
         if skip_rollout_sync:
             self._record_weight_sync_phase("sync_skipped")
         else:
-            self._sync_weights(target_version=step + 1)
+            installed = self._sync_weights(target_version=step + 1)
         weight_sync_time = time.time() - sync_start
 
         new_version = step + 1
-        self.train_engine.set_version(new_version)
-        if not getattr(self, "_rollout_unavailable_ids", ()):
-            self._rebind_rollout_engine_from_config(reason="after_weight_sync")
-
-        self._resume_rollout_pipeline()
+        if installed or not bounded:
+            self.train_engine.set_version(new_version)
+        if bounded:
+            if installed and self.dispatcher is not None and self.staleness_manager.group_reservations_enabled:
+                self.dispatcher.on_publication(new_version)
+        else:
+            if not getattr(self, "_rollout_unavailable_ids", ()):
+                self._rebind_rollout_engine_from_config(reason="after_weight_sync")
+            self._resume_rollout_pipeline()
         self._trace_train_phase(step, "weight_sync_done")
 
         if self.is_main_process and self.config.enable_rollout_tracing:

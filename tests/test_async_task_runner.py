@@ -170,3 +170,25 @@ def test_explicit_drain_runs_inputs_accepted_before_pause():
         assert runner.wait(count=1, timeout=1.)[0].data == 'after resume'
     finally:
         runner.destroy()
+
+
+def test_cancel_tasks_waits_for_the_target_coroutine_to_release_execution():
+    runner = AsyncTaskRunner()
+    entered, released = threading.Event(), threading.Event()
+
+    async def target():
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            await asyncio.sleep(.03)
+            released.set()
+
+    runner.initialize()
+    try:
+        runner.submit(target, task_id=11)
+        assert entered.wait(1)
+        runner.cancel_tasks({11})
+        assert released.is_set()
+    finally:
+        runner.destroy()
