@@ -2,7 +2,8 @@
 import asyncio
 from types import SimpleNamespace
 
-from RL_Framework.infra.execution.batch_dispatcher import TaskInput
+from RL_Framework.infra.execution.async_runner import AsyncTaskRunner
+from RL_Framework.infra.execution.batch_dispatcher import BatchTaskDispatcher, TaskInput
 from RL_Framework.infra.sync.staleness import StalenessManager
 from RL_Framework.trainer.async_rl_trainer import AsyncRLTrainer
 
@@ -14,7 +15,6 @@ def test_timeout_notification_does_not_consume_successful_result_credit(monkeypa
     trainer.is_main_process = True
     trainer.train_engine = SimpleNamespace(get_version=lambda: 0)
     trainer.rollout_engine = object()
-    trainer._refresh_rollout_engine_from_manifest_for_task = lambda: None
     trainer._pending_grpo_groups = {}
     manager = trainer.staleness_manager = StalenessManager(
         trainer.train_engine, max_concurrent_rollouts=8,
@@ -28,23 +28,19 @@ def test_timeout_notification_does_not_consume_successful_result_credit(monkeypa
     trainer.workflow = SimpleNamespace(run_episode=episode)
     monkeypatch.setenv('ROLLOUT_TASK_TIMEOUT_S', '.001')
 
-    async def produce():
-        packets = []
-        for index in range(5):
-            manager.on_rollout_enqueued()
-            manager.on_rollout_submitted()
-            task = TaskInput(index, {'timeout': index == 0}, version=0,
-                             group_id='failed' if index == 0 else 'complete',
-                             rollout_index=max(0, index - 1))
-            packets.append(await trainer._create_rollout_task(task)())
-        return packets
-
-    packets = asyncio.run(produce())
-    assert (manager.get_stats().accepted, manager.get_stats().rejected) == (4, 1)
-    chunks = [packets[:4], packets[4:]]
-    trainer.dispatcher = SimpleNamespace(active_submit_and_wait=lambda **kw: chunks.pop(0))
-    batch = trainer._collect_complete_grpo_batch(iter(()), batch_size=4)
-    assert [row['grpo_rollout_index'] for row in batch] == [0, 1, 2, 3]
-    assert (manager.get_stats().accepted, manager.get_stats().running,
-            manager.get_stats().rejected) == (0, 0, 1)
-    assert manager.get_capacity() == 8
+    inputs = (TaskInput(index, {'timeout': index == 0}, version=0,
+                        group_id='failed' if index == 0 else 'complete',
+                        rollout_index=max(0, index - 1))
+              for index in range(5))
+    runner = AsyncTaskRunner(max_queue_size=8)
+    dispatcher = trainer.dispatcher = BatchTaskDispatcher(runner, manager, trainer._create_rollout_task)
+    runner.initialize()
+    dispatcher.initialize()
+    try:
+        batch = trainer._collect_complete_grpo_batch(inputs, batch_size=4)
+        assert [row['grpo_rollout_index'] for row in batch] == [0, 1, 2, 3]
+        assert (manager.get_stats().accepted, manager.get_stats().running,
+                manager.get_stats().rejected) == (0, 0, 1)
+        assert manager.get_capacity() == 8
+    finally:
+        dispatcher.destroy()

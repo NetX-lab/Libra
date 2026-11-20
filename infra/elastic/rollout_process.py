@@ -62,10 +62,12 @@ def slurm_command(command, host, gpus, env, *, step_name=None):
     ids = ','.join(str(gpu) for gpu in gpus)
     if not gpus or len(set(gpus)) != len(gpus) or min(gpus) < 0:
         raise ValueError('Expected distinct assigned node GPU IDs')
-    # With --overlap the step inherits the job's existing GPU allocation on
-    # this node. Asking for --gpus=N could select a different physical subset.
+    # Parent steps hold whole-node GPU allocations. Request that complete
+    # group again; the process mask selects the planned physical GPU IDs.
     argv = ['srun', '--overlap', '--jobid', env['SLURM_JOB_ID'], '--nodes=1', '--ntasks=1',
             '--nodelist', node, '--cpus-per-task=4', '--cpu-bind=none']
+    if node_gpus := env.get('SLURM_GPUS_ON_NODE'):
+        argv.append('--gres=gpu:' + node_gpus)
     if step_name:
         argv += ['--job-name', step_name]
     argv += ['env', 'CUDA_VISIBLE_DEVICES=' + ids, 'PLANNED_CUDA_VISIBLE_DEVICES=' + ids,
@@ -97,7 +99,9 @@ def _process_record(pid):
 def _owned_descendants(pid):
     records = {int(path.name): _process_record(int(path.name)) for path in Path('/proc').iterdir()
                if path.name.isdigit()}
-    owned, frontier = {}, [pid]
+    # Workers can outlive the launcher and keep its dedicated process group.
+    owned = {}
+    frontier = [pid] + [key for key, record in records.items() if record and record['group'] == pid]
     while frontier:
         current = frontier.pop()
         record = records.get(current)
@@ -194,8 +198,12 @@ def stop_rollout_process(proc, meta=None, timeout=30., control_dir=None):
     step, record = _owned_remote_step(owner, env)
     if record and record.get('status') == 'exited' and record.get('owned_processes_exited') is True:
         return stop_owned_session(proc, timeout)
+    cancel_error = None
     if step:
-        subprocess.run(['scancel', '--signal=TERM', step], check=True, env=env, capture_output=True, text=True)
+        try:
+            subprocess.run(['scancel', '--signal=TERM', step], check=True, env=env, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            cancel_error = exc
     else:
         # Cancel a pending srun before it can create a remote step.
         stop_owned_session(proc, timeout)
@@ -211,6 +219,8 @@ def stop_rollout_process(proc, meta=None, timeout=30., control_dir=None):
                    for line in query.stdout.splitlines()) and proc.poll() is not None:
             return
         time.sleep(.05)
+    if cancel_error is not None:
+        raise cancel_error
     if step:
         subprocess.run(['scancel', '--signal=KILL', step], check=True, env=env, capture_output=True, text=True)
     raise RuntimeError('Remote rollout Slurm step exit was not verified; retaining ownership')
@@ -359,7 +369,7 @@ def stop_adopted_rollout(meta, env=None, timeout=30., control_dir=None):
     argv = [sys.executable, '-m', 'RL_Framework.infra.elastic.rollout_process',
             '--stop-adopted', json.dumps(contract, separators=(',', ':')), '--timeout', str(timeout)]
     command = slurm_command(shlex.join(argv), meta.host, meta.gpus, env)
-    result = subprocess.run(shlex.split(command), env=env, check=True, capture_output=True, text=True,
+    result = subprocess.run(shlex.split(command), env=env, check=True, stdout=subprocess.PIPE, text=True,
                             timeout=3*timeout+30 if timeout > 0 else None)
     try:
         receipt = json.loads(result.stdout.strip().splitlines()[-1])

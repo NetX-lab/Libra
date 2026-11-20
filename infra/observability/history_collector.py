@@ -287,6 +287,15 @@ class HistoryDataCollector:
 
 
 
+    def record_length_profile(self, step: int, sequence_records: list[dict[str, Any]]) -> None:
+        """Make this step's rollout lengths visible to the online planner."""
+        if not self.length_profile_path:
+            return
+        if not self._initialized:
+            self.initialize()
+        with self._lock:
+            self._write_length_profile_records(step, time.time(), sequence_records)
+
     def record_step(
         self,
         step: int,
@@ -319,6 +328,7 @@ class HistoryDataCollector:
 
         resource_config: ResourceConfig | None = None,
         control_plane: dict[str, Any] | None = None,
+        write_length_profile: bool = True,
     ) -> StepRecord:
         """Record step."""
         if not self._initialized:
@@ -461,7 +471,8 @@ class HistoryDataCollector:
             self._records.append(record)
             self._record_count += 1
             self._write_record(record)
-            self._write_length_profile_records(step, now, sequences)
+            if write_length_profile:
+                self._write_length_profile_records(step, now, sequences)
 
             if self._record_count % self.flush_interval == 0:
                 self._flush()
@@ -660,6 +671,8 @@ class HistoryDataCollector:
                 "profile_source": "runtime_online",
             }
             for key in (
+                "n_turns",
+                "sequence_length",
                 "prompt_id",
                 "total_output_tokens",
                 "tool_returns",

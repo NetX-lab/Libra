@@ -11,6 +11,8 @@ from typing import Any
 
 import httpx
 
+from RL_Framework.workflow.behavior import SamplingEvidenceError
+
 logger = logging.getLogger(__name__)
 
 
@@ -178,11 +180,28 @@ class VLLMRolloutEngine:
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Generate."""
-        await self._ensure_client()
+        from RL_Framework.workflow.behavior import ValidatedBehaviorTrace, validate_behavior_trace
+        prompt_token_ids = kwargs.pop("prompt_token_ids", None)
+        capture_behavior = bool(kwargs.pop("capture_behavior", False))
+        if prompt_token_ids is not None and (
+            not isinstance(prompt_token_ids, list) or not prompt_token_ids
+            or any(type(token) is not int or token < 0 for token in prompt_token_ids)
+        ):
+            error = SamplingEvidenceError if capture_behavior else ValueError
+            raise error("Explicit prompt IDs must be nonempty nonnegative integers")
+        if capture_behavior and (prompt_token_ids is None or n != 1 or type(seed) is not int):
+            raise SamplingEvidenceError("Behavior capture requires exact token IDs, n=1 and an integer seed")
+        try:
+            await self._ensure_client()
+        except Exception as exc:
+            if capture_behavior:
+                raise SamplingEvidenceError("Behavior capture client initialization failed") from exc
+            raise
+        request_options = {"headers": {"X-Libra-Capture-Behavior": "1"}} if capture_behavior else {}
 
         payload = {
             "model": self.model_path,
-            "prompt": prompt,
+            "prompt": prompt_token_ids if prompt_token_ids is not None else prompt,
             "max_tokens": max_new_tokens,
             "temperature": temperature,
             "top_p": top_p,
@@ -193,10 +212,19 @@ class VLLMRolloutEngine:
             payload["seed"] = int(seed)
         if stop is not None:
             payload["stop"] = stop
+        include_stop = kwargs.pop("include_stop_str_in_output", None)
+        if capture_behavior or include_stop is not None:
+            payload["include_stop_str_in_output"] = True if include_stop is None else bool(include_stop)
+        if capture_behavior:
+            payload["return_tokens_as_token_ids"] = True
+        if "ignore_eos" in kwargs:
+            ignore_eos = kwargs.pop("ignore_eos")
+            payload["ignore_eos"] = bool(ignore_eos)
         kv_transfer_params = kwargs.pop("kv_transfer_params", None)
         if kv_transfer_params is not None:
             if not isinstance(kv_transfer_params, dict):
-                raise ValueError("kv_transfer_params must be a dictionary")
+                error = SamplingEvidenceError if capture_behavior else ValueError
+                raise error("kv_transfer_params must be a dictionary")
             payload["kv_transfer_params"] = kv_transfer_params
         # Keep the engine forward-compatible with workflow-level generation
         # options that are not understood by the OpenAI-compatible endpoint.
@@ -205,10 +233,23 @@ class VLLMRolloutEngine:
         del kwargs
 
         try:
-            response = await self.http_client.post(
-                self.completions_url,
-                json=payload,
-            )
+            try:
+                response = await self.http_client.post(
+                    self.completions_url,
+                    json=payload, **request_options,
+                )
+            except (httpx.ReadError, httpx.RemoteProtocolError) as error:
+                if (
+                    isinstance(error, httpx.RemoteProtocolError)
+                    and str(error) != "Server disconnected without sending a response."
+                ):
+                    raise
+                logger.warning("Retrying completion once after HTTP disconnect: %r (url=%s)",
+                               error, self.completions_url)
+                response = await self.http_client.post(
+                    self.completions_url,
+                    json=payload, **request_options,
+                )
 
             if response.status_code != 200:
                 error_text = response.text
@@ -217,7 +258,31 @@ class VLLMRolloutEngine:
                 )
 
             result = response.json()
-            return self._parse_response(result)
+            parsed = self._parse_response(result)
+            revision = response.headers.get("x-libra-optimizer-revision")
+            if revision is not None:
+                try:
+                    parsed["sample_revision"] = int(revision)
+                except (TypeError, ValueError) as exc:
+                    raise SamplingEvidenceError("Invalid actual sampling revision") from exc
+                if parsed["sample_revision"] < 0:
+                    raise SamplingEvidenceError("Invalid actual sampling revision")
+            elif capture_behavior:
+                raise SamplingEvidenceError("Server omitted actual sampling revision")
+            if capture_behavior:
+                choices = result.get("choices")
+                trace = choices[0].get("libra_behavior") if isinstance(choices, list) and len(choices) == 1 else None
+                if not isinstance(trace, dict):
+                    raise SamplingEvidenceError("Server omitted sampler token evidence")
+                parsed["behavior_trace"] = trace
+                validate_behavior_trace(
+                    parsed, prompt_token_ids, seed=seed, temperature=temperature,
+                    top_p=top_p, output_limit=max_new_tokens,
+                )
+                parsed["behavior_trace"] = ValidatedBehaviorTrace(trace)
+                parsed["tokens"] = list(trace["output_token_ids"])
+                parsed["logprobs"] = list(trace["logprobs"])
+            return parsed
 
         except Exception as e:
             logger.error(
@@ -229,6 +294,10 @@ class VLLMRolloutEngine:
                 max_new_tokens,
                 self.completions_url,
             )
+            if capture_behavior and not isinstance(e, SamplingEvidenceError):
+                raise SamplingEvidenceError(
+                    f"Behavior capture failed: {type(e).__name__}: {e}"
+                ) from e
             raise
 
     async def generate_batch(

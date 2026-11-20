@@ -245,6 +245,9 @@ class ProfilingConfig:
 
     train_workspace_bytes: float = 0.5e9  # 500MB
 
+    # Offline backend calibration, shared by GRP, CMLFQ and EHP.
+    calibration: dict = field(default_factory=dict)
+
     @classmethod
     def from_dict(cls, d: dict) -> "ProfilingConfig":
         """Build an instance from a dictionary."""
@@ -280,7 +283,7 @@ class HeterogeneousInstanceConfig:
 class SchedulingConfig:
     """Scheduling config implementation."""
 
-    scheduler_type: str = "length_aware"  # length_aware / la_mlfq / cmlfq / cmlfq_cost / load_balance
+    scheduler_type: str = "length_aware"  # length_aware / la_mlfq / cmlfq / cmlfq_cost / cmlfq_cost_kv_dynamic / load_balance
 
 
 
@@ -652,6 +655,38 @@ class GlobalResourcePlannerConfig:
         return _from_dict(cls, d)
 
 
+def validate_grpo_objective(config) -> None:
+    """Validate the opt-in probability contract before allocating workers."""
+    objective = getattr(config, "grpo_objective", "legacy")
+    if objective not in {"legacy", "decoupled"}:
+        raise ValueError("grpo_objective must be 'legacy' or 'decoupled'")
+    if objective == "legacy":
+        return
+    if config.train_backend != "megatron_core":
+        raise ValueError("decoupled GRPO requires train_backend='megatron_core'")
+    if not config.recompute_logprobs:
+        raise ValueError("decoupled GRPO requires recompute_logprobs=True")
+    if config.rollout_backend != "vllm":
+        raise ValueError("decoupled GRPO requires actual vLLM behavior probabilities")
+    if config.weight_sync_mode != "nccl" or config.rollout_weight_sync_mode != "nccl":
+        raise ValueError(
+            "decoupled GRPO currently requires weight_sync_mode='nccl' and "
+            "rollout_weight_sync_mode='nccl'; checkpoint publication is not supported"
+        )
+    scheduling = config.heterogeneous_rollout.scheduling
+    if scheduling.cmlfq_kv_backend != "recompute":
+        raise ValueError("decoupled GRPO requires cmlfq_kv_backend='recompute' until versioned KV migration is available")
+    planner = getattr(config, "global_resource_planner", None)
+    hybrid_enabled = any(getattr(planner, field, False) for field in (
+        "hybrid_worker_launch_enabled", "elastic_hybrid_planning_enabled",
+        "hybrid_training_prewarm_enabled",
+    ))
+    if config.ppo_epochs != 1:
+        raise ValueError("decoupled GRPO requires ppo_epochs=1")
+    if hybrid_enabled and planner.hybrid_worker_mode != "megatron_core":
+        raise ValueError("decoupled GRPO requires hybrid_worker_mode='megatron_core'")
+
+
 @dataclass
 class AsyncRLConfig:
     """Async r l config implementation."""
@@ -701,6 +736,7 @@ class AsyncRLConfig:
     rollout_sync_drain_lead_steps: int = 2
 
 
+    grpo_objective: str = "legacy"  # legacy | decoupled
     recompute_logprobs: bool = True
     # Recompute can use a smaller temporary batch than the training update.
     # This preserves the requested training micro-batch while bounding logits.
@@ -829,6 +865,7 @@ class AsyncRLConfig:
             raise ValueError(
                 "train_backend must be 'fsdp', 'megatron3d', or 'megatron_core'"
             )
+        validate_grpo_objective(self)
 
 
         if self.train_gpus <= 0:

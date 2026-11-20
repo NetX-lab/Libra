@@ -42,7 +42,7 @@ def test_training_task_passes_global_count_to_engine_and_gradient_client(tmp_pat
             membership_epoch=metadata['membership_epoch'], sample_count=len(trajectories),
             global_sample_count=metadata['global_sample_count'])
 
-    engine = SimpleNamespace(recompute_logprobs=lambda _: None,
+    engine = SimpleNamespace(hybrid_lockstep_gradient_sync=False, recompute_logprobs=lambda _: None,
         compute_elastic_gradient_payload=compute)
     monkeypatch.setattr(worker, 'parse_args', lambda: args)
     monkeypatch.setattr(worker, '_initialize_megatron_worker', lambda _: engine)

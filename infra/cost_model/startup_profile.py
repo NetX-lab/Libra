@@ -51,6 +51,8 @@ def _length_record_from_payload(
     if step is not None:
         record["step"] = step
     for key in (
+        "n_turns",
+        "sequence_length",
         "prompt_id",
         "source_index",
         "sample_index",

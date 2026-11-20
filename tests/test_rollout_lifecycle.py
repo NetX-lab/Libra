@@ -65,14 +65,14 @@ def trainer(rank, *, ready_groups=2, loan=True, publish_failure=False):
         is_main_process=rank == 0, control=SimpleNamespace(rank=rank),
         runtime_elastic_executor=executor if rank == 0 else None,
         config=SimpleNamespace(
-            n_samples=4, heterogeneous_rollout=SimpleNamespace(instances=instances),
+            n_samples=4, heterogeneous_rollout=SimpleNamespace(enabled=True, instances=instances),
             global_resource_planner=SimpleNamespace(
                 enabled=True, runtime_reconfigure_training=True,
                 hybrid_worker_launch_enabled=True, runtime_training_pool_plan_only=False,
             ),
         ),
         rollout_engine=SimpleNamespace(scheduler=SimpleNamespace(_instances=handles)),
-        dispatcher=SimpleNamespace(peek_ready_data=lambda: []),
+        dispatcher=SimpleNamespace(peek_ready_data=lambda: [], is_paused=lambda: False),
         _pending_grpo_groups={f"group-{i}": [
             {"grpo_group_id": f"group-{i}", "grpo_rollout_index": index}
             for index in range(4)] for i in range(ready_groups)},
@@ -89,7 +89,8 @@ def trainer(rank, *, ready_groups=2, loan=True, publish_failure=False):
         calls=calls, handles=handles,
     )
 
-    def publish(*, target_version):
+    def publish(*, target_version, reopen_restored):
+        assert not reopen_restored
         assert target_version == 23
         assert all(not handle.is_ready for handle in handles)
         assert state._restored_rollouts_pending_publication == {"engine-a", "engine-b"}
@@ -251,11 +252,11 @@ def test_pending_hybrid_activation_gets_post_boundary_catchup_even_without_grp_g
     events = []
     current_plan = object()
     state = SimpleNamespace(
-        config=object(),
+        config=SimpleNamespace(total_steps=11),
         runtime_elastic_executor=SimpleNamespace(has_pending_boundary_work=lambda: True),
         global_resource_planner=SimpleNamespace(
             _history=[], _build_current_plan=lambda config, history: current_plan),
-        _run_global_resource_planner=lambda *args: pytest.fail("pending join skipped catchup"),
+        _run_global_resource_planner=lambda *args: events.append("planner"),
         _runtime_reconfiguration_boundary=lambda *args: events.append(("noop", args)),
     )
 
@@ -265,8 +266,8 @@ def test_pending_hybrid_activation_gets_post_boundary_catchup_even_without_grp_g
 
     state._apply_global_resource_planner_decision = apply
     AsyncRLTrainer._run_global_resource_planner_at_boundary(state, 9, [], {})
-    assert len(events) == 1
-    step, decision = events[0]
+    assert len(events) == 2 and events[0] == "planner"
+    step, decision = events[1]
     assert step == 9
     assert decision.reason == "hybrid_boundary_maintenance"
     assert decision.should_reconfigure is True
@@ -279,6 +280,7 @@ def test_no_pending_activation_keeps_normal_grp_post_boundary():
     from RL_Framework.trainer.async_rl_trainer import AsyncRLTrainer
     events = []
     state = SimpleNamespace(
+        config=SimpleNamespace(total_steps=11),
         runtime_elastic_executor=SimpleNamespace(has_pending_boundary_work=lambda: False),
         _run_global_resource_planner=lambda *args: events.append("planner"),
         _runtime_reconfiguration_boundary=lambda step, point: events.append((step, point)),
@@ -296,8 +298,8 @@ def test_repartition_publication_uses_new_topology_before_client_reopen():
             {"instance_id": "old-engine-a", "tp_degree": 2},
             {"instance_id": "old-engine-b", "tp_degree": 2},
         ]),
-        config=SimpleNamespace(heterogeneous_rollout=SimpleNamespace(instances=[
-            SimpleNamespace(instance_id="new-engine", tp=4),
+        config=SimpleNamespace(heterogeneous_rollout=SimpleNamespace(enabled=True, instances=[
+            SimpleNamespace(instance_id="new-engine", tp=4, host="new", port=8000),
         ])),
     )
     world_size, offsets = AsyncRLTrainer._nccl_rollout_topology(state)
@@ -311,7 +313,7 @@ def test_resource_repartition_publishes_current_config_targets(monkeypatch):
     commands = []
     monkeypatch.setattr(core_reconfiguration, "dispatch_core_command", lambda executor, operation, **kwargs:
                         commands.append((operation, kwargs)))
-    state = SimpleNamespace(config=SimpleNamespace(heterogeneous_rollout=SimpleNamespace(instances=[
+    state = SimpleNamespace(config=SimpleNamespace(heterogeneous_rollout=SimpleNamespace(enabled=True, instances=[
         SimpleNamespace(instance_id="new-engine", tp=4, gpus=[0, 1, 2, 3], host="rollout-node", port=8200),
     ])))
     RuntimeElasticExecutor._publish_current_rollout_weights(state)
