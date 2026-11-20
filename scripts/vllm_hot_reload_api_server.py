@@ -14,17 +14,23 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 import uvloop
 
+import vllm
 from vllm.entrypoints.openai import api_server
 from vllm.entrypoints.openai.cli_args import make_arg_parser
 from vllm.entrypoints.openai.cli_args import validate_parsed_serve_args
-from vllm.utils import FlexibleArgumentParser
+try:
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+except ImportError:
+    from vllm.utils import FlexibleArgumentParser
+
 from RL_Framework.infra.sync.prefix_cache_reset import (
     install_checked_prefix_cache_reset, reset_prefix_cache_verified,
 )
 from RL_Framework.scripts.serving_protocol import ServingState, GenerationMiddleware
 
 # EngineCore subprocesses import this project entrypoint before utility RPCs.
-install_checked_prefix_cache_reset()
+if vllm.__version__.split("+")[0] == "0.9.2":
+    install_checked_prefix_cache_reset()
 
 
 class ReloadWeightsRequest(BaseModel):
@@ -219,8 +225,15 @@ def make_serving_state(args):
     return ServingState(args.tensor_parallel_size, args.model)
 
 
-def build_app_with_reload_routes(args):
-    app = _build_app(args)
+def _build_app_for_libra(args, *pos, **kwargs):
+    app = _build_app(args, *pos, **kwargs)
+    # SageMaker bootstrap eagerly builds this stack before serving starts.
+    app.middleware_stack = None
+    return app
+
+
+def build_app_with_reload_routes(args, *pos, **kwargs):
+    app = _build_app_for_libra(args, *pos, **kwargs)
     app.state.serving_state = make_serving_state(args)
     app.state.behavior_install_lock = asyncio.Lock()
     app.include_router(_custom_router)
@@ -235,7 +248,11 @@ api_server.build_app = build_app_with_reload_routes
 
 
 if __name__ == "__main__":
-    api_server.cli_env_setup()
+    try:
+        from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
+    except ImportError:
+        cli_env_setup = api_server.cli_env_setup
+    cli_env_setup()
     parser = FlexibleArgumentParser(
         description="vLLM OpenAI server with Libra hot weight reload support."
     )
