@@ -69,8 +69,9 @@ def as_plan(value):
         n_total_gpus=12, max_concurrent_rollouts=16)
 
 
-def test_runtime_replaces_unlaunchable_core_resize_but_preserves_hybrid_demand():
+def test_grp_replans_with_fixed_core_when_first_layout_requires_unlaunchable_ranks():
     cfg = config()
+    cfg.global_resource_planner.elastic_hybrid_planning_enabled = False
     planner = GlobalResourcePlanner.from_config(cfg)
     planner.runtime_capabilities = CoreRuntimeCapabilities.from_engine(engine())
     planner.optimizer.optimize = Mock(side_effect=[result(8), result(4)])
@@ -80,10 +81,8 @@ def test_runtime_replaces_unlaunchable_core_resize_but_preserves_hybrid_demand()
     assert decision.candidate_plan.train_config.tp == 4
     assert decision.candidate_plan.train_config.dp == 1
     assert decision.candidate_plan.rollout_gpus == 8
-    assert decision.elastic_hybrid_signal.desired_replicas == 1
-    assert decision.elastic_hybrid_signal.reason == 'candidate_requests_more_training_capacity'
+    assert decision.elastic_hybrid_signal is None
     assert not decision.resource_should_reconfigure
-    assert decision.should_reconfigure  # Real EHP membership still changes.
     first, second = planner.optimizer.optimize.call_args_list
     assert first.kwargs['fixed_train_gpus'] == 0
     assert second.kwargs['fixed_train_gpus'] == 4
@@ -96,8 +95,9 @@ def test_runtime_replaces_unlaunchable_core_resize_but_preserves_hybrid_demand()
     assert proof['elastic_demand_preserved']
 
 
-def test_even_a_forced_resize_uses_ehp_instead_of_inventing_core_ranks(monkeypatch):
+def test_forced_grp_resize_cannot_invent_core_ranks(monkeypatch):
     cfg = config()
+    cfg.global_resource_planner.elastic_hybrid_planning_enabled = False
     planner = GlobalResourcePlanner.from_config(cfg)
     planner.runtime_capabilities = CoreRuntimeCapabilities.from_engine(engine())
     monkeypatch.setenv('GRP_FORCE_TRAIN_GPUS', '8')
@@ -106,8 +106,8 @@ def test_even_a_forced_resize_uses_ehp_instead_of_inventing_core_ranks(monkeypat
         runtime_metrics=RuntimeResourceMetrics(step=5, train_time_s=1, rollout_time_s=10))
     assert decision.candidate_plan.train_gpus == 4
     assert not decision.resource_should_reconfigure
-    assert decision.should_reconfigure and decision.elastic_hybrid_signal.desired_replicas == 1
-    assert decision.reason == 'elastic_hybrid_adjustment'
+    assert not decision.should_reconfigure
+    assert decision.elastic_hybrid_signal is None
 
 
 @pytest.mark.parametrize('initial_gpus', [4, 8])
@@ -131,8 +131,9 @@ def test_live_core_rebuild_rejects_unsupported_model_axes(axis):
     assert capability.incompatibility(candidate) == f'core_{axis}_rebuild_unsupported'
 
 
-def test_fixed_core_keeps_rollout_repartition_and_actual_ehp_enabled():
+def test_fixed_core_keeps_rollout_repartition_executable():
     cfg = config()
+    cfg.global_resource_planner.elastic_hybrid_planning_enabled = False
     planner = GlobalResourcePlanner.from_config(cfg)
     planner.runtime_capabilities = CoreRuntimeCapabilities.from_engine(engine())
     candidate = result(4)
@@ -140,16 +141,14 @@ def test_fixed_core_keeps_rollout_repartition_and_actual_ehp_enabled():
     planner.optimizer.optimize = Mock(return_value=candidate)
     decision = planner.plan_if_needed(step=5, config=cfg, batch=ROWS)
     assert decision.resource_should_reconfigure
+    assert decision.candidate_plan.train_gpus == 4
     assert decision.candidate_plan.train_config.tp == 4
     assert decision.candidate_plan.train_config.dp == 1
     assert decision.candidate_plan.rollout_tp_list == [4, 4]
+    assert planner.optimizer.optimize.call_count == 1
     executor = RuntimeElasticExecutor(config=cfg, planner=planner, train_engine=engine())
     prepared = executor.prepare_transaction(decision)
     assert prepared.should_execute and prepared.resource_reconfiguration
-    assert cfg.global_resource_planner.runtime_reconfigure_training
-    assert cfg.global_resource_planner.runtime_training_pool_only
-    assert not cfg.global_resource_planner.runtime_training_pool_plan_only
-    assert cfg.global_resource_planner.hybrid_worker_launch_enabled
 
 
 def test_fixed_core_rejects_tp_dp_change_even_if_adapter_exposes_old_rebuild_hook():

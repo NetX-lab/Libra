@@ -331,7 +331,7 @@ class HeterogeneousRolloutEngine:
 
     def wait_until_idle(self, timeout: float = 3600.0, poll_interval: float = 0.5):
         """Block until no rollout requests are active before reconfiguration."""
-        deadline = time.time() + max(0.0, timeout)
+        deadline = time.time() + timeout if timeout > 0 else float("inf")
         while True:
             with self._lock:
                 handles = list(getattr(self.scheduler, "_instances", []))
@@ -585,7 +585,7 @@ class HeterogeneousRolloutEngine:
             while True:
                 try:
                     decision = scheduler.reserve_generation(
-                        request_id, input_tokens if input_tokens > 0 else None,
+                        request_id, input_tokens if input_tokens > 0 else None, max_new_tokens,
                     )
                     break
                 except NoAvailableRolloutError:
@@ -613,6 +613,7 @@ class HeterogeneousRolloutEngine:
                 "fallback_reason": outcome.fallback_reason,
                 "estimated_decode_seconds": decision.decode_seconds,
                 "estimated_migration_seconds": decision.migration_seconds,
+                "estimated_prefill_seconds": decision.prefill_seconds,
             }
             if isinstance(scheduler, CMLFQDynamicKVCostScheduler):
                 output["_schedule_info"]["kv_routing"] = decision.kv_routing

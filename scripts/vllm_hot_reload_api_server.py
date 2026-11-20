@@ -47,6 +47,7 @@ class ReloadWeightsNcclRequest(BaseModel):
     optimizer_revision: int | None = None
     expected_tensor_count: int | None = None
     session_id: str = ''
+    expected_service_instance_id: str | None = None
 
 
 _reload_lock = asyncio.Lock()
@@ -54,8 +55,50 @@ _custom_router = APIRouter()
 
 
 @_custom_router.get('/publication/status')
+@_custom_router.get('/libra/kv/identity')
 async def publication_status(request: Request):
     return request.app.state.serving_state.status()
+
+
+@_custom_router.post('/libra/kv/lease')
+async def acquire_kv_lease(request: Request):
+    body = await request.body()
+    lease_id = json.loads(body).get('lease_id') if body else None
+    if lease_id is not None and (not isinstance(lease_id, str) or not re.fullmatch('[a-f0-9]{32}', lease_id)):
+        raise HTTPException(status_code=400, detail='Invalid KV lease ID')
+    try:
+        return await request.app.state.serving_state.acquire_kv_lease(lease_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@_custom_router.delete('/libra/kv/lease/{lease_id}')
+async def release_kv_lease(lease_id: str, request: Request):
+    await request.app.state.serving_state.release_kv_lease(lease_id)
+    return {'released': True}
+
+
+async def ensure_behavior_capture(request):
+    if os.environ.get('LIBRA_CAPTURE_BEHAVIOR', '0') != '1':
+        raise HTTPException(status_code=409, detail='Actual sampler capture was not enabled')
+    async with request.app.state.behavior_install_lock:
+        existing = getattr(request.app.state, 'behavior_capture_workers', None)
+        if existing is not None:
+            return {'workers': existing, 'installed': True}
+        workers = await api_server.engine_client(request).collective_rpc('dependency_enable_behavior_capture', timeout=120)
+        expected = request.app.state.serving_state.tp_size
+        if (len(workers) != expected or sorted(worker.get('tp_rank', -1) for worker in workers) != list(range(expected))
+                or not all(worker.get('installed') for worker in workers)):
+            raise RuntimeError('All current TP workers must verify the actual serving sampler')
+        from RL_Framework.scripts.behavior_sampling import install_behavior_response
+        install_behavior_response()
+        request.app.state.behavior_capture_workers = workers
+        return {'workers': workers, 'installed': True}
+
+
+@_custom_router.post('/dependency_probe/behavior/install')
+async def install_behavior(request: Request):
+    return await ensure_behavior_capture(request)
 
 
 def _kv_directory(key: str) -> Path:
@@ -133,6 +176,9 @@ async def reload_weights_nccl(
     async with _reload_lock:
         started = time.perf_counter()
         state = request.app.state.serving_state
+        if (payload.session_id
+                and payload.expected_service_instance_id != state.server_instance_id):
+            raise HTTPException(status_code=409, detail='NCCL session targets a different physical service')
         if ((payload.snapshot_id is None) != (payload.optimizer_revision is None)
                 or payload.optimizer_revision is not None and payload.optimizer_revision < state.optimizer_revision):
             raise HTTPException(status_code=409, detail='Missing or regressing snapshot identity')
@@ -176,8 +222,12 @@ def make_serving_state(args):
 def build_app_with_reload_routes(args):
     app = _build_app(args)
     app.state.serving_state = make_serving_state(args)
+    app.state.behavior_install_lock = asyncio.Lock()
     app.include_router(_custom_router)
-    app.add_middleware(GenerationMiddleware, state=app.state.serving_state)
+    async def ensure(scope):
+        if dict(scope.get('headers', ())).get(b'x-libra-capture-behavior') == b'1':
+            await ensure_behavior_capture(Request(scope))
+    app.add_middleware(GenerationMiddleware, state=app.state.serving_state, ensure_behavior=ensure)
     return app
 
 

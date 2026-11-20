@@ -175,8 +175,117 @@ def test_async_future_survives_boundaries_and_is_consumed_once(trainers, monkeyp
     peer._runtime_reconfiguration_boundary(4, "post")
     leader._run_global_resource_planner_at_boundary(5, [], {})
     assert leader._grp_future is None
-    assert calls == [0]
+    assert calls == [4]
     assert not clock.sleeps
+
+
+def test_ready_maintenance_consumes_current_estimate_before_one_transaction(trainers, monkeypatch):
+    leader, _, executor = trainers
+    complete(leader, Decision(True), step=0)
+    leader.global_resource_planner._history = []
+    leader.global_resource_planner._build_current_plan = lambda *args: Decision().candidate_plan
+    monkeypatch.setattr(executor, "has_pending_boundary_work", lambda: True)
+    applied = []
+    monkeypatch.setattr(leader, "_apply_global_resource_planner_decision",
+                        lambda step, decision, stats: applied.append((step, decision.reason)))
+    leader._run_global_resource_planner_at_boundary(3, [], {})
+    assert leader._grp_future is None
+    assert applied == [(3, "reconfigure")]
+
+
+@pytest.mark.parametrize('collective_publication', [True, False])
+def test_approved_full_grp_plan_reaches_post_with_elastic_planning_disabled(
+    trainers, monkeypatch, collective_publication,
+):
+    from RL_Framework.infra.cost_model.global_resource_planner import CoreRuntimeCapabilities, GlobalResourcePlanner
+
+    leader, peer, executor = trainers
+    config = leader.config
+    config.global_resource_planner.runtime_drain_before_reconfigure = False
+    config.global_resource_planner.runtime_forced_rollout_tp_list = [2]
+    planner = GlobalResourcePlanner.from_config(config)
+    planner.runtime_capabilities = CoreRuntimeCapabilities(world_size=2, tp=1, ep=1, pp=1, dp=2, cp=1)
+    planner.warmup_steps = 0
+    planner.min_history_size = 1
+    executor.planner = leader.global_resource_planner = planner
+    decision = planner.plan_if_needed(step=0, config=config, batch=[dict(input_len=128, output_len=64)])
+    assert decision.resource_should_reconfigure
+    assert decision.candidate_plan.rollout_tp_list == [2]
+    complete(leader, decision)
+    rebinds = []
+    monkeypatch.setattr(leader, '_rebind_rollout_engine_from_config', lambda *, reason: rebinds.append(reason))
+    if collective_publication:
+        executor.trainer = leader
+        peer.dispatcher = SimpleNamespace(pause=lambda: pytest.fail('collective publication drained generation'))
+
+        def publish_current():
+            request = read_record(executor._coordination_dir() / 'request.json')
+            ready = read_record(executor._coordination_dir() / 'ready/rank_1.json')
+            assert ready['coord_id'] == request['coord_id']
+            leader._rebind_rollout_engine_from_config(reason='core_boundary_publication')
+
+        monkeypatch.setattr(executor, '_publish_current_rollout_weights', publish_current)
+
+    stats = {}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        following = pool.submit(peer._runtime_reconfiguration_boundary, 0, 'post')
+        leader._run_global_resource_planner_at_boundary(0, [], stats)
+        following.result(timeout=3)
+
+    boundary = peer._runtime_boundary_protocol.wait(0, 'post')
+    assert boundary['decision'] == 'reconfig'
+    assert boundary['drain_required'] is collective_publication
+    assert stats['global_resource_planner']['resource_should_reconfigure'] is True
+    assert stats['global_resource_planner_runtime']['applied']
+    assert config.heterogeneous_rollout.tp_list == [2]
+    assert rebinds == ['core_boundary_publication' if collective_publication else 'after_runtime_reconfiguration']
+
+
+@pytest.mark.parametrize('attached, core_count, publish_rollout, should_execute', [
+    (True, 2, True, False), (False, 2, True, True), (True, 1, True, True), (True, 2, False, True),
+])
+def test_full_grp_without_rank_coordination_requires_a_local_publication(
+    trainers, monkeypatch, attached, core_count, publish_rollout, should_execute,
+):
+    leader, _, executor = trainers
+    leader.config.global_resource_planner.runtime_coordinate_reconfiguration_ranks = False
+    leader.config.global_resource_planner.apply_to_runtime = publish_rollout
+    leader.config.train_gpus = core_count
+    executor.train_engine = SimpleNamespace(world_size=core_count, train_dp_size=core_count)
+    if attached:
+        executor.trainer = leader
+    decision = Decision(True)
+    decision.candidate_plan.train_gpus = core_count
+    decision.candidate_plan.train_config.dp = core_count
+    decision.elastic_hybrid_signal = {'desired_replicas': 0}
+
+    prepared = executor.prepare_transaction(decision)
+
+    assert prepared.should_execute is should_execute
+    if not should_execute:
+        assert prepared.reason == 'runtime_candidate_rejected:collective_publication_requires_rank_coordination'
+        assert not prepared.coord_id and not prepared.drain_required
+        monkeypatch.setattr(executor, '_publish_current_rollout_weights',
+            lambda: pytest.fail('ineligible topology dispatched a collective'))
+        monkeypatch.setattr(executor, '_release_all_hybrid_workers',
+            lambda **kwargs: pytest.fail('ineligible topology changed current membership'))
+        assert not executor.execute_prepared(prepared).applied
+        assert executor.planner.applied == 0
+        assert not (executor._coordination_dir() / 'core_command.json').exists()
+
+
+def test_last_post_leaves_ready_join_and_old_decision_for_cleanup(trainers, monkeypatch):
+    leader, peer, executor = trainers
+    leader.config.total_steps = 1
+    future = complete(leader, Decision(True))
+    monkeypatch.setattr(executor, "has_pending_boundary_work", lambda: True)
+    monkeypatch.setattr(leader, "_apply_global_resource_planner_decision",
+                        lambda *args: pytest.fail("last POST started a resource transaction"))
+    leader._run_global_resource_planner_at_boundary(0, [], {})
+    peer._runtime_reconfiguration_boundary(0, "post")
+    assert peer._runtime_boundary_protocol.wait(0, "post")["decision"] == "no_reconfig"
+    assert leader._grp_future is future
+    assert not (executor._coordination_dir() / "request.json").exists()
 
 
 def test_draining_request_precedes_decision_and_ready(trainers, monkeypatch):
@@ -344,9 +453,9 @@ def test_cluster_swap_coordinates_peers_once(trainers, monkeypatch):
     monkeypatch.setattr(executor, "_cluster_swap_rollout_training_pools", lambda *a: None)
     monkeypatch.setattr(executor, "_reconfigure_rollout_processes", lambda *a, **k: ([], []))
     original = executor._coordinate_peer_rank_drain
-    def coordinate(*args):
+    def coordinate(*args, **kwargs):
         calls.append(executor._current_coordination_id(Decision(True).candidate_plan))
-        return original(*args)
+        return original(*args, **kwargs)
     def acknowledge(coord_id):
         root = executor._coordination_dir()
         assert read_record(root / "request.json")["coord_id"] == coord_id

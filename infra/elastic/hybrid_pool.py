@@ -519,6 +519,7 @@ class InterReplicaGradientDomain:
         step: int = -1,
         state_version: int = -1,
         in_place: bool = False,
+        accepted_hybrid_stats: list[dict[str, float]] | None = None,
     ) -> dict[str, tuple[torch.Tensor, ...]]:
         """Reduce local sample means into the fixed global batch gradient.
 
@@ -530,6 +531,7 @@ class InterReplicaGradientDomain:
         gradient buffers to this call. It bounds temporary storage to transport
         chunks, rather than duplicating every FP32 model gradient. The default
         retains independent output buffers and leaves its inputs untouched.
+        When requested, report statistics for the same accepted local lanes.
         """
         distributed = (
             dist is not None
@@ -642,6 +644,10 @@ class InterReplicaGradientDomain:
             self._consumed_payloads.update(k for k in seen if k[2] >= 0)
             if step >= 0:
                 self._consumed_payloads = {k for k in self._consumed_payloads if k[2] >= step - 1}
+        if accepted_hybrid_stats is not None:
+            for _, payload, _ in accepted:
+                if payload.stats:
+                    accepted_hybrid_stats.append(payload.stats)
 
         # In a real distributed launch each rank owns one core replica lane. The
         # transport call performs the RDMA/NCCL all-reduce. For local tests we

@@ -9,7 +9,7 @@ from RL_Framework.infra.elastic.runtime_executor import RuntimeElasticExecutor
 
 @pytest.mark.parametrize('fail', [False, True])
 @pytest.mark.parametrize('preexisting', [False, True])
-def test_subset_publication_restores_temporary_scope_and_keeps_old_loan(fail, preexisting):
+def test_subset_publication_keeps_old_loan_and_pending_scope(fail, preexisting):
     borrowed = {'old-hybrid-engine'}
     unavailable = borrowed | {'returned-engine'}
     topology = object()
@@ -22,14 +22,10 @@ def test_subset_publication_restores_temporary_scope_and_keeps_old_loan(fail, pr
         trainer._restored_rollouts_pending_publication = previous_pending
     observed = []
 
-    def sync(*, target_version):
-        observed.append((target_version, set(trainer._publication_target_ids),
-            set(trainer._restored_rollouts_pending_publication)))
+    def sync(*, target_version, instance_ids, reopen_restored):
+        observed.append((target_version, set(instance_ids), reopen_restored))
         if fail:
             raise RuntimeError('receiver failed')
-        # The real NCCL trainer invokes this helper after sender ACK.
-        from RL_Framework.infra.elastic.rollout_lifecycle import reopen_after_publication
-        reopen_after_publication(trainer)
 
     trainer._sync_weights = sync
     command = dict(operation='publish', target=dict(scope='returned_subset',
@@ -39,7 +35,7 @@ def test_subset_publication_restores_temporary_scope_and_keeps_old_loan(fail, pr
             _run_operation(engine, command, trainer)
     else:
         assert _run_operation(engine, command, trainer)['acknowledged']
-    assert observed == [(7, {'returned-engine'}, {'returned-engine'})]
+    assert observed == [(7, {'returned-engine'}, False)]
     assert trainer.config is topology
     assert trainer._rollout_unavailable_ids is unavailable
     if preexisting:

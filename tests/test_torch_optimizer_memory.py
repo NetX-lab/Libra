@@ -405,3 +405,80 @@ def test_bf16_streaming_leaves_unsupported_mcore_preparation_untouched(mcore_cpu
     bound_default_torch_adam_memory(actual.root, release_main_gradients=True)
     assert not getattr(child, '_libra_streamed_bf16_main_gradients', False)
     assert child._copy_model_grads_to_main_grads == original
+
+
+@pytest.mark.parametrize('path,children', [
+    ('streaming', 2), ('eager', 2), ('dynamic_fallback', 2),
+    ('standalone_eager', 1),
+])
+@pytest.mark.parametrize('bad_gradient', [float('nan'), float('inf')])
+def test_nonfinite_existing_norm_rejects_before_clip_or_any_adam_state_change(
+        mcore_cpu, monkeypatch, children, path, bad_gradient):
+    actual = mcore_cpu.make(children)
+    for model in actual.models:
+        model.main_grad.fill_(1.)
+    actual.root.step()  # Populate moments and counters before the failing update.
+    if path.endswith('eager'):
+        for child in actual.children:
+            child.optimizer.param_groups[0]['foreach'] = True
+    bound_default_torch_adam_memory(actual.root, release_main_gradients=True)
+    if path.endswith('dynamic_fallback'):
+        for child in actual.children:
+            child.optimizer.param_groups[0]['foreach'] = True
+    before_parameters = [parameter.detach().clone() for parameter in actual.parameters]
+    before_models = [model.detach().clone() for model in actual.models]
+    before_states = [copy.deepcopy(child.optimizer.state_dict()) for child in actual.children]
+    # The later child's norm must reject before the first child is clipped or stepped.
+    actual.children[-1].model_float16_groups[0][0].main_grad.fill_(bad_gradient)
+    clipped, stepped = [], []
+    from megatron.core.optimizer import clip_grads
+    monkeypatch.setattr(clip_grads, 'multi_tensor_scale_impl',
+        lambda *args: clipped.append(args))
+    for child in actual.children:
+        monkeypatch.setattr(child.optimizer, 'step', lambda: stepped.append(True))
+    mcore_cpu.reductions.clear()
+    root = actual.children[0] if path.startswith('standalone') else actual.root
+    with pytest.raises(FloatingPointError, match='non-finite gradient norm'):
+        root.step()
+    assert len(mcore_cpu.reductions) == 1
+    assert not clipped and not stepped
+    assert all(torch.equal(parameter, before)
+        for parameter, before in zip(actual.parameters, before_parameters))
+    assert all(torch.equal(model, before) for model, before in zip(actual.models, before_models))
+    for child, before in zip(actual.children, before_states):
+        current = child.optimizer.state_dict()
+        assert current['param_groups'] == before['param_groups']
+        for parameter, fields in before['state'].items():
+            for name, value in fields.items():
+                assert torch.equal(current['state'][parameter][name], value)
+
+
+@pytest.mark.parametrize('path', ['streaming', 'standalone_eager'])
+@pytest.mark.parametrize('zero', [False, True])
+def test_guarded_existing_norm_preserves_finite_and_zero_updates(mcore_cpu, path, zero):
+    children = 1 if path.startswith('standalone') else 2
+    actual, expected = mcore_cpu.make(children), mcore_cpu.make(children)
+    if path.endswith('eager'):
+        for child in actual.children:
+            child.optimizer.param_groups[0]['foreach'] = True
+    bound_default_torch_adam_memory(actual.root, release_main_gradients=True)
+    if path.endswith('dynamic_fallback'):
+        for child in actual.children:
+            child.optimizer.param_groups[0]['foreach'] = True
+    for step in range(2):
+        for model, reference in zip(actual.models, expected.models):
+            gradient = torch.zeros_like(model) if zero else torch.linspace(-3., 7., model.numel())
+            model.main_grad.copy_(gradient)
+            reference.main_grad.copy_(gradient)
+        actual_root = actual.children[0] if path.startswith('standalone') else actual.root
+        expected_root = expected.children[0] if path.startswith('standalone') else expected.root
+        mcore_cpu.reductions.clear()
+        expected_result = expected_root.step()
+        actual_result = actual_root.step()
+        assert actual_result == expected_result
+        assert len(mcore_cpu.reductions) == 2
+        for child, reference in zip(actual.children, expected.children):
+            parameters = [p for group in child.optimizer.param_groups for p in group['params']]
+            targets = [p for group in reference.optimizer.param_groups for p in group['params']]
+            _assert_adam_equal(child.optimizer, reference.optimizer, parameters, targets)
+        assert all(torch.equal(a, b) for a, b in zip(actual.models, expected.models))

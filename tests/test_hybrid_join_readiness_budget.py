@@ -57,6 +57,7 @@ def bootstrap(tmp_path, monkeypatch):
             receipt = dict(snapshot=str(manifest), rank=0, pid=123, acknowledged=True,
                 snapshot_id="capture0", optimizer_revision=0, state_version=0,
                 lane_snapshot_id="lane0", target_core_id="dp0", source_uri="ehp://source/lane0")
+            receipt.update(executor.hybrid_task_identity(identity.worker))
             (tmp_path / f"{identity.worker}.rank_0.ready").write_text(
                 "".join(f"{key}={value}\n" for key, value in receipt.items()))
         return False
@@ -135,6 +136,7 @@ def queued_activation(bootstrap, monkeypatch):
         receipt = dict(snapshot=str(latest), rank=0, pid=123, acknowledged=True,
             snapshot_id="capture14", optimizer_revision=14, state_version=14,
             lane_snapshot_id="lane14", target_core_id="dp0", source_uri="ehp://source/lane14")
+        receipt.update(executor.hybrid_task_identity(h.identity.worker))
         (latest.parent / f"{h.identity.worker}.rank_0.ready").write_text(
             "".join(f"{key}={value}\n" for key, value in receipt.items()))
 
