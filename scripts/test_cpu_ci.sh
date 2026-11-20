@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-python -m pytest -q --strict-markers -o faulthandler_timeout=60 --junitxml=reports/cpu-tests.xml \
+python -m pytest -v -o faulthandler_timeout=60 --strict-markers --junitxml=reports/cpu-tests.xml \
   tests/test_config_parsing.py \
   tests/test_qwen3_config.py \
   tests/test_planner_global_batch_workload.py \

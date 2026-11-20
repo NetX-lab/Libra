@@ -570,12 +570,13 @@ class CMLFQScheduler(BaseScheduler):
         self,
         tp_preferences: list[int],
         global_counts: dict[str, int] | None = None,
+        *, eligible=None,
     ) -> Optional[InstanceHandle]:
         """Try select."""
         for tp_degree in tp_preferences:
             candidates = [
                 h for h in self._instances_by_tp.get(tp_degree, [])
-                if h.is_ready
+                if h.is_ready and (eligible is None or eligible(h))
             ]
             if not candidates:
                 continue

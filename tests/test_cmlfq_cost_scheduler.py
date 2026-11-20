@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -22,6 +23,7 @@ from RL_Framework.infra.scheduling.cmlfq_scheduler import CMLFQMigrationDecision
 from RL_Framework.infra.scheduling.cmlfq_tool_state import DefaultToolStateExtractor
 from RL_Framework.infra.scheduling.factory import SchedulerFactory
 from RL_Framework.infra.cost_model.model import RolloutCostModel
+from RL_Framework.infra.elastic.rollout_lifecycle import apply_availability
 
 
 BUCKETS = {
@@ -68,16 +70,24 @@ class TestDistributionCostRouting(unittest.TestCase):
         routing = CMLFQRoutingCosts(rollout_model=model)
         # TP1 has room for nine KV tokens; this request needs twenty.
         self.assertTrue(math.isinf(routing.completion_seconds(1, "short", 10, 10)))
+        routing.decode_ms = {"1": {"short": 1}}
+        self.assertTrue(math.isinf(routing.completion_seconds(1, "short", 10, 10)))
+        self.assertTrue(math.isinf(routing.decode_seconds(1, "short", 10, 10)))
 
     def test_known_load_can_move_a_trace_to_a_slower_idle_service(self):
         s = scheduler(lengths=(10000,))
         s.routing_costs.decode_ms = {"1": {"long": 2000}, "4": {"long": 2500}}
         s.routing_costs.migrations[0]["recompute_ms"] = 100
         request = s.schedule(100, "p").request_id
-        s.schedule(100, "other")
+        other = s.schedule(100, "other").request_id
+        previous = s.reserve_generation(other)
+        s.commit_generation(other, previous)
+        # The other trajectory is waiting on its tool; the server is free.
+        self.assertFalse(s.on_tool_return(request, EVENT, 900).should_migrate)
+        s.reserve_generation(other)
         # Staying waits behind one equal representative workload: 4s.
         # The idle service needs 2.5s generation plus .1s movement.
-        decision = s.on_tool_return(request, EVENT, 900)
+        decision = s.reserve_generation(request)
         self.assertTrue(decision.should_migrate)
         self.assertEqual(decision.target_instance_index, 1)
 
@@ -88,15 +98,31 @@ class TestDistributionCostRouting(unittest.TestCase):
         s.routing_costs.rollout_model = RolloutCostModel(
             num_params=1, d_model=1, n_layers=1, n_kv_heads=1, head_dim=1,
             dtype_bytes=1, flops_peak=1000, mem_bw=1000, mem_capacity=1e9,
-            tp_comm_overhead=0, prefill_mfu=1, prefill_chunk_size=100,
-            calibration={"4": {"prefill_scale": 4}},
+            tp_comm_overhead=0, prefill_mfu=1, prefill_chunk_size=100, act_workspace_bytes=0,
         )
         request = s.schedule(100, "p").request_id
         decision = s.on_tool_return(request, EVENT, 0)
-        # Both services recompute 100 tokens (42.4s); decode is 2s vs 1s.
+        # Recompute to TP4 pays its cold prefill once; decode is 2s vs 1s.
         self.assertTrue(decision.should_migrate)
-        self.assertAlmostEqual(decision.prefill_seconds, 42.4)
-        self.assertAlmostEqual(decision.migration_seconds, 0)
+        self.assertAlmostEqual(decision.prefill_seconds, 0)
+        self.assertAlmostEqual(decision.migration_seconds, 10.6)
+
+        s.routing_costs.migrations = costs(recompute_ms=100).migrations
+        measured = s.reserve_generation(request)
+        self.assertEqual(measured.execution_path, "recompute")
+        self.assertAlmostEqual(measured.prefill_seconds, 0)
+        self.assertAlmostEqual(measured.migration_seconds, .1)
+
+    def test_analytic_decode_prices_an_unprofiled_bin(self):
+        model = RolloutCostModel(
+            num_params=1000, d_model=8, n_layers=2, n_kv_heads=2, head_dim=4,
+            dtype_bytes=2, flops_peak=1e9, mem_bw=1e9, mem_capacity=1e9,
+            tp_comm_overhead=0, prefill_mfu=1, act_workspace_bytes=0,
+        )
+        routing = CMLFQRoutingCosts(rollout_model=model)
+        seconds = routing.decode_work_seconds(1, "short", 8, 32, other_requests=1)
+        self.assertTrue(math.isfinite(seconds))
+        self.assertGreater(seconds, 0)
 
     def test_online_tree_excludes_feedback_from_remaining_generated_tokens(self):
         s = scheduler(lengths=())
@@ -171,6 +197,42 @@ class TestDistributionCostRouting(unittest.TestCase):
         s.commit_generation(request, decision)
         self.assertEqual(s.get_request_route(request).instance_index, 1)
 
+    def test_missing_migration_price_falls_back_to_fitting_ready_service(self):
+        for history in ((), (10000,)):
+            with self.subTest(history=history):
+                s = scheduler(lengths=history)
+                s.routing_costs.migrations = []
+                s.register_instance(2, "fit", 4)
+                s.get_instance_handle(1).kv_capacity_tokens = 115
+                s.get_instance_handle(2).kv_capacity_tokens = 120
+                request = s.schedule(100, "p").request_id
+                s.on_tool_return(request, EVENT, 0, preview=False)
+                owner = SimpleNamespace(rollout_engine=SimpleNamespace(scheduler=s))
+                apply_availability(owner, {"s"})
+                with self.assertRaisesRegex(RuntimeError, "fit 121 tokens"):
+                    s.reserve_generation(request, 100, 21)
+                decision = s.reserve_generation(request, 100, 20)
+                self.assertEqual(decision.target_instance_index, 2)
+                self.assertEqual(decision.execution_path, "recompute")
+                self.assertEqual(decision.reason, "source_withdrawn")
+
+    def test_fast_profile_cannot_route_to_an_instance_that_does_not_fit(self):
+        s = scheduler(lengths=(10000,))
+        s.get_instance_handle(1).kv_capacity_tokens = 119
+        request = s.schedule(100, "p").request_id
+        s.on_tool_return(request, EVENT, 0, preview=False)
+        self.assertFalse(s.reserve_generation(request, 100, 20).should_migrate)
+        s.rollback_generation(request)
+        self.assertTrue(s.reserve_generation(request, 100, 19).should_migrate)
+
+    def test_resume_without_history_checks_the_generation_budget(self):
+        s = scheduler(lengths=())
+        s.get_instance_handle(0).kv_capacity_tokens = 110
+        request = s.schedule(100, "p").request_id
+        decision = s.reserve_generation(request, 100, 11)
+        self.assertEqual(decision.reason, "source_capacity")
+        self.assertEqual(decision.target_instance_index, 1)
+
     def test_rollback_releases_withdrawn_target_generation_wait(self):
         s = scheduler(lengths=())
         request = s.schedule(100, "unseen").request_id
@@ -223,7 +285,8 @@ class TestDistributionCostRouting(unittest.TestCase):
         s = scheduler(max_queue_length=1)
         request = s.schedule(100, "p").request_id
         self.assertTrue(s.on_tool_return(request, EVENT, 900).should_migrate)
-        s.get_instance_handle(1).active_requests = 1
+        s.attach_metrics_feed(SimpleNamespace(get=lambda instance_id:
+            SimpleNamespace(running=0, waiting=1) if instance_id == "l" else None))
         decision = s.reserve_generation(request)
         self.assertFalse(decision.should_migrate)
         s.commit_generation(request, decision)
@@ -326,7 +389,7 @@ class TestBackendIntegration(unittest.IsolatedAsyncioTestCase):
         rid = engine.begin_cmlfq_request("p", 100)
         costs = engine.scheduler.routing_costs
         try:
-            with patch.object(costs, "completion_seconds", wraps=costs.completion_seconds) as estimate:
+            with patch.object(costs, "decode_work_seconds", wraps=costs.decode_work_seconds) as estimate:
                 record = getattr(engine, "record_cmlfq_tool_return", engine.route_cmlfq_tool_return)
                 record(rid, EVENT, 900)
                 self.assertEqual(estimate.call_count, 0)
