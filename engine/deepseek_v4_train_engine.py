@@ -2,11 +2,65 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
+from contextlib import contextmanager
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
 from RL_Framework.engine.megatron_core_train_engine import MegatronCoreTrainEngine
+
+
+def _gradient_norms(_chunk_size, _overflow, tensor_lists, per_tensor=False):
+    # Megatron's DSA split combines views from several gradient buffers.
+    # Compute FP32 norms with PyTorch, grouping the foreach calls by dtype.
+    groups = defaultdict(list)
+    grads = tensor_lists[0]
+    for index, grad in enumerate(grads):
+        groups[grad.dtype].append((index, grad))
+    norms = [None] * len(grads)
+    for group in groups.values():
+        indices, tensors = zip(*group)
+        for index, norm in zip(indices, torch._foreach_norm(tensors, 2, dtype=torch.float32)):
+            norms[index] = norm
+    per_gradient = torch.stack(norms)
+    return torch.linalg.vector_norm(per_gradient).reshape(1), per_gradient if per_tensor else None
+
+
+def _scale_gradients(_chunk_size, _overflow, tensor_lists, scale):
+    # Megatron clips in place and passes the same list as both source and target.
+    groups = defaultdict(list)
+    for source, target in zip(*tensor_lists):
+        if source is not target:
+            raise ValueError("Expected in-place Megatron gradient scaling")
+        groups[target.dtype].append(target)
+    if isinstance(scale, torch.Tensor):
+        scale = scale.reshape(())
+    for group in groups.values():
+        torch._foreach_mul_(group, scale)
+
+
+@contextmanager
+def _pytorch_gradient_clipping():
+    from megatron.core.optimizer import clip_grads
+
+    saved = (
+        clip_grads.l2_norm_impl,
+        clip_grads.multi_tensor_scale_impl,
+        clip_grads.multi_tensor_scale_tensor_impl,
+    )
+    clip_grads.l2_norm_impl = _gradient_norms
+    clip_grads.multi_tensor_scale_impl = _scale_gradients
+    clip_grads.multi_tensor_scale_tensor_impl = _scale_gradients
+    try:
+        yield
+    finally:
+        (
+            clip_grads.l2_norm_impl,
+            clip_grads.multi_tensor_scale_impl,
+            clip_grads.multi_tensor_scale_tensor_impl,
+        ) = saved
 
 
 class DeepSeekV4TrainEngine(MegatronCoreTrainEngine):
@@ -165,7 +219,10 @@ class DeepSeekV4TrainEngine(MegatronCoreTrainEngine):
             self._set_train_mode(True)
             stats = self._pipeline(trajectories, forward_only=False)
             # The schedule calls finalize_model_grads before returning.
-            successful, grad_norm, _ = self.optimizer.step()
+            # Both Apex and TE 2.20 hit illegal accesses calculating V4's
+            # DSA split norm on H20. Preserve Megatron's reductions and clipping.
+            with _pytorch_gradient_clipping():
+                successful, grad_norm, _ = self.optimizer.step()
             if not successful:
                 raise FloatingPointError("DeepSeek V4 optimizer rejected the update")
             self.optimizer_revision += 1

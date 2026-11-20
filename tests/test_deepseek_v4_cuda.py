@@ -86,3 +86,16 @@ def test_v4_schedule_preserves_actions_when_padding_variable_lengths(monkeypatch
     assert all(torch.isfinite(item["loss"]) for item in stats)
     assert model.embedding.weight.grad is not None
     assert model.embedding.weight.grad[5:].count_nonzero() == 0
+
+
+def test_v4_gradient_clipping_supports_mixed_precision():
+    from RL_Framework.engine.deepseek_v4_train_engine import _gradient_norms, _scale_gradients
+
+    grads = [torch.tensor([3., 4.], dtype=torch.bfloat16),
+             torch.tensor([0., 12.], dtype=torch.float32)]
+    total, norms = _gradient_norms(None, None, [grads], per_tensor=True)
+    torch.testing.assert_close(norms, torch.tensor([5., 12.]))
+    torch.testing.assert_close(total, torch.tensor([13.]))
+    _scale_gradients(None, None, [grads, grads], torch.tensor([0.5]))
+    torch.testing.assert_close(grads[0].float(), torch.tensor([1.5, 2.]))
+    torch.testing.assert_close(grads[1], torch.tensor([0., 6.]))
