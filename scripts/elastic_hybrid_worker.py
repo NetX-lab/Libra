@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import time
+import traceback
 from pathlib import Path
 
 import torch
@@ -59,23 +60,49 @@ def _load_payload_file(path: Path, *, worker_id: str, target_core_id: str, args)
         step=int(data.get("step", -1)) if isinstance(data, dict) else -1,
         state_version=int(data.get("state_version", -1)) if isinstance(data, dict) else -1,
         membership_epoch=int(data.get("membership_epoch", 0)) if isinstance(data, dict) else 0,
+        sample_count=int(data.get("sample_count", 1)) if isinstance(data, dict) else 1,
+        global_sample_count=int(data.get("global_sample_count", 0)) if isinstance(data, dict) else 0,
     )
 
 
-def _touch_ready(task_dir: Path, worker_id: str, snapshot_path: str):
+def worker_identity(data=None):
+    """Reject a task from another launch before installing or computing."""
+    identity = {}
+    for field in ("run_id", "generation", "launch_owner"):
+        launched = os.environ.get("LIBRA_HYBRID_" + field.upper(), "")
+        if not launched:
+            continue
+        if field == "generation":
+            launched = int(launched)
+        if isinstance(data, dict) and data.get(field) != launched:
+            raise ValueError(f"Hybrid task {field} differs from its launched worker")
+        identity[field] = launched
+    return identity
+
+
+def _touch_ready(task_dir: Path, worker_id: str, snapshot_path: str, receipt=None):
     task_dir.mkdir(parents=True, exist_ok=True)
     rank = int(os.environ.get("RANK", "0"))
     ready = task_dir / f"{worker_id}.rank_{rank}.ready"
-    ready.write_text(f"snapshot={snapshot_path}\npid={os.getpid()}\nrank={rank}\n", encoding="utf-8")
-    if rank == 0:
-        (task_dir / f"{worker_id}.ready").write_text(ready.read_text(encoding="utf-8"), encoding="utf-8")
+    contents = f"snapshot={snapshot_path}\npid={os.getpid()}\nrank={rank}\n"
+    details = {**(receipt or {}), **worker_identity()}
+    contents += "".join(f"{key}={value}\n" for key, value in details.items())
+    temporary = ready.with_suffix(f".tmp.{os.getpid()}")
+    temporary.write_text(contents, encoding="utf-8")
+    temporary.replace(ready)
+
+
+def _install_state_and_prepare(args, engine, snapshot):
+    receipt = engine.load_elastic_state_snapshot(
+        snapshot, target_core_id=args.target_core_id,
+        replica_rank=int(os.environ.get("RANK", "0")))
+    engine.prepare_elastic_gradient_communication()
+    return receipt
 
 
 def _initialize_megatron_worker(args):
     if not args.config:
         raise ValueError("--config is required for --worker-mode megatron_core")
-    backend = str(getattr(torch, "__name__", ""))
-    del backend
     from RL_Framework.config import AsyncRLConfig
     from RL_Framework.engine.train_factory import create_train_engine
 
@@ -92,10 +119,33 @@ def _initialize_megatron_worker(args):
         torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     if config.train_backend != "megatron_core":
         raise ValueError("elastic hybrid workers currently require Megatron-Core")
+    model_width = (int(getattr(config, "train_tp_size", 1))
+                   * int(getattr(config, "train_pp_size", 1))
+                   * int(getattr(config, "train_cp_size", 1)))
+    expert_width = int(getattr(config, "train_ep_size", 1))
+    replica_world = model_width * expert_width
+    launched_world = int(os.environ.get("WORLD_SIZE", getattr(args, "replica_world_size", replica_world)))
+    if launched_world != replica_world:
+        raise ValueError(f"Hybrid launch must contain one complete model replica: {launched_world} != {replica_world}")
+    # In MCore, EP subdivides the dense-DP dimension. One dense replica uses
+    # DP1; a complete expert replica retains its EP workers and expert-DP1.
+    config.train_dp_size = expert_width
+    config.train_gpus = replica_world
+    config.tp_size = int(getattr(config, "train_tp_size", 1))
     engine = create_train_engine(config)
     engine.initialize(max_seq_length=config.max_seq_length)
-    if not args.initialize_only:
-        engine.load_elastic_state_snapshot(args.snapshot_path)
+    actual = engine.get_parallel_state()
+    if int(actual["train_dp"]) != expert_width or int(getattr(engine, "world_size", launched_world)) != launched_world:
+        raise RuntimeError("Hybrid factory initialized a different replica topology")
+    for key in ("tp", "pp", "cp", "ep"):
+        if int(actual[f"train_{key}"]) != int(getattr(config, f"train_{key}_size", 1)):
+            raise RuntimeError(f"Hybrid factory changed the requested {key} model parallelism")
+    from RL_Framework.engine.logprob_compat import install as install_bounded_logprob
+    install_bounded_logprob(engine)
+    if args.initialize_only:
+        engine.prepare_elastic_gradient_communication()
+    else:
+        _install_state_and_prepare(args, engine, args.snapshot_path)
     engine.hybrid_lockstep_gradient_sync = bool(getattr(config.global_resource_planner, "hybrid_lockstep_gradient_sync", True))
     return engine
 
@@ -136,17 +186,29 @@ def _gradient_client(args, endpoint_data):
     return ElasticGradientClient(endpoint)
 
 
+def _prepare_training_task(engine, data):
+    """Check the task's policy contract before recomputing its local anchor."""
+    objective = getattr(engine, "grpo_objective", "legacy")
+    if data.get("grpo_objective", "legacy") != objective:
+        raise ValueError("Hybrid task and worker have different GRPO objectives")
+    if objective == "decoupled":
+        if int(data["state_version"]) != engine.optimizer_revision:
+            raise ValueError("Hybrid anchor requires the task's installed optimizer revision")
+    engine.recompute_logprobs(data["trajectories"])
+
+
 def main():
     args = parse_args()
-    snapshot = Path(args.snapshot_path)
-    if not snapshot.exists() and not args.initialize_only:
+    snapshot = args.snapshot_path
+    if not snapshot.startswith("ehp://") and not Path(snapshot).exists() and not args.initialize_only:
         raise FileNotFoundError(f"snapshot does not exist: {snapshot}")
     engine = _initialize_megatron_worker(args) if args.worker_mode == "megatron_core" else None
     if args.initialize_only:
         _touch_ready(Path(args.task_dir), args.worker_id, str(snapshot))
         return
     if engine is None:
-        torch.load(snapshot, map_location="cpu", weights_only=False)
+        if not snapshot.startswith("ehp://"):
+            torch.load(snapshot, map_location="cpu", weights_only=False)
     endpoint = GradientEndpoint(args.gradient_host, args.gradient_port, args.authkey)
     if engine is not None:
         client = _gradient_client(args, _endpoint_for_lane(args, engine))
@@ -180,7 +242,7 @@ def main():
     if not args.task_dir:
         raise ValueError("--task-dir or --payload-file is required")
     task_dir = Path(args.task_dir)
-    _touch_ready(task_dir, args.worker_id, str(snapshot))
+    _touch_ready(task_dir, args.worker_id, str(snapshot), getattr(engine, "_elastic_state_receipt", None))
     while True:
         tasks = sorted(task_dir.glob(f"{args.worker_id}.*.pt"))
         if not tasks:
@@ -189,32 +251,62 @@ def main():
         for task_path in tasks:
             try:
                 data = torch.load(task_path, map_location="cpu", weights_only=False)
+                if isinstance(data, dict):
+                    worker_identity(data)
                 if isinstance(data, dict) and data.get("shutdown"):
                     task_path.rename(task_path.with_suffix(task_path.suffix + ".done"))
                     return
+                if engine is not None and isinstance(data, dict) and data.get("install_state"):
+                    installed_snapshot = str(data["snapshot_path"])
+                    receipt = _install_state_and_prepare(args, engine, installed_snapshot)
+                    snapshot = installed_snapshot
+                    _touch_ready(task_dir, args.worker_id, snapshot, receipt)
+                    if torch.distributed.is_initialized():
+                        torch.distributed.barrier()
+                    if int(os.environ.get("RANK", "0")) == 0:
+                        task_path.rename(task_path.with_suffix(task_path.suffix + ".done"))
+                    if torch.distributed.is_initialized():
+                        torch.distributed.barrier()
+                    continue
                 if engine is not None and isinstance(data, dict) and "trajectories" in data:
                     task_snapshot = str(data.get("snapshot_path", ""))
                     if task_snapshot and task_snapshot != str(snapshot):
-                        engine.load_elastic_state_snapshot(task_snapshot)
-                        snapshot = Path(task_snapshot)
-                    engine.recompute_logprobs(data["trajectories"])
-                    payload = engine.compute_elastic_gradient_payload(data["trajectories"], worker_id=args.replica_id or args.worker_id, target_core_id=args.target_core_id, step=int(data["step"]), state_version=int(data["state_version"]), membership_epoch=int(data["membership_epoch"]))
+                        _install_state_and_prepare(args, engine, task_snapshot)
+                        snapshot = task_snapshot
+                    data["trajectories"] = [dict(row) for row in data["trajectories"]]
+                    _prepare_training_task(engine, data)
+                    payload = engine.compute_elastic_gradient_payload(data["trajectories"], worker_id=args.replica_id or args.worker_id, target_core_id=args.target_core_id, step=int(data["step"]), state_version=int(data["state_version"]), membership_epoch=int(data["membership_epoch"]), global_sample_count=int(data.get("global_sample_count", 0)))
                 else:
                     payload = _load_payload_file(task_path, worker_id=args.worker_id, target_core_id=args.target_core_id, args=args)
                 if payload is not None:
                     expect_update = bool(engine is not None and getattr(engine, "hybrid_lockstep_gradient_sync", True))
                     update = client.send(payload, expect_update=expect_update)
+                    if expect_update and update is None:
+                        raise RuntimeError("Hybrid did not receive its required post-AllReduce update")
                     if update is not None:
-                        if update.replica_id != payload.replica_id or update.step != payload.step or update.membership_epoch != payload.membership_epoch:
+                        if update.replica_id != payload.replica_id or update.step != payload.step or update.membership_epoch != payload.membership_epoch or update.state_version != payload.state_version + 1:
                             raise RuntimeError("received mismatched post-AllReduce update")
                         engine.apply_elastic_gradient_update(update.tensors, state_version=update.state_version)
                 if torch.distributed.is_initialized():
                     torch.distributed.barrier()
                 if int(os.environ.get("RANK", "0")) == 0:
                     task_path.rename(task_path.with_suffix(task_path.suffix + ".done"))
-            except Exception as exc:
-                task_path.with_suffix(task_path.suffix + ".error").write_text(str(exc), encoding="utf-8")
-                task_path.rename(task_path.with_suffix(task_path.suffix + ".failed"))
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+            except Exception:
+                # Only the lane that retires the input writes the diagnostic.
+                try:
+                    task_path.rename(task_path.with_suffix(task_path.suffix + ".failed"))
+                except OSError:
+                    pass
+                else:
+                    try:
+                        task_path.with_suffix(task_path.suffix + ".error").write_text(
+                            traceback.format_exc(), encoding="utf-8")
+                    except Exception:
+                        pass
+                # torchrun reports the original failure and stops the other lanes.
+                raise
 
 
 if __name__ == "__main__":

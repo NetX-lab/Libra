@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import asyncio
 from typing import Any, Callable
 
 import torch
@@ -134,10 +135,16 @@ class CodeAgentWorkflow:
 
 
             generate_kwargs = {
+                "prompt_id": prompt_id,
                 "prompt": current_text,
                 "max_new_tokens": self.max_new_tokens,
                 "temperature": self.temperature,
                 "n": 1,
+                # Reused segment count (approximate at BPE boundaries); skips the
+                # engine-side estimation encode.
+                "input_tokens": sum(
+                    len(tokens) for tokens, _, _ in segments
+                ),
             }
             if cmlfq_request_id:
                 generate_kwargs.update({
@@ -146,7 +153,10 @@ class CodeAgentWorkflow:
                 })
             try:
                 response = await engine.generate(**generate_kwargs)
-            except Exception:
+            except BaseException:
+                # BaseException: CancelledError (task cancellation) must
+                # also release the C-MLFQ request state, otherwise the
+                # leaked entry wedges wait_until_idle until timeout.
                 cancel_cmlfq = getattr(
                     engine, "cancel_cmlfq_request", None
                 )
@@ -174,6 +184,11 @@ class CodeAgentWorkflow:
 
                 try:
                     pass_rate, metadata = await self.executor.execute(code, test_cases)
+                except asyncio.CancelledError:
+                    cancel = getattr(engine, "cancel_cmlfq_request", None)
+                    if cmlfq_request_id and callable(cancel):
+                        cancel(cmlfq_request_id)
+                    raise
                 except Exception as e:
                     pass_rate = 0.0
                     metadata = {"error": str(e)}

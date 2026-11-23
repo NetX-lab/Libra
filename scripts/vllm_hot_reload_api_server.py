@@ -4,17 +4,33 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import re
 from pathlib import Path
 import time
 
-from fastapi import HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 import uvloop
 
+import vllm
 from vllm.entrypoints.openai import api_server
 from vllm.entrypoints.openai.cli_args import make_arg_parser
 from vllm.entrypoints.openai.cli_args import validate_parsed_serve_args
-from vllm.utils import FlexibleArgumentParser
+try:
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+except ImportError:
+    from vllm.utils import FlexibleArgumentParser
+
+from RL_Framework.infra.sync.prefix_cache_reset import (
+    install_checked_prefix_cache_reset, reset_prefix_cache_verified,
+)
+from RL_Framework.scripts.serving_protocol import ServingState, GenerationMiddleware
+
+# EngineCore subprocesses import this project entrypoint before utility RPCs.
+if vllm.__version__.split("+")[0] == "0.9.2":
+    install_checked_prefix_cache_reset()
 
 
 class ReloadWeightsRequest(BaseModel):
@@ -33,12 +49,102 @@ class ReloadWeightsNcclRequest(BaseModel):
     rank_offset: int
     timeout_seconds: float = 1200.0
     chunk_bytes: int = 268435456
+    snapshot_id: str | None = None
+    optimizer_revision: int | None = None
+    expected_tensor_count: int | None = None
+    session_id: str = ''
+    expected_service_instance_id: str | None = None
 
 
 _reload_lock = asyncio.Lock()
+_custom_router = APIRouter()
 
 
-@api_server.router.post("/reload_weights")
+@_custom_router.get('/publication/status')
+@_custom_router.get('/libra/kv/identity')
+async def publication_status(request: Request):
+    return request.app.state.serving_state.status()
+
+
+@_custom_router.post('/libra/kv/lease')
+async def acquire_kv_lease(request: Request):
+    body = await request.body()
+    lease_id = json.loads(body).get('lease_id') if body else None
+    if lease_id is not None and (not isinstance(lease_id, str) or not re.fullmatch('[a-f0-9]{32}', lease_id)):
+        raise HTTPException(status_code=400, detail='Invalid KV lease ID')
+    try:
+        return await request.app.state.serving_state.acquire_kv_lease(lease_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@_custom_router.delete('/libra/kv/lease/{lease_id}')
+async def release_kv_lease(lease_id: str, request: Request):
+    await request.app.state.serving_state.release_kv_lease(lease_id)
+    return {'released': True}
+
+
+async def ensure_behavior_capture(request):
+    if os.environ.get('LIBRA_CAPTURE_BEHAVIOR', '0') != '1':
+        raise HTTPException(status_code=409, detail='Actual sampler capture was not enabled')
+    async with request.app.state.behavior_install_lock:
+        existing = getattr(request.app.state, 'behavior_capture_workers', None)
+        if existing is not None:
+            return {'workers': existing, 'installed': True}
+        workers = await api_server.engine_client(request).collective_rpc('dependency_enable_behavior_capture', timeout=120)
+        expected = request.app.state.serving_state.tp_size
+        if (len(workers) != expected or sorted(worker.get('tp_rank', -1) for worker in workers) != list(range(expected))
+                or not all(worker.get('installed') for worker in workers)):
+            raise RuntimeError('All current TP workers must verify the actual serving sampler')
+        from RL_Framework.scripts.behavior_sampling import install_behavior_response
+        install_behavior_response()
+        request.app.state.behavior_capture_workers = workers
+        return {'workers': workers, 'installed': True}
+
+
+@_custom_router.post('/dependency_probe/behavior/install')
+async def install_behavior(request: Request):
+    return await ensure_behavior_capture(request)
+
+
+def _kv_directory(key: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}", key):
+        raise HTTPException(status_code=400, detail="invalid KV key")
+    return Path(os.environ.get("LIBRA_KV_STORAGE_PATH", "/dev/shm/libra-kv")) / key
+
+
+@_custom_router.get("/libra/kv/{key}")
+async def cpu_offload_status(key: str, source_tp: int = 1):
+    directory = _kv_directory(key)
+    if not 1 <= source_tp <= 64:
+        raise HTTPException(status_code=400, detail="invalid source TP")
+    if (directory / "released").exists():
+        raise HTTPException(status_code=410, detail="KV released")
+    manifests = []
+    for rank in range(source_tp):
+        error = directory / f"rank_{rank}.error.json"
+        if error.exists():
+            raise HTTPException(status_code=500, detail=error.read_text())
+        path = directory / f"rank_{rank}.json"
+        if not path.exists():
+            return {"ready": False}
+        manifests.append(json.loads(path.read_text()))
+    return {"ready": True, "workers": [
+        {k: v for k, v in manifest.items() if k != "tokens"} for manifest in manifests
+    ]}
+
+
+@_custom_router.delete("/libra/kv/{key}")
+async def release_cpu_offload(key: str):
+    directory = _kv_directory(key)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "released").touch()
+    for path in directory.glob("rank_*"):
+        path.unlink(missing_ok=True)
+    return {"released": True}
+
+
+@_custom_router.post("/reload_weights")
 async def reload_weights(payload: ReloadWeightsRequest, request: Request):
     """Replace resident worker weights after Libra has drained rollout work."""
     checkpoint = Path(payload.checkpoint_path).resolve()
@@ -47,25 +153,27 @@ async def reload_weights(payload: ReloadWeightsRequest, request: Request):
 
     async with _reload_lock:
         started = time.perf_counter()
+        state = request.app.state.serving_state
+        await state.begin_reload(payload.timeout_seconds)
         client = api_server.engine_client(request)
         try:
             results = await client.collective_rpc(
-                "reload_weights",
-                timeout=payload.timeout_seconds,
+                "reload_weights", timeout=payload.timeout_seconds if payload.timeout_seconds > 0 else None,
                 args=(str(checkpoint),),
             )
-            # Prefix-cache entries encode outputs from the previous parameters.
-            await client.reset_prefix_cache()
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        return {
-            "checkpoint_path": str(checkpoint),
-            "total_seconds": time.perf_counter() - started,
-            "workers": results,
-        }
+            cleared = await reset_prefix_cache_verified(client,
+                require_verified=os.environ.get('LIBRA_CHECK_PREFIX_CACHE') == '1')
+            state.install(snapshot_id=None, optimizer_revision=None, workers=results)
+            await state.reopen()
+        except BaseException as exc:
+            await state.fail(repr(exc))
+            raise
+        return dict(checkpoint_path=str(checkpoint), total_seconds=time.perf_counter()-started,
+                    workers=results, prefix_cache_cleared=cleared is True,
+                    service_generation=state.server_generation, service_instance_id=state.server_instance_id)
 
 
-@api_server.router.post("/reload_weights_nccl")
+@_custom_router.post("/reload_weights_nccl")
 async def reload_weights_nccl(
     payload: ReloadWeightsNcclRequest,
     request: Request,
@@ -73,31 +181,78 @@ async def reload_weights_nccl(
     """Receive the next model directly from the Megatron GPU stream."""
     async with _reload_lock:
         started = time.perf_counter()
+        state = request.app.state.serving_state
+        if (payload.session_id
+                and payload.expected_service_instance_id != state.server_instance_id):
+            raise HTTPException(status_code=409, detail='NCCL session targets a different physical service')
+        if ((payload.snapshot_id is None) != (payload.optimizer_revision is None)
+                or payload.optimizer_revision is not None and payload.optimizer_revision < state.optimizer_revision):
+            raise HTTPException(status_code=409, detail='Missing or regressing snapshot identity')
+        await state.begin_reload(payload.timeout_seconds)
         client = api_server.engine_client(request)
         try:
             results = await client.collective_rpc(
-                "reload_weights_nccl",
-                timeout=payload.timeout_seconds,
-                args=(
-                    payload.host,
-                    payload.port,
-                    payload.world_size,
-                    payload.rank_offset,
-                    payload.timeout_seconds,
-                    payload.chunk_bytes,
-                ),
+                "reload_weights_nccl", timeout=payload.timeout_seconds if payload.timeout_seconds > 0 else None,
+                args=(payload.host, payload.port, payload.world_size, payload.rank_offset,
+                      payload.timeout_seconds, payload.chunk_bytes)
+                     + ((payload.expected_tensor_count, payload.session_id) if payload.session_id else
+                        (payload.expected_tensor_count,) if payload.expected_tensor_count is not None else ()),
             )
-            await client.reset_prefix_cache()
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        return {
-            "total_seconds": time.perf_counter() - started,
-            "workers": results,
-        }
+            cleared = await reset_prefix_cache_verified(client,
+                require_verified=bool(payload.snapshot_id) or os.environ.get('LIBRA_CHECK_PREFIX_CACHE') == '1')
+            state.install(snapshot_id=payload.snapshot_id, optimizer_revision=payload.optimizer_revision,
+                          workers=results, rank_offset=payload.rank_offset,
+                          expected_tensor_count=payload.expected_tensor_count)
+            await state.reopen()
+        except BaseException as exc:
+            await state.fail(repr(exc))
+            raise
+        return dict(total_seconds=time.perf_counter()-started, workers=results,
+                    prefix_cache_cleared=cleared is True, service_generation=state.server_generation,
+                    service_instance_id=state.server_instance_id, snapshot_id=state.snapshot_id,
+                    optimizer_revision=state.optimizer_revision)
+
+
+# vLLM 0.9.x constructs a fresh FastAPI app in build_app() and includes its
+# module router there.  Adding routes to api_server.router alone is fragile
+# across V1 initialization; explicitly attach our private router to the
+# concrete app after vLLM has built it.
+_build_app = api_server.build_app
+
+
+def make_serving_state(args):
+    """Build the service state shared by generation and weight reload."""
+    return ServingState(args.tensor_parallel_size, args.model)
+
+
+def _build_app_for_libra(args, *pos, **kwargs):
+    app = _build_app(args, *pos, **kwargs)
+    # SageMaker bootstrap eagerly builds this stack before serving starts.
+    app.middleware_stack = None
+    return app
+
+
+def build_app_with_reload_routes(args, *pos, **kwargs):
+    app = _build_app_for_libra(args, *pos, **kwargs)
+    app.state.serving_state = make_serving_state(args)
+    app.state.behavior_install_lock = asyncio.Lock()
+    app.include_router(_custom_router)
+    async def ensure(scope):
+        if dict(scope.get('headers', ())).get(b'x-libra-capture-behavior') == b'1':
+            await ensure_behavior_capture(Request(scope))
+    app.add_middleware(GenerationMiddleware, state=app.state.serving_state, ensure_behavior=ensure)
+    return app
+
+
+api_server.build_app = build_app_with_reload_routes
 
 
 if __name__ == "__main__":
-    api_server.cli_env_setup()
+    try:
+        from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
+    except ImportError:
+        cli_env_setup = api_server.cli_env_setup
+    cli_env_setup()
     parser = FlexibleArgumentParser(
         description="vLLM OpenAI server with Libra hot weight reload support."
     )

@@ -4,7 +4,23 @@ from __future__ import annotations
 
 import numpy as np
 from dataclasses import dataclass
-from typing import List
+from typing import List, Sequence
+
+
+def split_gpu_slots(
+    hosts: Sequence[str], gpus_per_host: int, train_gpus: int,
+) -> tuple[dict[str, list[int]], dict[str, list[int]]]:
+    """Assign leading GPU slots to Core and all remaining slots to rollout."""
+    train, rollout = {}, {}
+    remaining = train_gpus
+    for host in hosts:
+        core_slots = min(remaining, gpus_per_host)
+        if core_slots:
+            train[host] = list(range(core_slots))
+            remaining -= core_slots
+        if core_slots < gpus_per_host:
+            rollout[host] = list(range(core_slots, gpus_per_host))
+    return train, rollout
 
 
 @dataclass
@@ -208,6 +224,7 @@ class CostModelAllocator:
         length_distribution: list[tuple[int, int]] | None = None,
         B_global: int = 32,
         allowed_train_tp: list[int] | None = None,
+        allowed_train_ep: list[int] | None = None,
         allowed_train_pp: list[int] | None = None,
     ):
         """Allocate resources."""
@@ -241,6 +258,7 @@ class CostModelAllocator:
             requests=requests,
             B_global=B_global,
             allowed_train_tp=allowed_train_tp,
+            allowed_train_ep=allowed_train_ep,
             allowed_train_pp=allowed_train_pp,
         )
 
@@ -274,7 +292,8 @@ class CostModelAllocator:
                 "t_rollout": r.t_rollout,
                 "t_global": r.t_global,
                 "train_config": {
-                    "tp": r.train_config.tp, "pp": r.train_config.pp,
+                    "tp": r.train_config.tp, "ep": r.train_config.ep,
+                    "pp": r.train_config.pp,
                     "dp": r.train_config.dp,
                 } if r.train_config else None,
                 "rollout_config": r.rollout_config.tp_list if r.rollout_config else None,

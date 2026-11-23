@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
@@ -46,7 +47,7 @@ class CMLFQRequestState:
     collected_return_states: list[ToolReturnState] = field(default_factory=list)
     generated_tokens: int = 0
     tool_return_token_positions: list[int] = field(default_factory=list)
-    total_output_tokens: int = 0
+    tool_return_generated_positions: list[int | None] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     has_migrated: bool = False
 
@@ -176,6 +177,7 @@ class CMLFQScheduler(BaseScheduler):
         prompt_id: str = "",
         n_samples: int = 1,
         epoch: int = -1,
+        max_new_tokens: int = 0,
     ) -> SchedulingResult:
         """Schedule."""
         with self._lock:
@@ -199,7 +201,7 @@ class CMLFQScheduler(BaseScheduler):
             self._request_states[request_id] = CMLFQRequestState(
                 request_id=request_id,
                 prompt_id=prompt_id,
-                current_bucket=shortest_bucket,
+                current_bucket=result.category,
                 current_instance_index=result.instance_index if result.instance_index >= 0 else -1,
             )
             result.request_id = request_id
@@ -318,13 +320,14 @@ class CMLFQScheduler(BaseScheduler):
             if old_handle:
                 with self._lock:
                     self._decrement_active(old_handle)
-            req_state.current_bucket = decision.target_bucket
+            req_state.current_bucket = result.category
             req_state.current_instance_index = result.instance_index
-            req_state.has_migrated = True
+            moved = result.instance_index != old_idx
+            req_state.has_migrated = req_state.has_migrated or moved
             result.request_id = request_id
-            self._migration_count += 1
+            self._migration_count += int(moved)
             with self._lock:
-                self._stats.migrated_routes += 1
+                self._stats.migrated_routes += int(moved)
 
         return result
 
@@ -389,7 +392,7 @@ class CMLFQScheduler(BaseScheduler):
             with self._lock:
                 self._decrement_active(handle)
 
-    def finish_request(self, request_id: str, total_output_tokens: int):
+    def finish_request(self, request_id: str, total_output_tokens: int, *, generated_tokens: int | None = None):
         """Finish request."""
         req_state = self._request_states.pop(request_id, None)
         if req_state is None:
@@ -400,19 +403,26 @@ class CMLFQScheduler(BaseScheduler):
             with self._lock:
                 self._decrement_active(handle)
 
-        req_state.total_output_tokens = max(0, total_output_tokens)
         if not req_state.collected_return_states:
             return
 
+        generated_positions = req_state.tool_return_generated_positions
+        pure_output = (generated_tokens is not None
+                       and len(generated_positions) == len(req_state.collected_return_states)
+                       and all(position is not None for position in generated_positions))
+        positions = (req_state.tool_return_generated_positions if pure_output
+                     else req_state.tool_return_token_positions)
+        total_length = max(0, generated_tokens if pure_output else total_output_tokens)
         remaining_lengths = [
-            max(0, total_output_tokens - position)
-            for position in req_state.tool_return_token_positions
+            max(0, total_length - position)
+            for position in positions
         ]
         trajectory = Trajectory(
             prompt_id=req_state.prompt_id,
             return_states=list(req_state.collected_return_states),
             total_remaining_lengths=remaining_lengths,
-            total_length=total_output_tokens,
+            total_length=total_length,
+            remaining_unit="model_generated_tokens" if pure_output else "context_tokens",
         )
         self.prefix_tree.insert(trajectory)
         self._recent_trajectories.append(trajectory)
@@ -507,7 +517,7 @@ class CMLFQScheduler(BaseScheduler):
                     return SchedulingResult(
                         instance_index=selected.index,
                         tp_degree=selected.tp_degree,
-                        category=bucket,
+                        category=self.bucket_for_tp(selected.tp_degree, bucket),
                         is_fallback=True,
                         reason=f"{reason}_fallback",
                         prompt_id=prompt_id,
@@ -527,7 +537,7 @@ class CMLFQScheduler(BaseScheduler):
                 return SchedulingResult(
                     instance_index=selected.index,
                     tp_degree=selected.tp_degree,
-                    category=bucket,
+                    category=self.bucket_for_tp(selected.tp_degree, bucket),
                     is_fallback=True,
                     reason="global_fallback",
                     prompt_id=prompt_id,
@@ -546,16 +556,27 @@ class CMLFQScheduler(BaseScheduler):
                 request_id="",
             )
 
+    def bucket_for_tp(self, tp_degree: int, preferred: str = "") -> str:
+        """Report the bucket of the actual instance, including on fallback."""
+        matches = [
+            name for name in self._sorted_bucket_names
+            if tp_degree in self._buckets[name].get("tp_degrees", [])
+        ]
+        if preferred in matches:
+            return preferred
+        return matches[0] if matches else "unmapped"
+
     def _try_select(
         self,
         tp_preferences: list[int],
         global_counts: dict[str, int] | None = None,
+        *, eligible=None,
     ) -> Optional[InstanceHandle]:
         """Try select."""
         for tp_degree in tp_preferences:
             candidates = [
                 h for h in self._instances_by_tp.get(tp_degree, [])
-                if h.is_ready
+                if h.is_ready and (eligible is None or eligible(h))
             ]
             if not candidates:
                 continue
@@ -627,6 +648,38 @@ class CMLFQScheduler(BaseScheduler):
             f"active requests={len(self._request_states)}, "
             f"tree statistics={self.prefix_tree.get_stats()}"
         )
+
+    def export_learned_state(self) -> dict:
+        """Carry live evidence and the rebuild window across engine rebinds."""
+        state = super().export_learned_state()
+        state["cmlfq"] = {
+            "prefix_tree": self.prefix_tree.clone(),
+            "recent_trajectories": copy.deepcopy(self._recent_trajectories),
+            "current_epoch": self._current_epoch,
+            "tree_update_count": self._tree_update_count,
+            "migration_count": self._migration_count,
+            "tool_return_count": self._tool_return_count,
+        }
+        return state
+
+    def import_learned_state(self, state: dict) -> None:
+        super().import_learned_state(state)
+        carried = state.get("cmlfq") if isinstance(state, dict) else None
+        if not isinstance(carried, dict):
+            return
+        tree = carried.get("prefix_tree")
+        if isinstance(tree, CausalPrefixTree):
+            # Prefer live state over a possibly older tree loaded from disk.
+            self.prefix_tree = tree.clone()
+        recent = carried.get("recent_trajectories")
+        if isinstance(recent, list):
+            self._recent_trajectories = copy.deepcopy([
+                traj for traj in recent if isinstance(traj, Trajectory)
+            ][-self._max_recent_trajectories:])
+        for key in ("current_epoch", "tree_update_count", "migration_count", "tool_return_count"):
+            value = carried.get(key)
+            if isinstance(value, int):
+                setattr(self, "_" + key, value)
 
     def on_epoch_end(self, epoch: int):
         """On epoch end."""

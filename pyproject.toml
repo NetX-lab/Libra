@@ -52,6 +52,7 @@ packages = [
   "RL_Framework.infra.scheduling",
   "RL_Framework.infra.sync",
   "RL_Framework.launcher",
+  "RL_Framework.scripts",
   "RL_Framework.trainer",
   "RL_Framework.workflow",
 ]

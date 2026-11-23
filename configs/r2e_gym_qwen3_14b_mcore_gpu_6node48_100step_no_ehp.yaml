@@ -122,7 +122,8 @@ global_resource_planner:
   allocation_granularity_gpus: 8
   min_train_gpus: 8
   min_rollout_gpus: 8
-  rollout_node_tp_pattern: [1, 1, 2, 4]
+  # Empty means GRP provisions heterogeneous bucket capacities with RolloutDP.
+  rollout_node_tp_pattern: []
   allowed_rollout_tp: [1, 2, 4]
   require_heterogeneous_rollout_tp: true
   micro_batch_sizes: [1]

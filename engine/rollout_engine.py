@@ -12,6 +12,8 @@ from typing import Any
 
 import httpx
 
+from RL_Framework.workflow.behavior import SamplingEvidenceError
+
 logger = logging.getLogger(__name__)
 
 
@@ -175,16 +177,32 @@ class VLLMRolloutEngine:
         n: int = 1,
         input_tokens: int = 0,
         seed: int | None = None,
-        stop: list[str] | None = None,
-        include_stop_str_in_output: bool = False,
+        stop: str | list[str] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Generate."""
-        await self._ensure_client()
+        from RL_Framework.workflow.behavior import ValidatedBehaviorTrace, validate_behavior_trace
+        prompt_token_ids = kwargs.pop("prompt_token_ids", None)
+        capture_behavior = bool(kwargs.pop("capture_behavior", False))
+        if prompt_token_ids is not None and (
+            not isinstance(prompt_token_ids, list) or not prompt_token_ids
+            or any(type(token) is not int or token < 0 for token in prompt_token_ids)
+        ):
+            error = SamplingEvidenceError if capture_behavior else ValueError
+            raise error("Explicit prompt IDs must be nonempty nonnegative integers")
+        if capture_behavior and (prompt_token_ids is None or n != 1 or type(seed) is not int):
+            raise SamplingEvidenceError("Behavior capture requires exact token IDs, n=1 and an integer seed")
+        try:
+            await self._ensure_client()
+        except Exception as exc:
+            if capture_behavior:
+                raise SamplingEvidenceError("Behavior capture client initialization failed") from exc
+            raise
+        request_options = {"headers": {"X-Libra-Capture-Behavior": "1"}} if capture_behavior else {}
 
         payload = {
             "model": self.model_path,
-            "prompt": prompt,
+            "prompt": prompt_token_ids if prompt_token_ids is not None else prompt,
             "max_tokens": max_new_tokens,
             "temperature": temperature,
             "top_p": top_p,
@@ -193,61 +211,80 @@ class VLLMRolloutEngine:
         }
         if seed is not None:
             payload["seed"] = int(seed)
-        if stop:
+        if stop is not None:
             payload["stop"] = stop
-            payload["include_stop_str_in_output"] = include_stop_str_in_output
+        include_stop = kwargs.pop("include_stop_str_in_output", None)
+        if capture_behavior or include_stop is not None:
+            payload["include_stop_str_in_output"] = True if include_stop is None else bool(include_stop)
+        if capture_behavior:
+            payload["return_tokens_as_token_ids"] = True
+        if "ignore_eos" in kwargs:
+            ignore_eos = kwargs.pop("ignore_eos")
+            payload["ignore_eos"] = bool(ignore_eos)
+        kv_transfer_params = kwargs.pop("kv_transfer_params", None)
+        if kv_transfer_params is not None:
+            if not isinstance(kv_transfer_params, dict):
+                error = SamplingEvidenceError if capture_behavior else ValueError
+                raise error("kv_transfer_params must be a dictionary")
+            payload["kv_transfer_params"] = kv_transfer_params
+        # Keep the engine forward-compatible with workflow-level generation
+        # options that are not understood by the OpenAI-compatible endpoint.
+        # Known endpoint options are promoted explicitly above; unknown options
+        # are intentionally ignored instead of crashing the rollout loop.
+        measure_first_token_latency = bool(kwargs.pop("measure_first_token_latency", False))
 
         try:
-            request_started = time.perf_counter()
-            # Streaming is required for a real time-to-first-token measurement.
-            # vLLM keeps the same completion contract while emitting SSE chunks.
-            payload["stream"] = True
-            text_parts: list[str] = []
-            token_parts: list[str] = []
-            logprob_parts: list[float | None] = []
-            first_token_latency_s: float | None = None
-            finish_reason: str | None = None
-            async with self.http_client.stream("POST", self.completions_url, json=payload) as response:
-                if response.status_code != 200:
-                    error_text = await response.aread()
-                    raise RuntimeError(
-                        f"Generation failed: status={response.status_code}, {error_text.decode(errors='replace')}"
-                    )
-                async for line in response.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                    except Exception:
-                        continue
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    choice = choices[0]
-                    delta = choice.get("text") or ""
-                    if delta and first_token_latency_s is None:
-                        first_token_latency_s = time.perf_counter() - request_started
-                    text_parts.append(delta)
-                    logprobs = choice.get("logprobs") or {}
-                    token_parts.extend(logprobs.get("tokens") or [])
-                    logprob_parts.extend(logprobs.get("token_logprobs") or [])
-                    finish_reason = choice.get("finish_reason") or finish_reason
-            request_e2e_latency_s = time.perf_counter() - request_started
-            result = {
-                "choices": [{"text": "".join(text_parts), "finish_reason": finish_reason,
-                             "logprobs": {"tokens": token_parts, "token_logprobs": logprob_parts}}],
-                "timing": {
-                    "request_started_monotonic": request_started,
-                    "first_token_latency_s": first_token_latency_s,
-                    "request_e2e_latency_s": request_e2e_latency_s,
-                },
-            }
+            if measure_first_token_latency and n == 1 and not capture_behavior and kv_transfer_params is None:
+                return await self._generate_with_token_timing(payload)
+            try:
+                response = await self.http_client.post(
+                    self.completions_url,
+                    json=payload, **request_options,
+                )
+            except (httpx.ReadError, httpx.RemoteProtocolError) as error:
+                if (
+                    isinstance(error, httpx.RemoteProtocolError)
+                    and str(error) != "Server disconnected without sending a response."
+                ):
+                    raise
+                logger.warning("Retrying completion once after HTTP disconnect: %r (url=%s)",
+                               error, self.completions_url)
+                response = await self.http_client.post(
+                    self.completions_url,
+                    json=payload, **request_options,
+                )
 
+            if response.status_code != 200:
+                error_text = response.text
+                raise RuntimeError(
+                    f"Generation failed: status={response.status_code}, {error_text}"
+                )
+
+            result = response.json()
             parsed = self._parse_response(result)
-            parsed.update(result["timing"])
+            revision = response.headers.get("x-libra-optimizer-revision")
+            if revision is not None:
+                try:
+                    parsed["sample_revision"] = int(revision)
+                except (TypeError, ValueError) as exc:
+                    raise SamplingEvidenceError("Invalid actual sampling revision") from exc
+                if parsed["sample_revision"] < 0:
+                    raise SamplingEvidenceError("Invalid actual sampling revision")
+            elif capture_behavior:
+                raise SamplingEvidenceError("Server omitted actual sampling revision")
+            if capture_behavior:
+                choices = result.get("choices")
+                trace = choices[0].get("libra_behavior") if isinstance(choices, list) and len(choices) == 1 else None
+                if not isinstance(trace, dict):
+                    raise SamplingEvidenceError("Server omitted sampler token evidence")
+                parsed["behavior_trace"] = trace
+                validate_behavior_trace(
+                    parsed, prompt_token_ids, seed=seed, temperature=temperature,
+                    top_p=top_p, output_limit=max_new_tokens,
+                )
+                parsed["behavior_trace"] = ValidatedBehaviorTrace(trace)
+                parsed["tokens"] = list(trace["output_token_ids"])
+                parsed["logprobs"] = list(trace["logprobs"])
             return parsed
 
         except Exception as e:
@@ -260,7 +297,57 @@ class VLLMRolloutEngine:
                 max_new_tokens,
                 self.completions_url,
             )
+            if capture_behavior and not isinstance(e, SamplingEvidenceError):
+                raise SamplingEvidenceError(
+                    f"Behavior capture failed: {type(e).__name__}: {e}"
+                ) from e
             raise
+
+    async def _generate_with_token_timing(self, payload: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
+        payload["stream"] = True
+        text_parts: list[str] = []
+        tokens: list[str] = []
+        logprobs: list[float | None] = []
+        first_token_latency = None
+        finish_reason = None
+        async with self.http_client.stream("POST", self.completions_url, json=payload) as response:
+            if response.status_code != 200:
+                error = (await response.aread()).decode(errors="replace")
+                raise RuntimeError(f"Generation failed: status={response.status_code}, {error}")
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                for choice in json.loads(data).get("choices") or []:
+                    delta = choice.get("text") or ""
+                    scores = choice.get("logprobs") or {}
+                    chunk_tokens = scores.get("tokens") or []
+                    if first_token_latency is None and (delta or chunk_tokens):
+                        first_token_latency = time.perf_counter() - started
+                    text_parts.append(delta)
+                    tokens.extend(chunk_tokens)
+                    logprobs.extend(scores.get("token_logprobs") or [])
+                    finish_reason = choice.get("finish_reason") or finish_reason
+            revision = response.headers.get("x-libra-optimizer-revision")
+
+        if finish_reason is None:
+            raise RuntimeError("Generation stream ended without a completion")
+        parsed = self._parse_response({"choices": [{
+            "text": "".join(text_parts),
+            "finish_reason": finish_reason,
+            "logprobs": {"tokens": tokens, "token_logprobs": logprobs},
+        }]})
+        parsed.update(
+            request_started_monotonic=started,
+            first_token_latency_s=first_token_latency,
+            request_e2e_latency_s=time.perf_counter() - started,
+        )
+        if revision is not None:
+            parsed["sample_revision"] = int(revision)
+        return parsed
 
     async def generate_batch(
         self,
@@ -292,6 +379,27 @@ class VLLMRolloutEngine:
             valid_results.append(result)
 
         return valid_results
+
+    async def wait_for_cpu_offload(self, key: str, source_tp: int, timeout: float = 30.0):
+        """Await only the portion of offload not hidden by tool execution."""
+        await self._ensure_client()
+        deadline = time.monotonic() + timeout
+        while True:
+            response = await self.http_client.get(
+                f"{self.base_url}/libra/kv/{key}", params={"source_tp": source_tp},
+            )
+            response.raise_for_status()
+            status = response.json()
+            if status.get("ready"):
+                return status
+            if time.monotonic() >= deadline:
+                raise TimeoutError("CPU KV offload did not become ready")
+            await asyncio.sleep(0.01)
+
+    async def release_cpu_offload(self, key: str):
+        await self._ensure_client()
+        response = await self.http_client.delete(f"{self.base_url}/libra/kv/{key}")
+        response.raise_for_status()
 
     # ------------------------------------------------------------------
 
@@ -325,12 +433,15 @@ class VLLMRolloutEngine:
         tokens = logprobs_data.get("tokens") or []
         token_logprobs = logprobs_data.get("token_logprobs") or []
 
-        return {
+        parsed = {
             "text": text or "",
             "tokens": tokens,
             "logprobs": token_logprobs,
             "finish_reason": choice.get("finish_reason", "length"),
         }
+        if isinstance(response.get("kv_transfer_params"), dict):
+            parsed["kv_transfer_params"] = response["kv_transfer_params"]
+        return parsed
 
     # ------------------------------------------------------------------
 

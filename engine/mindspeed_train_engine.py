@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -182,26 +183,25 @@ class MindSpeedTrainEngine(MegatronCoreTrainEngine):
         """
         pending = getattr(self, "_pending_hybrid_gradients", [])
         expected = set(getattr(self, "_elastic_step_hybrid_workers", ()))
-        if not pending and not expected:
-            return
-        if self.elastic_gradient_domain is None:
-            with self._hybrid_gradient_condition:
-                self._pending_hybrid_gradients.clear()
-            return
-        deadline = __import__("time").monotonic() + self._elastic_active_gradient_timeout_s
+        if self.elastic_gradient_domain is None or (not pending and not expected):
+            return []
+        timeout = self._elastic_active_gradient_timeout_s
+        deadline = time.monotonic() + timeout if timeout > 0 else None
         with self._hybrid_gradient_condition:
             while expected:
                 present = {p.replica_id for p in self._pending_hybrid_gradients
-                           if p.replica_id in expected and (p.step < 0 or p.step == self._elastic_training_step)}
+                           if p.replica_id in expected and p.step == self._elastic_training_step
+                           and p.state_version == self._elastic_expected_state_version}
                 missing = expected - present
                 if not missing:
                     break
-                remaining = deadline - __import__("time").monotonic()
+                remaining = deadline - time.monotonic() if deadline is not None else 0.1
                 if remaining <= 0:
                     raise TimeoutError(f"timed out waiting for active EHP gradients: {sorted(missing)}")
                 self._hybrid_gradient_condition.wait(timeout=min(remaining, 0.1))
             pending = list(self._pending_hybrid_gradients)
 
+        self._materialize_elastic_core_gradients()
         params_and_grads = []
         for chunk in self.model:
             for param in chunk.parameters():
@@ -211,13 +211,21 @@ class MindSpeedTrainEngine(MegatronCoreTrainEngine):
         if not params_and_grads:
             with self._hybrid_gradient_condition:
                 self._pending_hybrid_gradients.clear()
-            return
+            return []
         core_id = self.get_elastic_local_core_id()
+        partition = self._elastic_batch_partition
+        total_count = partition[1] if partition is not None else 0
+        hybrid_stats = []
         reduced = self.elastic_gradient_domain.reduce_core_gradients(
             core_gradients={core_id: tuple(g.detach() for _, g in params_and_grads)},
             hybrid_payloads=pending,
             step=self._elastic_training_step,
-            state_version=self.current_version,
+            state_version=self._elastic_expected_state_version,
+            core_sample_counts={core_id: total_count} if total_count else None,
+            global_sample_count=total_count,
+            in_place=True,
+            accepted_hybrid_stats=hybrid_stats,
+            reduce_across_core_replicas=False,
         )[core_id]
         mpu = self._parallel_state()
         for (param, grad), value in zip(params_and_grads, reduced):
@@ -235,16 +243,19 @@ class MindSpeedTrainEngine(MegatronCoreTrainEngine):
 
         if self._elastic_gradient_update_callback is not None:
             from RL_Framework.infra.elastic import GradientUpdate
+            local_lane = self.rank % self.get_elastic_replica_size_gpus()
+            update_tensors = tuple(g.detach().to(device="cpu", copy=True) for _, g in params_and_grads)
             for payload in pending:
-                if payload.replica_id in expected and payload.replica_rank == self.rank % self.get_elastic_replica_size_gpus():
+                if payload.replica_id in expected and payload.replica_rank == local_lane:
                     self._elastic_gradient_update_callback(GradientUpdate(
                         replica_id=payload.replica_id,
-                        tensors=tuple(g.detach().cpu() for _, g in params_and_grads),
-                        step=payload.step, state_version=self.current_version,
+                        tensors=update_tensors, step=payload.step,
+                        state_version=self._elastic_expected_state_version + 1,
                         membership_epoch=payload.membership_epoch,
                     ))
         with self._hybrid_gradient_condition:
             self._pending_hybrid_gradients.clear()
+        return hybrid_stats
 
     def build_mindspeed_args(self, max_seq_length):
         path = Path(self.mindspeed_args_path) if self.mindspeed_args_path else (
@@ -380,7 +391,7 @@ class MindSpeedTrainEngine(MegatronCoreTrainEngine):
                     trajectory[key] = torch.nn.functional.pad(trajectory[key], (0, width), value=value)
         return trajectories
 
-    def _pipeline(self, trajectories, *, forward_only=False):
+    def _pipeline(self, trajectories, *, forward_only=False, loss_scale=1.0):
         from megatron.core.pipeline_parallel import get_forward_backward_func
         batches = list(self._iter_recompute_micro_batches(trajectories) if forward_only
                        else self._iter_micro_batches(trajectories))
@@ -406,7 +417,8 @@ class MindSpeedTrainEngine(MegatronCoreTrainEngine):
                 if forward_only:
                     rows.append(self._action_log_probs(output_tensor, ids).detach())
                     return output_tensor.new_zeros(()), {}
-                return self._loss(batch, output_tensor)
+                loss, stats = self._loss(batch, output_tensor)
+                return loss * loss_scale, stats
 
             return output, loss_func
 
@@ -444,16 +456,17 @@ class MindSpeedTrainEngine(MegatronCoreTrainEngine):
         for _ in range(ppo_epochs):
             self._zero_grad()
             self._set_train_mode(True)
-            stats, _ = self._pipeline(trajectories)
+            stats, _ = self._pipeline(trajectories, loss_scale=self._elastic_core_loss_scale())
             # The pipeline schedule already finalizes model gradients once.
-            self._apply_elastic_inter_replica_gradients()
+            hybrid_stats = self._apply_elastic_inter_replica_gradients()
             ok, norm, _ = self.optimizer.step()
             if not ok:
                 raise FloatingPointError("MindSpeed optimizer rejected the update")
+            self.optimizer_revision += 1
             mpu = self._parallel_state()
             result = None
             if mpu.is_pipeline_last_stage():
-                merged = self._merge_stats(stats)
+                merged = self._merge_stats(stats + hybrid_stats)
                 merged["grad_norm"] = float(norm or 0.0)
                 result = self._reduce_stats(merged)
             payload = [result]
@@ -465,14 +478,20 @@ class MindSpeedTrainEngine(MegatronCoreTrainEngine):
         return result
 
     def compute_elastic_gradient_payload(self, trajectories, *, worker_id, target_core_id,
-                                         step, state_version, membership_epoch):
+                                         step, state_version, membership_epoch,
+                                         global_sample_count=0):
+        if int(state_version) != self.optimizer_revision:
+            raise ValueError("hybrid task optimizer revision does not match installed state")
         self._zero_grad()
         self._set_train_mode(True)
-        self._pipeline(trajectories)
+        stats, _ = self._pipeline(trajectories)
+        self._materialize_elastic_core_gradients()
         return GradientPayload(
             replica_id=worker_id, target_core_id=target_core_id,
             tensors=tuple(g.detach().cpu() for g in self._model_main_gradients()),
             replica_rank=int(self.rank % self.get_elastic_replica_size_gpus()),
             replica_world_size=self.get_elastic_replica_size_gpus(),
             step=step, state_version=state_version, membership_epoch=membership_epoch,
+            sample_count=len(trajectories), global_sample_count=int(global_sample_count),
+            stats=self._merge_stats(stats) if stats else {},
         )

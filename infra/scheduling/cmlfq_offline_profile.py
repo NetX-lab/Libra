@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
 from typing import Any
 
 from RL_Framework.infra.observability.history_collector import StepRecord
@@ -25,15 +24,6 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 
-@dataclass
-class ExtractedTrajectory:
-    """Extracted trajectory implementation."""
-    prompt_id: str
-    return_states: list[ToolReturnState]
-    total_remaining_lengths: list[float]
-    total_output_tokens: int
-
-
 class TrajectoryExtractor:
     """Trajectory extractor implementation."""
 
@@ -51,47 +41,10 @@ class TrajectoryExtractor:
         records: list[StepRecord],
     ) -> list[Trajectory]:
         """Extract from step records."""
-        trajectories = []
-        for record in records:
-            for seq in record.sequences:
-                prompt_id = str(
-                    seq.get(
-                        "prompt_id",
-                        f"step{record.step}_seq{seq.get('index', 0)}",
-                    )
-                )
-                tool_returns = seq.get("tool_returns", [])
-                if not tool_returns:
-                    continue
-
-                return_states = []
-                remaining_lengths = []
-                total_length = float(
-                    seq.get("total_output_tokens", seq.get("output_len", 0))
-                )
-                for tool_return in tool_returns:
-                    result = dict(tool_return)
-                    result.setdefault("result", tool_return.get("output", ""))
-                    return_states.append(self._tool_registry.extract(result))
-                    if "remaining_length" in tool_return:
-                        remaining = float(tool_return["remaining_length"])
-                    else:
-                        position = float(
-                            tool_return.get("token_position", total_length)
-                        )
-                        remaining = max(0.0, total_length - position)
-                    remaining_lengths.append(remaining)
-
-                trajectories.append(
-                    Trajectory(
-                        prompt_id=prompt_id,
-                        return_states=return_states,
-                        total_remaining_lengths=remaining_lengths,
-                        total_length=total_length,
-                    )
-                )
-
-        return trajectories
+        return self.extract_from_raw_data([
+            dict(seq, prompt_id=str(seq.get("prompt_id", f"step{record.step}_seq{seq.get('index', 0)}")))
+            for record in records for seq in record.sequences
+        ])
 
     def extract_from_raw_data(
         self,
@@ -105,37 +58,41 @@ class TrajectoryExtractor:
             if not tool_returns:
                 continue
 
+            total_length = float(raw.get("total_output_tokens", raw.get("output_len", 0)))
+            generated = float(raw["output_len"]) if "output_len" in raw else None
+            positions = []
+            feedback_tokens = 0
+            explicit = all("generated_token_position" in tr for tr in tool_returns)
+            recoverable = all("payload_tokens" in tr and "token_position" in tr for tr in tool_returns)
+            if generated is not None and (explicit or (recoverable and total_length - generated == sum(
+                    int(tr["payload_tokens"]) for tr in tool_returns))):
+                for tr in tool_returns:
+                    feedback_tokens += int(tr.get("payload_tokens", 0))
+                    positions.append(float(tr.get("generated_token_position", float(tr.get("token_position", 0)) - feedback_tokens)))
+            pure_output = (generated is not None and len(positions) == len(tool_returns)
+                           and all(0 <= position <= generated for position in positions)
+                           and positions == sorted(positions))
+            if pure_output:
+                remaining_lengths = [generated - position for position in positions]
+                total_length = generated
+            else:
+                # Preserve historical mean/P90 readers, but mark the old unit
+                # so these transcript lengths cannot price model decode.
+                remaining_lengths = [float(tr.get("remaining_length", max(
+                    0, total_length - float(tr.get("token_position", total_length))))) for tr in tool_returns]
             return_states = []
-            remaining_lengths = []
             for tr in tool_returns:
                 tool_result = dict(tr)
                 tool_result.setdefault("output", tr.get("result", ""))
                 state = self._tool_registry.extract(tool_result)
                 return_states.append(state)
-                total_length = float(
-                    raw.get("total_output_tokens", raw.get("output_len", 0))
-                )
-                remaining_lengths.append(
-                    float(
-                        tr.get(
-                            "remaining_length",
-                            max(
-                                0.0,
-                                total_length - float(
-                                    tr.get("token_position", total_length)
-                                ),
-                            ),
-                        )
-                    )
-                )
 
             trajectories.append(Trajectory(
                 prompt_id=prompt_id,
                 return_states=return_states,
                 total_remaining_lengths=remaining_lengths,
-                total_length=float(
-                    raw.get("total_output_tokens", raw.get("output_len", 0))
-                ),
+                total_length=total_length,
+                remaining_unit="model_generated_tokens" if pure_output else "context_tokens",
             ))
 
         return trajectories

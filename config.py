@@ -245,6 +245,9 @@ class ProfilingConfig:
 
     train_workspace_bytes: float = 0.5e9  # 500MB
 
+    # Offline backend calibration, shared by GRP, CMLFQ and EHP.
+    calibration: dict = field(default_factory=dict)
+
     @classmethod
     def from_dict(cls, d: dict) -> "ProfilingConfig":
         """Build an instance from a dictionary."""
@@ -280,7 +283,7 @@ class HeterogeneousInstanceConfig:
 class SchedulingConfig:
     """Scheduling config implementation."""
 
-    scheduler_type: str = "length_aware"  # "length_aware" / "la_mlfq" / "cmlfq" / "load_balance"
+    scheduler_type: str = "length_aware"  # length_aware / la_mlfq / cmlfq / cmlfq_cost / cmlfq_cost_kv_dynamic / load_balance
 
 
 
@@ -300,6 +303,56 @@ class SchedulingConfig:
     load_balance_strategy: str = "least_connections"
 
     max_queue_length: int = 100
+
+    # Load metric for least-connections style selection: "requests" (legacy
+    # request-count based), "tokens" (estimated in-flight token load,
+    # prompt + EMA-expected output), or "kv_tokens" (the same token load
+    # normalized by each TP bucket's estimated KV-cache capacity in tokens).
+    # Applies to load_balance / length_aware / la_mlfq schedulers; cmlfq
+    # keeps its own workload-aware routing.
+    load_metric: str = "requests"
+
+    # Explicit KV capacity override (tokens) per TP degree, e.g. {1: 120000,
+    # 2: 230000, 4: 450000}. When empty and load_metric is "kv_tokens",
+    # capacities are auto-estimated at config-load time from the hardware /
+    # model-arch configs and the rollout gpu_memory_utilization.
+    kv_capacity_tokens_by_tp: dict = field(default_factory=dict)
+
+    # Per-GPU bytes reserved for activations / workspace / fragmentation when
+    # auto-estimating KV capacity.
+    kv_activation_reserve_gib: float = 4.0
+
+    # Closed-loop /metrics feedback (engine-layer poller feeding the
+    # schedulers). Disabled by default; when enabled, observed vLLM gauges
+    # (running/waiting, gpu cache occupancy, preemptions) drive an additive
+    # bias correction of the local load estimate plus occupancy admission
+    # with hysteresis. Preemption counters are cumulative: events penalize
+    # an instance for the TTL window instead of blacklisting forever.
+    enable_metrics_feedback: bool = False
+    metrics_poll_interval_s: float = 3.0
+    metrics_request_timeout_s: float = 1.0
+    metrics_staleness_ttl_s: float = 10.0
+    metrics_admission_enter: float = 0.90
+    metrics_admission_exit: float = 0.75
+    metrics_preemption_penalty_ttl_s: float = 60.0
+    metrics_bias_alpha: float = 0.3
+
+    # Cross-rank load aggregation: every training rank publishes its
+    # per-instance in-flight accounting to this shared directory (atomic
+    # renames + heartbeat TTL); schedulers rank instances by the summed
+    # cluster load instead of their own partial view. Empty disables.
+    shared_load_dir: str = ""
+    shared_load_ttl_s: float = 30.0
+    shared_load_heartbeat_s: float = 10.0
+    shared_load_cache_ttl_s: float = 1.0
+
+    # Prefix affinity: bind prompt_id -> instance (bounded LRU) so repeated
+    # prompts (n_samples, multi-turn replays, shared system prompts) land
+    # on the instance whose prefix cache already holds them. Affinity only
+    # reorders preference among candidates that survived readiness / queue /
+    # capacity / admission filters; it never overrides them.
+    prefix_affinity: bool = False
+    prefix_affinity_max_entries: int = 8192
 
     enable_fallback: bool = True
 
@@ -330,6 +383,12 @@ class SchedulingConfig:
     cmlfq_rebuild_interval: int = 50
 
     cmlfq_migration_profile_path: str = ""
+
+    # Opt-in scheduler_type="cmlfq_cost"; legacy cmlfq is unchanged.
+    cmlfq_cost_profile_path: str = ""
+    cmlfq_kv_backend: str = "recompute"  # recompute / nixl / cpu_offload
+    # Explicitly validated directional TP pairs, e.g. [[1, 4], [4, 1]].
+    cmlfq_kv_transfer_tp_pairs: list = field(default_factory=list)
 
     cmlfq_tree_path: str = ""
 
@@ -452,7 +511,11 @@ class GlobalResourcePlannerConfig:
     rollout_node_tp_pattern: list[int] = field(default_factory=list)
     require_heterogeneous_rollout_tp: bool = False
     allowed_train_tp: list[int] = field(default_factory=list)
+    allowed_train_ep: list[int] = field(default_factory=list)
     allowed_train_pp: list[int] = field(default_factory=list)
+    train_comm_compute_ratio_threshold: float = float("inf")
+    train_ep_comm_compute_ratio_threshold: float = float("inf")
+    train_pipeline_bubble_ratio_threshold: float = 0.30
     fixed_train_gpus: int = 0
     # Startup placement is a GRP decision.  ``fixed_train_gpus`` is retained
     # only for backwards-compatible, explicitly configured deployments and is
@@ -483,6 +546,8 @@ class GlobalResourcePlannerConfig:
     memory_budget_logits_dtype_bytes: int = 4
     memory_budget_workspace_factor: float = 1.5
     apply_to_runtime: bool = True
+    runtime_forced_train_gpus: int = 0
+    runtime_forced_rollout_tp_list: list[int] = field(default_factory=list)
     verbose: bool = False
     runtime_length_profile_enabled: bool = True
     runtime_length_profile_jsonl: str = ""
@@ -539,6 +604,7 @@ class GlobalResourcePlannerConfig:
     runtime_use_nccl_barrier_before_weight_sync: bool = False
     runtime_coordinate_reconfiguration_ranks: bool = True
     runtime_coordinate_batch_source_only: bool = True
+    # Session/boundary decision timeout; expiry is a protocol error, not a no-op.
     runtime_peer_request_wait_s: float = 45.0
     vllm_launch_command_template: str = ""
     vllm_stop_command_template: str = ""
@@ -592,6 +658,38 @@ class GlobalResourcePlannerConfig:
         return _from_dict(cls, d)
 
 
+def validate_grpo_objective(config) -> None:
+    """Validate the opt-in probability contract before allocating workers."""
+    objective = getattr(config, "grpo_objective", "legacy")
+    if objective not in {"legacy", "decoupled"}:
+        raise ValueError("grpo_objective must be 'legacy' or 'decoupled'")
+    if objective == "legacy":
+        return
+    if config.train_backend != "megatron_core":
+        raise ValueError("decoupled GRPO requires train_backend='megatron_core'")
+    if not config.recompute_logprobs:
+        raise ValueError("decoupled GRPO requires recompute_logprobs=True")
+    if config.rollout_backend != "vllm":
+        raise ValueError("decoupled GRPO requires actual vLLM behavior probabilities")
+    if config.weight_sync_mode != "nccl" or config.rollout_weight_sync_mode != "nccl":
+        raise ValueError(
+            "decoupled GRPO currently requires weight_sync_mode='nccl' and "
+            "rollout_weight_sync_mode='nccl'; checkpoint publication is not supported"
+        )
+    scheduling = config.heterogeneous_rollout.scheduling
+    if scheduling.cmlfq_kv_backend != "recompute":
+        raise ValueError("decoupled GRPO requires cmlfq_kv_backend='recompute' until versioned KV migration is available")
+    planner = getattr(config, "global_resource_planner", None)
+    hybrid_enabled = any(getattr(planner, field, False) for field in (
+        "hybrid_worker_launch_enabled", "elastic_hybrid_planning_enabled",
+        "hybrid_training_prewarm_enabled",
+    ))
+    if config.ppo_epochs != 1:
+        raise ValueError("decoupled GRPO requires ppo_epochs=1")
+    if hybrid_enabled and planner.hybrid_worker_mode != "megatron_core":
+        raise ValueError("decoupled GRPO requires hybrid_worker_mode='megatron_core'")
+
+
 @dataclass
 class AsyncRLConfig:
     """Async r l config implementation."""
@@ -640,8 +738,10 @@ class AsyncRLConfig:
     queue_size: int = 256
     enable_rollout_tracing: bool = False
     sync_interval: int = 1
+    rollout_sync_drain_lead_steps: int = 2
 
 
+    grpo_objective: str = "legacy"  # legacy | decoupled
     recompute_logprobs: bool = True
     # Recompute can use a smaller temporary batch than the training update.
     # This preserves the requested training micro-batch while bounding logits.
@@ -771,6 +871,7 @@ class AsyncRLConfig:
             raise ValueError(
                 "train_backend must be 'fsdp', 'megatron3d', or 'megatron_core'"
             )
+        validate_grpo_objective(self)
 
 
         if self.train_gpus <= 0:
@@ -955,6 +1056,57 @@ class AsyncRLConfig:
                     self.master_addr = "localhost"
             else:
                 self.master_addr = "localhost"
+
+
+        self._maybe_estimate_kv_capacities()
+
+
+    def _maybe_estimate_kv_capacities(self) -> None:
+        """Auto-fill scheduling.kv_capacity_tokens_by_tp when needed.
+
+        Only runs for heterogeneous rollouts using the capacity-normalized
+        ``kv_tokens`` load metric without an explicit capacity table. The
+        estimate follows vLLM's budget rule: per GPU, the utilization
+        fraction of HBM minus sharded weights and an activation reserve,
+        divided by the per-token KV bytes of the bucket's TP layout.
+        """
+        sched = self.heterogeneous_rollout.scheduling
+        if not self.heterogeneous_rollout.enabled:
+            return
+        if getattr(sched, "load_metric", "") != "kv_tokens":
+            return
+        if sched.kv_capacity_tokens_by_tp:
+            return
+
+        from RL_Framework.infra.scheduling.base import estimate_kv_capacity_tokens
+
+        arch = self.model_arch
+        weights_bytes = float(arch.num_params) * max(1, int(arch.dtype_bytes))
+        reserve = max(0.0, float(sched.kv_activation_reserve_gib)) * 1024**3
+        tp_degrees = sorted({int(i.tp) for i in self.heterogeneous_rollout.instances if int(i.tp) > 0})
+        if not tp_degrees:
+            return
+
+        capacities: dict[int, int] = {}
+        for tp in tp_degrees:
+            capacity = estimate_kv_capacity_tokens(
+                tp_degree=tp,
+                mem_capacity_bytes=self.hardware.mem_capacity,
+                gpu_memory_utilization=self.heterogeneous_rollout.gpu_memory_utilization,
+                weights_bytes=weights_bytes,
+                n_layers=arch.n_layers,
+                n_kv_heads=arch.n_kv_heads,
+                n_heads=arch.n_heads,
+                d_model=arch.d_model,
+                head_dim=arch.head_dim,
+                dtype_bytes=arch.dtype_bytes,
+                activation_reserve_bytes=reserve,
+            )
+            if capacity > 0:
+                capacities[tp] = capacity
+
+        if capacities:
+            sched.kv_capacity_tokens_by_tp = capacities
 
     # ----------------------------------------------------------------
 

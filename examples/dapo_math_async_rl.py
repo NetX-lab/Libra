@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import torch
 import torch.distributed as dist
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -18,6 +17,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from RL_Framework import AsyncRLTrainer, parse_args_and_load_config
+from RL_Framework.engine.device_utils import distributed_backend, set_device
 from RL_Framework.env.dapo_math_reward import dapo_math_reward_fn, extract_dapo_answer
 from RL_Framework.workflow.dapo_math import DAPOMathWorkflow
 
@@ -123,8 +123,8 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if not dist.is_initialized() and world_size > 1:
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
+        set_device(local_rank)
+        dist.init_process_group(backend=distributed_backend())
 
     rank = dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", "0"))
     is_main = rank == 0

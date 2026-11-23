@@ -1,0 +1,20 @@
+# Portable rollout-scheduling preset. Model, endpoints and GPU placement
+# belong to the deployment config or the validation command, not this file.
+# Example (existing vLLM services):
+# python examples/validate_rollout_scheduling.py --config configs/scheduling_adaptive.yaml \
+#   --model <served-model-name> --endpoint <instance-id>,<tp>,<http://host:port> \
+#   --endpoint <instance-id>,<tp>,<http://host:port> --output <report.json>
+# To use for training: inherit this file via base_config from a full experiment
+# config, and supply model_path and heterogeneous_rollout.instances there.
+heterogeneous_rollout:
+  enabled: true
+  scheduling:
+    scheduler_type: load_balance
+    load_balance_strategy: least_connections
+    load_metric: kv_tokens
+    enable_metrics_feedback: true
+    prefix_affinity: true
+    # For multi-rank runs only, use a unique run directory visible to ALL ranks:
+    # shared_load_dir: <shared-filesystem>/<unique-run>/rollout-load
+    # Measured per-instance capacities from /metrics take precedence over
+    # analytic estimates; the latter require correct hardware/model_arch inputs.

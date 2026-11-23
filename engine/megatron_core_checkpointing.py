@@ -168,7 +168,9 @@ class MegatronDistributedCheckpointManager:
         )
         self._load_model_state(self._unwrap_model(model), loaded)
         if optimizer is not None and "optimizer" in loaded:
-            optimizer.load_state_dict(loaded["optimizer"])
+            from RL_Framework.engine.optimizer_state import optimizer_state_load_context
+            with optimizer_state_load_context(optimizer):
+                optimizer.load_state_dict(loaded["optimizer"])
         self._barrier()
 
     def _build_sharded_state_dict(

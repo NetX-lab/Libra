@@ -7,9 +7,11 @@ from collections import defaultdict
 from typing import Any
 
 from RL_Framework.infra.scheduling.base import (
+    DEFAULT_LOAD_METRIC,
     BaseScheduler,
     InstanceHandle,
     LoadBalanceStrategy,
+    MetricsFeedbackConfig,
     RoutingRule,
     SchedulerStats,
     SchedulingResult,
@@ -35,8 +37,20 @@ class LengthAwareScheduler(BaseScheduler):
         load_balance_strategy: str = "least_connections",
         max_queue_length: int = 100,
         enable_fallback: bool = True,
+        load_metric: str = DEFAULT_LOAD_METRIC,
+        kv_capacity_tokens_by_tp: dict[int, int] | None = None,
+        feedback: MetricsFeedbackConfig | None = None,
+        prefix_affinity: bool = False,
+        prefix_affinity_max_entries: int = 8192,
     ):
-        super().__init__(name="LengthAware")
+        super().__init__(
+            name="LengthAware",
+            load_metric=load_metric,
+            kv_capacity_tokens_by_tp=kv_capacity_tokens_by_tp,
+            feedback=feedback,
+            prefix_affinity=prefix_affinity,
+            prefix_affinity_max_entries=prefix_affinity_max_entries,
+        )
 
 
         self._rules: dict[str, RoutingRule] = dict(self.DEFAULT_ROUTING_RULES)
@@ -102,6 +116,7 @@ class LengthAwareScheduler(BaseScheduler):
         prompt_id: str = "",
         n_samples: int = 1,
         epoch: int = -1,
+        max_new_tokens: int = 0,
     ) -> SchedulingResult:
         """Schedule."""
         category = self.categorize(input_tokens)
@@ -112,13 +127,50 @@ class LengthAwareScheduler(BaseScheduler):
             self._stats.category_counts[category] += 1
 
 
+            # Prefix affinity outranks the length-bucket preference: a
+            # cache hit on the sticky instance beats a nominally better
+            # TP fit on a cold one. Filters (readiness/queue/capacity/
+            # admission) are applied to the candidate set first.
+            affinity_candidates = self._selectable(
+                [
+                    h for h in self._instances
+                    if self._prefix_affinity_enabled and h.is_ready
+                    and h.tp_degree in rule.preferred_tp_degrees and (
+                        self._max_queue_length <= 0
+                        or h.active_requests < self._max_queue_length
+                    )
+                ]
+            )
+            selected = self._affinity_pick(prompt_id, affinity_candidates)
+            if selected is not None:
+                self._stats.preferred_routes += 1
+                self._stats.category_tp_counts[category][selected.tp_degree] += 1
+                reserved = self._record_route(
+                    selected, input_tokens, category=category, prompt_id=prompt_id,
+                    max_new_tokens=max_new_tokens,
+                )
+                return SchedulingResult(
+                    instance_index=selected.index,
+                    reserved_tokens=reserved,
+                    tp_degree=selected.tp_degree,
+                    category=category,
+                    is_fallback=False,
+                    reason="prefix_affinity",
+                    prompt_id=prompt_id,
+                )
+
+
             selected = self._try_select(rule.preferred_tp_degrees)
             if selected is not None:
                 self._stats.preferred_routes += 1
                 self._stats.category_tp_counts[category][selected.tp_degree] += 1
-                selected.inc_active()
+                reserved = self._record_route(
+                    selected, input_tokens, category=category, prompt_id=prompt_id,
+                    max_new_tokens=max_new_tokens,
+                )
                 return SchedulingResult(
                     instance_index=selected.index,
+                    reserved_tokens=reserved,
                     tp_degree=selected.tp_degree,
                     category=category,
                     is_fallback=False,
@@ -131,9 +183,13 @@ class LengthAwareScheduler(BaseScheduler):
                 if selected is not None:
                     self._stats.fallback_routes += 1
                     self._stats.category_tp_counts[category][selected.tp_degree] += 1
-                    selected.inc_active()
+                    reserved = self._record_route(
+                        selected, input_tokens, category=category, prompt_id=prompt_id,
+                        max_new_tokens=max_new_tokens,
+                    )
                     return SchedulingResult(
                         instance_index=selected.index,
+                        reserved_tokens=reserved,
                         tp_degree=selected.tp_degree,
                         category=category,
                         is_fallback=True,
@@ -141,14 +197,18 @@ class LengthAwareScheduler(BaseScheduler):
                     )
 
 
-            all_ready = [h for h in self._instances if h.is_ready]
+            all_ready = self._selectable([h for h in self._instances if h.is_ready])
             if all_ready:
-                selected = min(all_ready, key=lambda h: h.active_requests)
+                selected = self._min_load_rotating(all_ready)
                 self._stats.fallback_routes += 1
                 self._stats.category_tp_counts[category][selected.tp_degree] += 1
-                selected.inc_active()
+                reserved = self._record_route(
+                    selected, input_tokens, category=category, prompt_id=prompt_id,
+                    max_new_tokens=max_new_tokens,
+                )
                 return SchedulingResult(
                     instance_index=selected.index,
+                    reserved_tokens=reserved,
                     tp_degree=selected.tp_degree,
                     category=category,
                     is_fallback=True,
@@ -173,12 +233,16 @@ class LengthAwareScheduler(BaseScheduler):
         prompt_id: str = "",
         final_bucket: str = "",
         output_tokens: int = 0,
+        reserved_tokens: int | None = None,
     ):
         """On request done."""
-        handle = self.get_instance_handle(instance_index)
-        if handle:
-            with self._lock:
-                handle.dec_active()
+        with self._lock:
+            self._complete_route(
+                instance_index,
+                output_tokens=output_tokens,
+                category=final_bucket or "any",
+                reserved_tokens=reserved_tokens,
+            )
 
     def _try_select(self, tp_preferences: list[int]) -> InstanceHandle | None:
         """Try select."""
@@ -190,6 +254,7 @@ class LengthAwareScheduler(BaseScheduler):
             if not candidates:
                 continue
 
+            candidates = self._selectable(candidates)
 
             if self._max_queue_length > 0:
                 candidates = [
@@ -205,8 +270,8 @@ class LengthAwareScheduler(BaseScheduler):
                 self._rr_index[tp_degree] += 1
                 return candidates[idx]
             else:
-                # least_connections
-                return min(candidates, key=lambda h: h.active_requests)
+                # least_connections with rotation among equal-load endpoints
+                return self._min_load_rotating(candidates)
 
         return None
 
@@ -247,6 +312,13 @@ class LengthAwareScheduler(BaseScheduler):
             load_balance_strategy=sched.load_balance_strategy,
             max_queue_length=sched.max_queue_length,
             enable_fallback=sched.enable_fallback,
+            load_metric=getattr(sched, "load_metric", DEFAULT_LOAD_METRIC),
+            kv_capacity_tokens_by_tp=getattr(sched, "kv_capacity_tokens_by_tp", None),
+            feedback=MetricsFeedbackConfig.from_scheduling(sched),
+            prefix_affinity=bool(getattr(sched, "prefix_affinity", False)),
+            prefix_affinity_max_entries=int(
+                getattr(sched, "prefix_affinity_max_entries", 8192)
+            ),
         )
 
 

@@ -18,7 +18,7 @@ def _normalize_backend(value: str | None = None) -> str:
 
 
 def accelerator_backend(value: str | None = None) -> str:
-    """Return the configured CUDA or CPU backend."""
+    """Return the configured accelerator backend."""
     requested = _normalize_backend(value)
     if requested in {"cuda", "gpu"}:
         return "cuda"
@@ -31,7 +31,7 @@ def accelerator_backend(value: str | None = None) -> str:
 
 
 def distributed_backend(value: str | None = None) -> str:
-    """Return NCCL for CUDA and Gloo for CPU."""
+    """Return NCCL for CUDA, HCCL for Ascend, or Gloo for CPU."""
     requested = str(os.environ.get("DIST_BACKEND", value or "auto")).strip().lower()
     if requested not in {"", "auto"}:
         if requested not in {"nccl", "gloo", "hccl"}:
