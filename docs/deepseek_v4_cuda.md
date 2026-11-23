@@ -105,3 +105,51 @@ git -C "$MCORE_PATH" apply "$LIBRA_PATH/patches/mcore-defer-ddp-grad-allocation.
 CUDA V4 still requires a static topology. Enabling EHP additionally requires
 cross-host launch for the complete PP/EP replica, matching expert gradient
 lanes, and full rollout weight publication.
+
+## Fixed-checkpoint rollout on 32 H20s
+
+Use four independent vLLM replicas with eight GPUs per replica (TP8, expert
+parallelism enabled). Run MTP and DSpark as separate rollout configurations
+with the matching official checkpoints.
+
+| Method | Checkpoint | Draft configuration |
+| --- | --- | --- |
+| MTP | `deepseek-ai/DeepSeek-V4-Flash` | One draft token on Hopper |
+| DSpark | `deepseek-ai/DeepSeek-V4-Flash-DSpark` | Seven draft tokens, greedy drafting with target rejection sampling |
+
+Use a CUDA environment with vLLM 0.30.0 and a compatible PyTorch wheel. On
+the QS H20 image with driver 570 and CUDA 13.3 compatibility libraries, prepend
+`/usr/local/cuda/compat` to `LD_LIBRARY_PATH` for that process. Put complete
+checkpoint snapshots at paths visible on each node.
+
+On each node, run the following in the rollout environment. Set
+`METHOD=mtp` or `METHOD=dspark`, `MODEL_PATH` to the local snapshot, and
+`SERVED_MODEL_NAME` to the same model name on all four replicas.
+
+```bash
+python -m RL_Framework.scripts.deepseek_v4_spec_rollout serve \
+  --method "$METHOD" --model "$MODEL_PATH" --model-name "$SERVED_MODEL_NAME" --enforce-eager
+```
+
+After readiness, verify each replica with the same served model name and port.
+For cross-node clients, bind a private interface with `serve --host` and use
+the four addresses in `vllm_endpoints`. The served model name must match the
+model name sent by the rollout client.
+
+```bash
+python -m RL_Framework.scripts.deepseek_v4_spec_rollout verify \
+  --model-name "$SERVED_MODEL_NAME"
+```
+
+The verifier sends three sampled requests through Libra's `VLLMRolloutEngine`,
+requires 64 tokens with finite logprobs per request, and checks that vLLM's
+draft and accepted-token counters increased. Save the JSON from all four
+nodes per mode. This gate covers fixed-checkpoint generation and standard
+completion logprobs. V4 training leaves its MTP auxiliary loss disabled.
+Decoupled PPO behavior capture and hot weight publication need separate
+integration.
+
+On 2026-11-23, all four replicas passed on QS with H20-3e GPUs, vLLM
+0.30.0, and eager execution. Each mode produced 768 output tokens with finite
+logprobs across 12 requests. vLLM recorded 361 accepted draft tokens out
+of 400 for MTP and 628 out of 1,134 for DSpark.
