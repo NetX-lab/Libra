@@ -35,6 +35,9 @@ from RL_Framework.infra.elastic import (
 class MegatronCoreTrainEngine:
     """MCore TP/EP/DDP backend with streaming HF interoperability."""
 
+    supports_pipeline_parallelism = False
+    dependency_guide = "requirements-megatron.txt"
+
     def __init__(
         self,
         *,
@@ -171,7 +174,7 @@ class MegatronCoreTrainEngine:
             raise ValueError(
                 "optimizer_offload_fraction requires optimizer_cpu_offload=True"
             )
-        if self.train_pp_size != 1:
+        if self.train_pp_size != 1 and not self.supports_pipeline_parallelism:
             raise ValueError(
                 "MegatronCoreTrainEngine currently supports PP=1; use TP/EP/DP "
                 "for Qwen3-30B-A3B"
@@ -184,17 +187,19 @@ class MegatronCoreTrainEngine:
             from megatron.bridge import AutoBridge
             from megatron.core.distributed import DistributedDataParallelConfig
             from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-            from RL_Framework.engine.megatron_core_attention import (
-                apply_megatron_core_014_compatibility,
-                torch_sdpa_layer_spec,
-            )
+            if not self.supports_pipeline_parallelism:
+                from RL_Framework.engine.megatron_core_attention import (
+                    apply_megatron_core_014_compatibility,
+                )
+            if not self.use_transformer_engine:
+                from RL_Framework.engine.megatron_core_attention import torch_sdpa_layer_spec
         except ImportError as exc:
             raise RuntimeError(
-                "Megatron-Core dependencies are unavailable. Install the pinned "
-                "packages from requirements-megatron.txt."
+                f"Megatron-Core dependencies are unavailable. See {self.dependency_guide}."
             ) from exc
         init_phase("imports_complete")
-        apply_megatron_core_014_compatibility()
+        if not self.supports_pipeline_parallelism:
+            apply_megatron_core_014_compatibility()
 
         init_phase("tokenizer_load_start")
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -206,10 +211,7 @@ class MegatronCoreTrainEngine:
         init_phase("tokenizer_load_complete")
 
         init_phase("bridge_load_start")
-        self.bridge = AutoBridge.from_hf_pretrained(
-            self.model_path,
-            trust_remote_code=True,
-        )
+        self.bridge = self._load_bridge(AutoBridge)
         init_phase("bridge_load_complete")
         init_phase("provider_build_start")
         self.provider = self.bridge.to_megatron_provider(load_weights=True)
@@ -306,6 +308,9 @@ class MegatronCoreTrainEngine:
                 f"{self.optimizer_offload_fraction if initialize_optimizer else 0.0}",
                 flush=True,
             )
+
+    def _load_bridge(self, auto_bridge):
+        return auto_bridge.from_hf_pretrained(self.model_path, trust_remote_code=True)
 
     def _configure_provider(self, max_seq_length: int) -> None:
         provider = self.provider
@@ -1246,17 +1251,22 @@ class MegatronCoreTrainEngine:
             weights = torch.exp(anchor - behavior)
         else:
             weights = loss_mask[action_positions]
+        return self._loss_from_actions(
+            current, anchor, advantages, weights, action_counts, micro_batch["rewards"],
+        )
+
+    def _loss_from_actions(self, current, anchor, advantages, weights, action_counts, rewards):
         log_ratio = current - anchor
         ratio = torch.exp(log_ratio.clamp(min=-20.0, max=20.0))
         clipped = ratio.clamp(1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon)
         weights_per_trajectory = weights / action_counts
-        sample_count = loss_mask.shape[0]
+        sample_count = rewards.numel()
         pg_per_action = torch.maximum(-advantages * ratio, -advantages * clipped)
         kl_per_action = (ratio - 1.0) - log_ratio
         pg = (weights_per_trajectory * pg_per_action).sum() / sample_count
         kl = (weights_per_trajectory * kl_per_action).sum() / sample_count
         loss = pg + self.kl_coef * kl
-        if decoupled:
+        if is_decoupled(self):
             checks = torch.stack((torch.isfinite(current).all() & (current <= 1e-6).all(),
                 torch.isfinite(weights).all() & (weights > 0).all(), torch.isfinite(loss)))
             # One combined host read before backward; no diagnostic reductions.
@@ -1267,10 +1277,10 @@ class MegatronCoreTrainEngine:
                 if not valid:
                     raise FloatingPointError(message)
         return loss, dict(loss=loss.detach(), pg_loss=pg.detach(), kl=kl.detach(),
-            reward_sum=micro_batch["rewards"].sum().detach(),
-            n_samples=float(micro_batch["rewards"].numel()), n_updates=1.0)
+            reward_sum=rewards.sum().detach(),
+            n_samples=float(sample_count), n_updates=1.0)
 
-    def _reduce_stats(self, stats: dict[str, float]) -> dict[str, float]:
+    def _reduce_stats(self, stats: dict[str, float], *, with_context_parallel=True) -> dict[str, float]:
         updates = float(stats["n_updates"])
         samples = float(stats["n_samples"])
         values = torch.tensor(
@@ -1289,7 +1299,7 @@ class MegatronCoreTrainEngine:
             device=self._device(),
         )
         group = self._parallel_state().get_data_parallel_group(
-            with_context_parallel=True
+            with_context_parallel=with_context_parallel
         )
         dist.all_reduce(values, op=dist.ReduceOp.SUM, group=group)
         global_updates = values[5].clamp(min=1.0)

@@ -1,0 +1,51 @@
+--- a/megatron/core/distributed/param_and_grad_buffer.py
++++ b/megatron/core/distributed/param_and_grad_buffer.py
+@@ -1317,15 +1317,12 @@
+                         allocate_param_buffer()
+                     if self.nccl_ub:
+                         allocate_grad_buffer()
+-                # Without nccl_ub the pool (if any) backs only param_data; grads stay plain.
+-                if not self.nccl_ub:
+-                    allocate_grad_buffer()
+
+         self.grad_data_size = 0
+         self.param_data_size = 0
+         self.param_data_cpu = None
+
+-        # Finally, map param.data and param.main_grad fields to buffers.
++        # Map parameter data, then allocate and map independent gradient storage.
+         def _create_bucket(bucket_id, bucket_params, bucket_params_with_extra_main_grads):
+             """
+             Look up precomputed bucket indices and create a new bucket.
+@@ -1357,12 +1354,8 @@
+                 bucket_params_with_extra_main_grads=bucket_params_with_extra_main_grads,
+             )
+
+-        bucket_params = []
+-        bucket_params_with_extra_main_grads = []
+-        cur_bucket_id = 0
+-        for param, param_name in params_with_names[::-1]:
+-            # Get parameter indices computed in previous loop.
+-            param_start_index, param_end_index, bucket_id = self.param_index_map[param]
++        for param, _ in reversed(params_with_names):
++            param_start_index, _, _ = self.param_index_map[param]
+             nvfp4_packed_param_start_index = None
+             if self.has_nvfp4_params:
+                 nvfp4_packed_param_start_index, _, _ = self.nvfp4_packed_param_index_map[param]
+@@ -1493,6 +1486,16 @@
+                     if getattr(param, "needs_nccl_mem", False):
+                         param.register_ub_pool(self.param_nccl_mem_pool or self.nccl_mem_pool)
+
++        if not self.nccl_ub and not uses_shared_param_grad_buffer:
++            # Independent gradient storage can be allocated after the original
++            # parameter storage has been replaced by views into param_data.
++            allocate_grad_buffer()
++
++        bucket_params = []
++        bucket_params_with_extra_main_grads = []
++        cur_bucket_id = 0
++        for param, param_name in reversed(params_with_names):
++            param_start_index, _, bucket_id = self.param_index_map[param]
+             # Grad buffer always uses full-numel offsets from param_index_map.
+             param.main_grad = self._get(
+                 param.data.shape, param_start_index, buffer_type=BufferType.GRAD
