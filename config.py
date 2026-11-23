@@ -840,8 +840,10 @@ class AsyncRLConfig:
     def _validate_deepseek_v4_training(self) -> None:
         if self.train_backend != "megatron_core" or not self.megatron_use_transformer_engine:
             raise ValueError("DeepSeek V4 requires Megatron-Core with Transformer Engine")
-        if (self.train_tp_size, self.train_cp_size, self.expert_tensor_parallel_size) != (1, 1, 1):
-            raise ValueError("The CUDA DeepSeek V4 provider requires TP=CP=ETP=1")
+        if (self.train_tp_size, self.expert_tensor_parallel_size) != (1, 1):
+            raise ValueError("The CUDA DeepSeek V4 provider requires TP=ETP=1")
+        if self.train_cp_size < 1:
+            raise ValueError("DeepSeek V4 requires a positive CP size")
         if self.train_pp_size < 2:
             raise ValueError("The CUDA DeepSeek V4 training path requires PP >= 2")
         if self.train_dp_size < 1 or self.n_samples < 1:
@@ -991,10 +993,17 @@ class AsyncRLConfig:
                     "expert_tensor_parallel_size must divide train_tp_size: "
                     f"{self.expert_tensor_parallel_size} vs {self.train_tp_size}"
                 )
-            if self.train_dp_size % self.train_ep_size != 0:
+            # Megatron's V4 expert rank generator consumes the dense DP×CP
+            # slots and keeps the same pipeline groups.
+            expert_slots = self.train_dp_size
+            expert_axis = "train_dp_size"
+            if self.megatron_model_family == "deepseek_v4":
+                expert_slots *= self.train_cp_size
+                expert_axis = "DP × CP"
+            if expert_slots % self.train_ep_size != 0:
                 raise ValueError(
-                    "train_ep_size must divide train_dp_size: "
-                    f"{self.train_ep_size} vs {self.train_dp_size}"
+                    f"train_ep_size must divide {expert_axis}: "
+                    f"{self.train_ep_size} vs {expert_slots}"
                 )
             if self.model_arch.num_experts > 1:
                 if self.model_arch.num_experts % self.train_ep_size != 0:

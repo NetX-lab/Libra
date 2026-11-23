@@ -1251,17 +1251,22 @@ class MegatronCoreTrainEngine:
             weights = torch.exp(anchor - behavior)
         else:
             weights = loss_mask[action_positions]
+        return self._loss_from_actions(
+            current, anchor, advantages, weights, action_counts, micro_batch["rewards"],
+        )
+
+    def _loss_from_actions(self, current, anchor, advantages, weights, action_counts, rewards):
         log_ratio = current - anchor
         ratio = torch.exp(log_ratio.clamp(min=-20.0, max=20.0))
         clipped = ratio.clamp(1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon)
         weights_per_trajectory = weights / action_counts
-        sample_count = loss_mask.shape[0]
+        sample_count = rewards.numel()
         pg_per_action = torch.maximum(-advantages * ratio, -advantages * clipped)
         kl_per_action = (ratio - 1.0) - log_ratio
         pg = (weights_per_trajectory * pg_per_action).sum() / sample_count
         kl = (weights_per_trajectory * kl_per_action).sum() / sample_count
         loss = pg + self.kl_coef * kl
-        if decoupled:
+        if is_decoupled(self):
             checks = torch.stack((torch.isfinite(current).all() & (current <= 1e-6).all(),
                 torch.isfinite(weights).all() & (weights > 0).all(), torch.isfinite(loss)))
             # One combined host read before backward; no diagnostic reductions.
@@ -1272,10 +1277,10 @@ class MegatronCoreTrainEngine:
                 if not valid:
                     raise FloatingPointError(message)
         return loss, dict(loss=loss.detach(), pg_loss=pg.detach(), kl=kl.detach(),
-            reward_sum=micro_batch["rewards"].sum().detach(),
-            n_samples=float(micro_batch["rewards"].numel()), n_updates=1.0)
+            reward_sum=rewards.sum().detach(),
+            n_samples=float(sample_count), n_updates=1.0)
 
-    def _reduce_stats(self, stats: dict[str, float]) -> dict[str, float]:
+    def _reduce_stats(self, stats: dict[str, float], *, with_context_parallel=True) -> dict[str, float]:
         updates = float(stats["n_updates"])
         samples = float(stats["n_samples"])
         values = torch.tensor(
@@ -1294,7 +1299,7 @@ class MegatronCoreTrainEngine:
             device=self._device(),
         )
         group = self._parallel_state().get_data_parallel_group(
-            with_context_parallel=True
+            with_context_parallel=with_context_parallel
         )
         dist.all_reduce(values, op=dist.ReduceOp.SUM, group=group)
         global_updates = values[5].clamp(min=1.0)

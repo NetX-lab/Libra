@@ -23,6 +23,76 @@ def test_h20_gate_config_selects_v4_pipeline():
         replace(config, batch_size=24)
 
 
+@pytest.mark.parametrize("cp_size", [1, 2, 3, 4, 6, 12])
+def test_v4_config_derives_logical_dp_for_48_training_gpus(cp_size):
+    path = Path(__file__).resolve().parents[1] / "configs/deepseek_v4_flash_h20_32_train_gate.yaml"
+    config = replace(load_config(str(path)), train_gpus=48, train_pp_size=4,
+                     train_ep_size=4, train_cp_size=cp_size, train_dp_size=0, batch_size=24)
+    assert config.train_dp_size == 12 // cp_size
+    assert create_train_engine(config).train_cp_size == cp_size
+    with pytest.raises(ValueError, match="must divide DP"):
+        replace(config, train_ep_size=8)
+
+
+@pytest.mark.parametrize("cp_size", [2, 3, 4])
+def test_v4_cp_shards_preserve_action_logprobs_and_gradient(monkeypatch, cp_size):
+    from RL_Framework.engine import deepseek_v4_train_engine as module
+
+    path = Path(__file__).resolve().parents[1] / "configs/deepseek_v4_flash_h20_32_train_gate.yaml"
+    config = replace(load_config(str(path)), train_gpus=48, train_ep_size=4,
+                     train_cp_size=cp_size, train_dp_size=0, batch_size=24)
+    engine = create_train_engine(config)
+    packed_module = ModuleType("megatron.core.packed_seq_params")
+    packed_module.PackedSeqParams = SimpleNamespace
+    monkeypatch.setitem(sys.modules, packed_module.__name__, packed_module)
+
+    generator = torch.Generator().manual_seed(19)
+    ids = torch.randint(0, 7, (2, 12), generator=generator)
+    # CP4 rank zero has no actions. CP3 rank zero owns the query for target 8.
+    mask = torch.tensor([[0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0],
+                         [0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0]], dtype=torch.float32)
+    full_logits = torch.randn(2, 12, 7, generator=generator, requires_grad=True)
+    batch = dict(input_ids=ids, loss_mask=mask, length=10,
+                 old_logprobs=torch.full((2, 12), -2.0),
+                 advantages=torch.tensor([1., -1.]), rewards=torch.tensor([1., 2.]))
+    reference = engine._action_log_probs(full_logits, ids)
+    expected_loss, expected_stats = engine._loss(batch, full_logits)
+    expected_grad = torch.autograd.grad(expected_loss, full_logits)[0]
+    aligned = torch.nn.functional.pad(reference[:, :9].detach(), (0, 3)).flatten()
+    width = ids.numel() // cp_size
+    total_loss = 0
+    for rank in range(cp_size):
+        start = rank * width
+        stop = start + width
+        group = SimpleNamespace(size=lambda: cp_size, rank=lambda: rank)
+
+        def model(*, input_ids, position_ids, packed_seq_params, **kwargs):
+            assert packed_seq_params.qkv_format == "thd"
+            assert packed_seq_params.cu_seqlens_q.tolist() == [0, 12, 24]
+            torch.testing.assert_close(input_ids[0], ids.flatten()[start:stop])
+            torch.testing.assert_close(position_ids[0], torch.arange(start, stop) % 12)
+            return full_logits.reshape(1, 24, 7)[:, start:stop]
+
+        def gather(output, local, *, group):
+            torch.testing.assert_close(local, aligned[start:stop])
+            output.copy_(aligned)
+
+        monkeypatch.setattr(module.dist, "all_gather_into_tensor", gather)
+        with torch.no_grad():
+            logits, objective = engine._forward_context_shard(
+                batch, model, group, forward_only=True,
+            )
+            torch.testing.assert_close(objective(logits)[1], reference[:, :9])
+        logits, objective = engine._forward_context_shard(
+            batch, model, group, forward_only=False,
+        )
+        loss, stats = objective(logits)
+        assert stats["n_samples"] == expected_stats["n_samples"]
+        total_loss += loss
+    torch.testing.assert_close(total_loss, expected_loss)
+    torch.testing.assert_close(torch.autograd.grad(total_loss, full_logits)[0], expected_grad)
+
+
 def test_v4_schedule_preserves_actions_when_padding_variable_lengths(monkeypatch):
     path = Path(__file__).resolve().parents[1] / "configs/deepseek_v4_flash_h20_32_train_gate.yaml"
     engine = create_train_engine(load_config(str(path)))

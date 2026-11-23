@@ -10,6 +10,10 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .venv/
+.venv-*/
+*.egg-info/
+/.coverage
+/htmlcov/
 
 # macOS metadata
 .DS_Store
@@ -45,6 +49,9 @@ tmp/
 *.npy
 *.npz
 *.safetensors
+
+# DeepSeek V4 CUDA gate receipts
+rank_[0-9][0-9][0-9][0-9].json
 
 # Per-run state that may be generated outside a top-level runs/ directory
 weights/

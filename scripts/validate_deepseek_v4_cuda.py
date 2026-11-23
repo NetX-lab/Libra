@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import hashlib
 import json
 import math
 import os
@@ -19,7 +20,11 @@ from RL_Framework.engine.train_factory import create_train_engine
 def run_gate(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     model_path = Path(args.model).resolve(strict=True)
-    config = replace(config, model_path=str(model_path), tokenizer_path=str(model_path))
+    topology = (
+        {"train_cp_size": args.cp_size, "train_dp_size": 0}
+        if args.cp_size is not None else {}
+    )
+    config = replace(config, model_path=str(model_path), tokenizer_path=str(model_path), **topology)
     if int(os.environ.get("WORLD_SIZE", "1")) != config.train_gpus:
         raise ValueError(f"Launch with torchrun on {config.train_gpus} training ranks")
 
@@ -46,6 +51,14 @@ def run_gate(args: argparse.Namespace) -> None:
         engine.recompute_logprobs(trajectories)
         if any(not torch.isfinite(row["logprobs"]).all() for row in trajectories):
             raise FloatingPointError("Nonfinite recomputed logprobs")
+        logprobs = torch.cat([row["logprobs"] for row in trajectories])
+        digest = hashlib.sha256(logprobs.contiguous().numpy().tobytes()).hexdigest()
+        parallel_state = engine._parallel_state()
+        if config.train_cp_size > 1:
+            digests = [None] * config.train_cp_size
+            dist.all_gather_object(digests, digest, group=parallel_state.get_context_parallel_group())
+            if len(set(digests)) != 1:
+                raise RuntimeError("Context ranks disagree on the reconstructed logprobs")
         probes = []
         for parameter in engine.model[0].parameters():
             if parameter.requires_grad and parameter.is_contiguous() and parameter.numel():
@@ -55,6 +68,8 @@ def run_gate(args: argparse.Namespace) -> None:
         metrics = engine.grpo_update(trajectories)
         if not all(math.isfinite(float(value)) for value in metrics.values()):
             raise FloatingPointError("Nonfinite training metrics")
+        if metrics["n_samples"] != config.batch_size:
+            raise RuntimeError("Each global trajectory must be counted once")
         if engine.optimizer_revision != 1:
             raise RuntimeError("Expected exactly one optimizer update")
         changed = torch.zeros((), dtype=torch.int32, device=engine._device())
@@ -68,6 +83,10 @@ def run_gate(args: argparse.Namespace) -> None:
         output.mkdir(parents=True, exist_ok=True)
         receipt = {
             "rank": dist.get_rank(),
+            "cp_size": config.train_cp_size,
+            "cp_rank": parallel_state.get_context_parallel_rank(),
+            "dp_rank": engine.get_data_parallel_rank(),
+            "logprobs_sha256": digest,
             "optimizer_revision": engine.optimizer_revision,
             "changed_parameter_probes": changed.item(),
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
@@ -86,6 +105,7 @@ def run_gate(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
+    parser.add_argument("--cp-size", type=int, help="Override CP and derive DP from the training allocation")
     parser.add_argument("--model", required=True, help="Local Hugging Face checkpoint directory")
     parser.add_argument("--output", required=True, help="Run-specific shared receipt directory")
     run_gate(parser.parse_args())

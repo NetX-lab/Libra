@@ -24,8 +24,36 @@ Make a complete local Hugging Face snapshot of
 [deepseek-ai/DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
 available at the same path on all training nodes. Megatron Bridge reads the
 official packed checkpoint and loads BF16 training weights. The initial profile
-uses the native attention and MoE layout with MTP disabled, unfused mHC/DSA,
-and selective recomputation. Attention TP, CP and expert TP are fixed at 1.
+uses the native attention and MoE layout with MTP disabled, unfused mHC,
+and selective recomputation. Attention TP and expert TP are fixed at 1.
+CP1 retains the unfused DSA path. CP>1 uses Megatron-Core's contiguous
+packed attention with the cuDNN DSA backend and requires a compatible
+cuDNN Frontend and FlashMLA sparse forward in the CUDA runtime. Older
+Hopper FlashMLA with `topk_length` supports this path when Libra's indexer
+loss is disabled. Requesting indexer LSE requires the extended FlashMLA API.
+
+## Context parallelism
+
+Set `train_cp_size` in the YAML and set `train_dp_size: 0` to derive DP
+from the number of training GPUs. The resulting topology must satisfy
+`train_gpus = TP × PP × CP × DP` and EP must divide `DP × CP`.
+The global batch must still divide into complete GRPO groups and
+microbatches on each logical DP replica. Choose CP at process startup.
+
+For example, with 48 training GPUs, PP3 and EP8, CP1, CP2, CP4 and CP8
+give DP16, DP8, DP4 and DP2 respectively. At PP4, EP4 fits the
+12 ranks per pipeline stage. CP1, CP2, CP3, CP4, CP6 and CP12 then
+give DP12, DP6, DP4, DP3, DP2 and DP1 respectively. These are topology
+examples. Activation memory and expert communication locality depend on
+the actual placement and workload.
+
+Each CP group handles the same logical trajectories. The packed
+attention shards the padded sequence, preserving document boundaries and
+global next-token targets across rank boundaries. Libra gathers scalar
+logprobs before returning them to the trainer. GRPO uses global action
+counts to normalize the local loss contributions and reports each
+trajectory once. Additional right padding aligns shards and gives
+Megatron enough rows for the attention boundary exchange.
 
 ## 32×H20 training gate
 
@@ -50,9 +78,30 @@ Success requires 32 per-rank receipts and
 `LIBRA_DEEPSEEK_V4_CUDA_GATE_PASSED ranks=32`. The gate checks finite
 recomputed logprobs and loss, one optimizer revision, a change in sampled
 parameters, and GPU memory peaks.
+Pass `--cp-size 2` or `--cp-size 4` to the same gate to derive a
+matching DP degree. Use a fresh output directory for each run. The gate
+also checks that CP peers reconstruct identical logprobs and that the
+optimizer reports the configured global sample count.
 
 The gate measures a training update. A separate rollout allocation or a
 validated colocated runtime is needed for generation during this run. Before
 using this path for a full Libra efficiency benchmark, validate HF export,
 rollout weight publication and consumption, and elastic training with the
 chosen backend and parallel layout.
+
+## Compact replica memory
+
+For a compact BF16 replica, the distributed optimizer can allocate its new
+parameter and gradient buffers while all original parameter storage is still
+resident. The patch below moves independent, non-NCCL-registered gradient
+allocation after the parameters are remapped. Apply it to a separate checkout
+of the compatible Megatron-Core source used by each training rank.
+
+```bash
+git -C "$MCORE_PATH" apply --check "$LIBRA_PATH/patches/mcore-defer-ddp-grad-allocation.patch"
+git -C "$MCORE_PATH" apply "$LIBRA_PATH/patches/mcore-defer-ddp-grad-allocation.patch"
+```
+
+CUDA V4 still requires a static topology. Enabling EHP additionally requires
+cross-host launch for the complete PP/EP replica, matching expert gradient
+lanes, and full rollout weight publication.
