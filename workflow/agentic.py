@@ -34,6 +34,8 @@ class AgenticWorkflow:
         self,
         engine: Any,
         data: dict[str, Any],
+        version: int = -1,
+        rollout_index: int = 0,
     ) -> dict[str, torch.Tensor]:
         """Run episode."""
         messages = data.get("messages", []).copy()
@@ -133,7 +135,7 @@ class AgenticWorkflow:
             "logprobs": torch.tensor(all_logprobs, dtype=torch.float32).unsqueeze(0),
             "loss_mask": torch.tensor(all_loss_masks, dtype=torch.long).unsqueeze(0),
             "rewards": torch.tensor([reward], dtype=torch.float32),
-            "versions": torch.tensor([-1] * len(all_input_ids), dtype=torch.long).unsqueeze(0),
+            "versions": torch.full((len(all_input_ids),), version, dtype=torch.long).unsqueeze(0),
             "n_turns": current_turn,
             "n_tool_calls": len(all_actions),
         }

@@ -82,6 +82,7 @@ class SearchR1Workflow:
         engine: Any,
         data: dict[str, Any],
         version: int = 0,
+        rollout_index: int = 0,
     ) -> dict[str, torch.Tensor]:
         """Run episode."""
         question = data.get("question", "")
