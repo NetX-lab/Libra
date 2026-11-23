@@ -125,7 +125,13 @@ class DAPOMathWorkflow:
             return tokens, logprobs
         return tokens[:remaining], logprobs[:remaining]
 
-    async def run_episode(self, engine: Any, data: dict[str, Any], version: int = 0) -> dict[str, torch.Tensor]:
+    async def run_episode(
+        self,
+        engine: Any,
+        data: dict[str, Any],
+        version: int = 0,
+        rollout_index: int = 0,
+    ) -> dict[str, torch.Tensor]:
         prompt_text = self._build_prompt(data)
         prompt_tokens = self._encode(prompt_text)
         answer = self._extract_answer(data)
