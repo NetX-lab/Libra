@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from RL_Framework.config import AsyncRLConfig, GlobalResourcePlannerConfig
 from RL_Framework.infra.elastic.batch_partition import (
     complete_group_sample_counts, partition_complete_grpo_groups,
 )
@@ -71,19 +72,32 @@ def make_trainer(tmp_path, rank=0, dp_size=1, dp_rank=0, source=True, hybrids=()
     trainer = object.__new__(AsyncRLTrainer)
     trainer.rank, trainer.local_rank = rank, rank
     trainer.world_size, trainer.is_main_process = dp_size, rank == 0
-    trainer.config = SimpleNamespace(
+    trainer.config = AsyncRLConfig(
+        model_path="/tmp/fake-model",
         batch_size=16, n_samples=4, total_steps=2, micro_batch_size=1,
         ppo_epochs=1, recompute_logprobs=False, sync_interval=0, save_interval=0,
         log_dir=str(tmp_path), enable_rollout_tracing=False,
-        global_resource_planner=SimpleNamespace(hybrid_worker_task_dir=str(tmp_path),
-                                               hybrid_lockstep_gradient_sync=True),
+        train_gpus=dp_size, train_dp_size=dp_size, rollout_gpus=1,
+        global_resource_planner=GlobalResourcePlannerConfig(
+            hybrid_worker_task_dir=str(tmp_path),
+            hybrid_lockstep_gradient_sync=True,
+        ),
     )
     trainer.train_engine = Engine(dp_rank, dp_size, source)
     trainer.start_step = 0
+    trainer.global_step = 0
+    trainer.control = None
     trainer.runtime_elastic_executor = None
     trainer._use_heterogeneous = False
     trainer.staleness_manager = None
     trainer._pending_hybrid_training_batches = {}
+    trainer._consumed_grpo_group_ids = set()
+    trainer._advantage_stats = {}
+    trainer._rollout_unavailable_ids = set()
+    trainer._restored_rollouts_pending_publication = set()
+    trainer._publication_target_ids = None
+    trainer._rollout_source_rank = None
+    trainer._rollout_source_world_size = None
     trainer._elastic_membership_run_id = "fixed-b-test"
     trainer.setup = lambda workflow: None
     trainer._create_data_generator = lambda dataset, workflow: iter(())

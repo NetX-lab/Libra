@@ -7,21 +7,21 @@ import torch.distributed as dist
 def _broadcast(trainer, value):
     packet = [value]
     if dist.is_available() and dist.is_initialized():
-        dist.broadcast_object_list(packet, src=0, group=getattr(trainer, "control", None))
+        dist.broadcast_object_list(packet, src=0, group=trainer.control)
     if packet[0].get("error"):
         raise RuntimeError(packet[0]["error"])
     return packet[0]
 
 
 def unavailable_rollouts(executor):
-    loan = getattr(executor, "_lent_rollout", None)
-    pending = getattr(executor, "_rollout_loan_rollback", None)
+    loan = executor._lent_rollout
+    pending = executor._rollout_loan_rollback
     return list(dict.fromkeys(meta.instance_id for record in (loan, pending) if record
                               for meta in record["engines"]))
 
 
 def apply_availability(trainer, unavailable):
-    previous = set(getattr(trainer, "_rollout_unavailable_ids", ()))
+    previous = set(trainer._rollout_unavailable_ids)
     trainer._rollout_unavailable_ids = set(unavailable)
     scheduler = getattr(trainer.rollout_engine, "scheduler", None)
     for handle in getattr(scheduler, "_instances", []):
@@ -61,13 +61,13 @@ def restore_for_publication(trainer):
 def reopen_after_publication(trainer):
     # A subset rollback has a separate owner: its publication must neither
     # withdraw an existing loan nor open routing before rank consensus.
-    if getattr(trainer, "_publication_target_ids", None) is not None:
+    if trainer._publication_target_ids is not None:
         return
-    if not getattr(trainer, "_restored_rollouts_pending_publication", None):
+    if not trainer._restored_rollouts_pending_publication:
         return
     apply_availability(trainer, ())
     trainer._restored_rollouts_pending_publication = set()
-    executor = getattr(trainer, "runtime_elastic_executor", None)
+    executor = trainer.runtime_elastic_executor
     if executor is not None:
         executor._rollout_lending_resume_pending = False
 
@@ -81,24 +81,24 @@ def publish_with_consensus(trainer, revision):
     errors = [error]
     if dist.is_available() and dist.is_initialized():
         errors = [None] * dist.get_world_size()
-        dist.all_gather_object(errors, error, group=getattr(trainer, "control", None))
+        dist.all_gather_object(errors, error, group=trainer.control)
     if any(errors):
         raise RuntimeError(f"Rollout publication failed across core ranks: {errors}")
 
 
 def ensure_batch_supply(trainer):
     """Keep the loan while ready groups suffice; return it before a supply wait."""
-    cfg = getattr(trainer.config, "global_resource_planner", None)
-    if not (getattr(cfg, "enabled", False)
-            and getattr(cfg, "runtime_reconfigure_training", False)
-            and getattr(cfg, "hybrid_worker_launch_enabled", False)
-            and not getattr(cfg, "runtime_training_pool_plan_only", True)):
+    cfg = trainer.config.global_resource_planner
+    if not (cfg.enabled
+            and cfg.runtime_reconfigure_training
+            and cfg.hybrid_worker_launch_enabled
+            and not cfg.runtime_training_pool_plan_only):
         return
     outcome = None
     if trainer.is_main_process:
         executor = trainer.runtime_elastic_executor
         ids = unavailable_rollouts(executor)
-        instances = getattr(trainer.config.heterogeneous_rollout, "instances", ())
+        instances = trainer.config.heterogeneous_rollout.instances
         outcome = {"all_lent": bool(ids) and len(ids) == len(instances)}
     outcome = _broadcast(trainer, outcome)
     if not outcome["all_lent"]:
@@ -109,7 +109,7 @@ def ensure_batch_supply(trainer):
     records = [sufficient]
     if dist.is_available() and dist.is_initialized():
         records = [None] * dist.get_world_size()
-        dist.all_gather_object(records, sufficient, group=getattr(trainer, "control", None))
+        dist.all_gather_object(records, sufficient, group=trainer.control)
     if all(records):
         return
     trainer._pause_rollout_pipeline()

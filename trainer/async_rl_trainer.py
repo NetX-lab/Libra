@@ -118,13 +118,11 @@ class AsyncRLTrainer:
         self._runtime_done_published = False
         self._rollout_engine_rebind_lock = threading.RLock()
         self._trace_train_phases = os.environ.get("RL_TRAIN_PHASE_TRACE", "0") == "1"
-        trace_enabled = self._trace_train_phases or bool(
-            getattr(config, "phase_trace_enabled", False)
-        )
+        trace_enabled = self._trace_train_phases or bool(config.phase_trace_enabled)
         trace_dir = (
             os.environ.get("RL_TRAIN_PHASE_TRACE_DIR", "")
-            or getattr(config, "phase_trace_dir", "")
-            or os.path.join(getattr(config, "log_dir", "./logs"), "phase_trace")
+            or config.phase_trace_dir
+            or os.path.join(config.log_dir, "phase_trace")
         )
         self._phase_tracer = (
             PhaseTracer(
@@ -139,6 +137,14 @@ class AsyncRLTrainer:
         self._elastic_membership_epochs: dict[str, int] = {}
         self._elastic_membership_run_id = ""
         self._pending_hybrid_training_batches: dict[str, list[dict[str, Any]]] = {}
+        self.control = None
+        self._consumed_grpo_group_ids: set[str] = set()
+        self._advantage_stats: dict[str, float] = {}
+        self._rollout_unavailable_ids: set[str] = set()
+        self._restored_rollouts_pending_publication: set[str] = set()
+        self._publication_target_ids: tuple[str, ...] | None = None
+        self._rollout_source_rank: int | None = None
+        self._rollout_source_world_size: int | None = None
 
     def _run_grp_memory_preflight(self) -> None:
         """Validate one complete recompute against the planned memory budget.
@@ -147,20 +153,18 @@ class AsyncRLTrainer:
         accounts for implementation-specific temporary tensors. All ranks run
         the probe because MCore recompute uses tensor-parallel collectives.
         """
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        if planner_cfg is None:
+        planner_cfg = self.config.global_resource_planner
+        if not planner_cfg.enabled:
             return
-        if not bool(getattr(planner_cfg, "enabled", False)):
+        if not planner_cfg.memory_budget_check_enabled:
             return
-        if not bool(getattr(planner_cfg, "memory_budget_check_enabled", True)):
+        if not planner_cfg.memory_budget_dry_run_enabled:
             return
-        if not bool(getattr(planner_cfg, "memory_budget_dry_run_enabled", True)):
-            return
-        if not bool(getattr(self.config, "recompute_logprobs", True)):
+        if not self.config.recompute_logprobs:
             return
         if self.train_engine is None:
             return
-        if getattr(self.config, "train_backend", "") != "megatron_core":
+        if self.config.train_backend != "megatron_core":
             if self.is_main_process:
                 print(
                     "[GRP memory preflight] skipped for non-Megatron-Core "
@@ -172,7 +176,6 @@ class AsyncRLTrainer:
         local_batch_size = self.train_engine.get_local_batch_size(
             self.config.batch_size
         )
-        is_npu = getattr(self.train_engine, "device_backend", "") == "npu"
         probe_count = max(1, int(local_batch_size))
         max_length = max(1, int(self.config.max_seq_length))
         trajectories = [
@@ -196,11 +199,8 @@ class AsyncRLTrainer:
             if dist.is_initialized():
                 dist.barrier()
             self.train_engine.recompute_logprobs(trajectories)
-            if is_npu and hasattr(torch, "npu"):
-                # torch_npu versions used on Ascend 910B may return a
-                # torch.device from current_device(), while synchronize()
-                # expects an integer device index.
-                torch.npu.synchronize(int(self.local_rank))
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(int(self.local_rank))
             if dist.is_initialized():
                 dist.barrier()
         except RuntimeError as exc:
@@ -214,11 +214,8 @@ class AsyncRLTrainer:
             raise
         finally:
             del trajectories
-            if is_npu and hasattr(torch, "npu"):
-                try:
-                    torch.npu.empty_cache()
-                except Exception:
-                    pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         if self.is_main_process:
             print("[GRP memory preflight] passed", flush=True)
@@ -227,12 +224,11 @@ class AsyncRLTrainer:
         """Setup."""
         self.workflow = workflow
 
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
+        planner_cfg = self.config.global_resource_planner
         if (
-            planner_cfg is not None
-            and bool(getattr(planner_cfg, "enabled", False))
-            and str(getattr(planner_cfg, "initial_allocation_strategy", "configured")).lower() == "grp"
-            and not bool(getattr(planner_cfg, "initial_allocation_applied", False))
+            planner_cfg.enabled
+            and planner_cfg.initial_allocation_strategy.lower() == "grp"
+            and not planner_cfg.initial_allocation_applied
         ):
             raise RuntimeError(
                 "GRP startup allocation is mandatory: run the global resource "
@@ -276,8 +272,8 @@ class AsyncRLTrainer:
 
 
         if self._is_rollout_source():
-            hetero_cfg = getattr(self.config, "heterogeneous_rollout", None)
-            if hetero_cfg and hetero_cfg.enabled and hetero_cfg.instances:
+            hetero_cfg = self.config.heterogeneous_rollout
+            if hetero_cfg.enabled and hetero_cfg.instances:
                 self._use_heterogeneous = True
                 self._setup_heterogeneous_engine(hetero_cfg)
             else:
@@ -359,7 +355,7 @@ class AsyncRLTrainer:
         """Setup heterogeneous engine."""
         self.rollout_engine = HeterogeneousRolloutEngine.from_config(self.config)
         if self.is_main_process:
-            scheduler_type = getattr(hetero_cfg.scheduling, "scheduler_type", "length_aware")
+            scheduler_type = hetero_cfg.scheduling.scheduler_type
             print(f"Using the heterogeneous rollout engine:")
             print(f"  Scheduler type: {scheduler_type}")
             print(f"  Number of instances: {self.rollout_engine.num_instances}")
@@ -370,14 +366,14 @@ class AsyncRLTrainer:
 
     def _setup_homogeneous_engine(self):
         """Setup homogeneous engine."""
-        rollout_backend = str(getattr(self.config, "rollout_backend", "vllm")).lower()
+        rollout_backend = str(self.config.rollout_backend).lower()
         if rollout_backend == "mock":
             self.rollout_engine = MockRolloutEngine(model_path=self.config.model_path)
             if self.is_main_process:
                 print("Using mock rollout engine for training-loop smoke testing")
             return
 
-        vllm_endpoints_str = getattr(self.config, "vllm_endpoints", "") or ""
+        vllm_endpoints_str = self.config.vllm_endpoints or ""
         if not vllm_endpoints_str:
             vllm_endpoints_str = os.environ.get("VLLM_ENDPOINTS", "")
 
@@ -480,10 +476,20 @@ class AsyncRLTrainer:
         """Create data generator."""
         from torch.utils.data import DistributedSampler
 
+        source_world_size = (
+            self._rollout_source_world_size
+            if self._rollout_source_world_size is not None
+            else self.train_engine.get_data_parallel_world_size()
+        )
+        source_rank = (
+            self._rollout_source_rank
+            if self._rollout_source_rank is not None
+            else self.train_engine.get_data_parallel_rank()
+        )
         sampler = DistributedSampler(
             dataset,
-            num_replicas=int(getattr(self, "_rollout_source_world_size", self.train_engine.get_data_parallel_world_size())),
-            rank=int(getattr(self, "_rollout_source_rank", self.train_engine.get_data_parallel_rank()) or 0),
+            num_replicas=int(source_world_size),
+            rank=int(source_rank or 0),
             shuffle=True,
         )
 
@@ -502,10 +508,12 @@ class AsyncRLTrainer:
             sampler.set_epoch(epoch)
             for sample_index, batch in enumerate(dataloader):
                 for item in batch:
-                    group_id = (
-                        f"dp{getattr(self, '_rollout_source_rank', self.train_engine.get_data_parallel_rank())}:"
-                        f"epoch{epoch}:sample{sample_index}"
+                    dp_rank = (
+                        self._rollout_source_rank
+                        if self._rollout_source_rank is not None
+                        else self.train_engine.get_data_parallel_rank()
                     )
+                    group_id = f"dp{dp_rank}:epoch{epoch}:sample{sample_index}"
                     for rollout_index in range(n_samples):
                         task_id = self._task_counter
                         self._task_counter += 1
@@ -529,14 +537,12 @@ class AsyncRLTrainer:
         if batch_size < 0 or n_samples < 1 or batch_size % n_samples:
             raise ValueError("requested batch must contain complete GRPO groups")
         selected: list[dict[str, Any]] = []
-        consumed = getattr(self, "_consumed_grpo_group_ids", None)
-        if consumed is None:
-            consumed = self._consumed_grpo_group_ids = set()
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        collection_timeout = float(getattr(planner_cfg, "runtime_batch_collection_timeout_s", 0.0))
-        max_retries = int(getattr(planner_cfg, "runtime_batch_collection_max_retries", 0))
+        consumed = self._consumed_grpo_group_ids
+        planner_cfg = self.config.global_resource_planner
+        collection_timeout = float(planner_cfg.runtime_batch_collection_timeout_s)
+        max_retries = int(planner_cfg.runtime_batch_collection_max_retries)
         retries = 0
-        is_main_process = getattr(self, "is_main_process", True)
+        is_main_process = self.is_main_process
         while len(selected) < batch_size:
             # This must precede every blocking dispatcher call: after EHP
             # borrows all engines a complete group may already be assembled.
@@ -712,13 +718,7 @@ class AsyncRLTrainer:
                 )
             time.sleep(poll_interval)
 
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        use_barrier = bool(
-            getattr(planner_cfg, "runtime_use_nccl_barrier_after_rollout", False)
-            if planner_cfg is not None
-            else False
-        )
-        if use_barrier:
+        if self.config.global_resource_planner.runtime_use_nccl_barrier_after_rollout:
             dist.barrier()
 
     def _wait_for_all_ranks_before_weight_sync(self, step: int) -> None:
@@ -770,13 +770,7 @@ class AsyncRLTrainer:
                 )
             time.sleep(poll_interval)
 
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        use_barrier = bool(
-            getattr(planner_cfg, "runtime_use_nccl_barrier_before_weight_sync", False)
-            if planner_cfg is not None
-            else False
-        )
-        if use_barrier:
+        if self.config.global_resource_planner.runtime_use_nccl_barrier_before_weight_sync:
             dist.barrier()
 
     def _trace_train_phase(self, step: int, phase: str, **details: Any) -> None:
@@ -844,7 +838,7 @@ class AsyncRLTrainer:
                 self._trace_train_phase(step, "follow_reconfig_start")
                 self._runtime_reconfiguration_boundary(step, "pre")
                 self._trace_train_phase(step, "follow_reconfig_done")
-            if getattr(self.config.global_resource_planner, "runtime_reconfigure_training", False):
+            if self.config.global_resource_planner.runtime_reconfigure_training:
                 from RL_Framework.infra.elastic.rollout_lifecycle import ensure_batch_supply
                 ensure_batch_supply(self)
             active_hybrid_ids = self._prepare_elastic_training_step(step)
@@ -947,7 +941,7 @@ class AsyncRLTrainer:
             stats["version"] = self.train_engine.get_version()
             if rollout_sync_drain is not None:
                 stats["rollout_sync_drain"] = rollout_sync_drain
-            stats.update(getattr(self, "_advantage_stats", {}))
+            stats.update(self._advantage_stats)
             self.stats = stats
 
 
@@ -1029,13 +1023,7 @@ class AsyncRLTrainer:
             metrics = self.dispatcher.get_runtime_metrics()
             active_to_drain = int(metrics.get("staleness_running", 0))
             self.dispatcher.wait_until_idle(
-                timeout=float(
-                    getattr(
-                        self.config,
-                        "rollout_weight_sync_timeout_s",
-                        1200.0,
-                    )
-                )
+                timeout=float(self.config.rollout_weight_sync_timeout_s)
             )
             rollout_sync_drain = {
                 "cancelled_dispatcher_queue": int(cancelled["dispatcher_queue"]),
@@ -1056,11 +1044,8 @@ class AsyncRLTrainer:
         self._wait_for_all_ranks_before_weight_sync(step)
         sync_start = time.time()
         skip_rollout_sync = (
-            str(getattr(self.config, "rollout_weight_sync_mode", "")).lower()
-            == "none"
-            and not bool(
-                getattr(self.config, "require_rollout_weight_sync", True)
-            )
+            str(self.config.rollout_weight_sync_mode).lower() == "none"
+            and not self.config.require_rollout_weight_sync
         )
         if skip_rollout_sync:
             self._record_weight_sync_phase("sync_skipped")
@@ -1070,7 +1055,7 @@ class AsyncRLTrainer:
 
         new_version = step + 1
         self.train_engine.set_version(new_version)
-        if not getattr(self, "_rollout_unavailable_ids", ()):
+        if not self._rollout_unavailable_ids:
             self._rebind_rollout_engine_from_config(reason="after_weight_sync")
 
         self._resume_rollout_pipeline()
@@ -1097,10 +1082,8 @@ class AsyncRLTrainer:
         batch_size: int,
     ) -> int | None:
         """Return a temporary in-flight cap near the next weight sync."""
-        interval = int(getattr(self.config, "sync_interval", 0) or 0)
-        lead_steps = int(
-            getattr(self.config, "rollout_sync_drain_lead_steps", 0) or 0
-        )
+        interval = int(self.config.sync_interval or 0)
+        lead_steps = int(self.config.rollout_sync_drain_lead_steps or 0)
         if interval <= 0 or lead_steps <= 0:
             return None
         remainder = step % interval
@@ -1109,7 +1092,7 @@ class AsyncRLTrainer:
             return None
         prefetch_batches = max(1, steps_until_sync)
         return min(
-            int(getattr(self.config, "max_concurrent_rollouts", batch_size)),
+            int(self.config.max_concurrent_rollouts),
             max(1, int(batch_size)) * prefetch_batches,
         )
 
@@ -1132,7 +1115,7 @@ class AsyncRLTrainer:
 
     def _run_periodic_evaluation(self, workflow, dataset, step: int):
         """Run rank-0 evaluation while other ranks wait outside NCCL collectives."""
-        interval = int(getattr(self.config, "eval_interval", 0) or 0)
+        interval = int(self.config.eval_interval or 0)
         if interval <= 0 or step <= 0 or step % interval != 0:
             return
         if not hasattr(workflow, "evaluate") or self.rollout_engine is None:
@@ -1162,7 +1145,7 @@ class AsyncRLTrainer:
                         "EVAL_MAX_NEW_TOKENS",
                         os.environ.get(
                             "R2E_EVAL_MAX_NEW_TOKENS",
-                            str(getattr(self.config, "max_new_tokens", 1024)),
+                            str(self.config.max_new_tokens),
                         ),
                     )
                 )
@@ -1246,7 +1229,7 @@ class AsyncRLTrainer:
             if self.is_main_process:
                 print(f"Synchronizing weights (step={self.global_step})")
 
-            mode = str(getattr(self.config, "rollout_weight_sync_mode", "none"))
+            mode = str(self.config.rollout_weight_sync_mode)
             with self._rollout_export_only_context(mode):
                 self.train_engine.save_weights(self.config.sync_path, self.global_step)
             self._record_weight_sync_phase("checkpoint_ready")
@@ -1274,15 +1257,14 @@ class AsyncRLTrainer:
         # topology from the committed planner config. A drained old client may
         # still describe the previous engine layout during publication.
         rollout_engine = self.rollout_engine
-        hetero_cfg = getattr(self.config, "heterogeneous_rollout", None)
-        configured_instances = getattr(hetero_cfg, "instances", []) if hetero_cfg else []
+        configured_instances = self.config.heterogeneous_rollout.instances
         if self._use_heterogeneous or configured_instances:
             instance_configs = None
             if configured_instances:
                 instance_configs = [
                     {
-                        "instance_id": str(getattr(cfg, "instance_id", f"instance_{index}")),
-                        "tp_degree": int(getattr(cfg, "tp", 1)),
+                        "instance_id": str(cfg.instance_id or f"instance_{index}"),
+                        "tp_degree": int(cfg.tp),
                     }
                     for index, cfg in enumerate(configured_instances)
                 ]
@@ -1293,10 +1275,10 @@ class AsyncRLTrainer:
                 for cfg in instance_configs
             ]
         else:
-            tp = int(getattr(self.config, "vllm_tp_size", 1) or 1)
+            tp = int(self.config.vllm_tp_size or 1)
             num_instances = int(
                 getattr(rollout_engine, "num_instances", 0)
-                or getattr(self.config, "vllm_num_instances", 0)
+                or self.config.vllm_num_instances
                 or max(1, int(self.config.rollout_gpus) // max(1, tp))
             )
             entries = [
@@ -1305,10 +1287,10 @@ class AsyncRLTrainer:
             ]
         offsets: dict[str, int] = {}
         next_rank = 0
-        borrowed = set(getattr(self, "_rollout_unavailable_ids", ())) - set(
-            getattr(self, "_restored_rollouts_pending_publication", ())
+        borrowed = set(self._rollout_unavailable_ids) - set(
+            self._restored_rollouts_pending_publication
         )
-        selected = getattr(self, "_publication_target_ids", None)
+        selected = self._publication_target_ids
         for instance_id, tp_degree in entries:
             if selected is not None and instance_id not in selected:
                 continue
@@ -1322,9 +1304,7 @@ class AsyncRLTrainer:
         """Stream Megatron Bridge tensors directly to all rollout workers."""
         if str(getattr(self.train_engine, "train_backend", "")) != "megatron_core":
             raise ValueError("Direct NCCL rollout sync requires train_backend=megatron_core")
-        control_dir_value = str(
-            getattr(self.config, "rollout_weight_sync_control_dir", "") or ""
-        )
+        control_dir_value = str(self.config.rollout_weight_sync_control_dir or "")
         if not control_dir_value:
             raise ValueError("NCCL weight synchronization requires rollout_weight_sync_control_dir")
         control_dir = Path(control_dir_value).resolve()
@@ -1332,14 +1312,14 @@ class AsyncRLTrainer:
         import socket
 
         host = (
-            str(getattr(self.config, "rollout_nccl_host", "") or "")
+            str(self.config.rollout_nccl_host or "")
             or os.environ.get("MASTER_ADDR", "")
             or socket.gethostbyname(socket.gethostname())
         )
         # Reuse one communicator across refreshes. The per-rank broadcast
         # counters provide generation ordering; changing the port here would
         # pay NCCL/TCPStore bootstrap on every training version.
-        port = int(getattr(self.config, "rollout_nccl_port", 29620))
+        port = int(self.config.rollout_nccl_port)
         world_size, offsets = self._nccl_rollout_topology()
         if not offsets:
             return
@@ -1350,14 +1330,8 @@ class AsyncRLTrainer:
             "nccl_port": port,
             "nccl_world_size": world_size,
             "nccl_rank_offsets": offsets,
-            "nccl_chunk_bytes": int(
-                getattr(self.config, "rollout_nccl_chunk_mb", 256)
-            )
-            * 1024
-            * 1024,
-            "reload_strategy": str(
-                getattr(self.config, "rollout_weight_reload_strategy", "parallel")
-            ),
+            "nccl_chunk_bytes": int(self.config.rollout_nccl_chunk_mb) * 1024 * 1024,
+            "reload_strategy": str(self.config.rollout_weight_reload_strategy),
             "created_at": time.time(),
         }
         preparation_error = None
@@ -1383,7 +1357,7 @@ class AsyncRLTrainer:
                 preparation_error = f"{type(exc).__name__}: {exc}"
         preparation = [preparation_error]
         if dist.is_initialized():
-            dist.broadcast_object_list(preparation, src=0, group=getattr(self, "control", None))
+            dist.broadcast_object_list(preparation, src=0, group=self.control)
         if preparation[0]:
             raise RuntimeError(f"Rollout publication preparation failed: {preparation[0]}")
 
@@ -1409,14 +1383,10 @@ class AsyncRLTrainer:
                     world_size=world_size,
                     rank=0,
                     device=torch.cuda.current_device(),
-                    timeout_s=float(
-                        getattr(self.config, "rollout_weight_sync_timeout_s", 1200.0)
-                    ),
+                    timeout_s=float(self.config.rollout_weight_sync_timeout_s),
                     chunk_bytes=request["nccl_chunk_bytes"],
                     session_id=request["nccl_session_id"],
-                    rate_limit_gbps=float(
-                        getattr(self.config, "rollout_nccl_rate_limit_gbps", 0.0)
-                    ),
+                    rate_limit_gbps=float(self.config.rollout_nccl_rate_limit_gbps),
                 ),
                 on_tensor=record_tensor,
                 keepalive=transport_keepalive,
@@ -1426,13 +1396,13 @@ class AsyncRLTrainer:
         stream_export_with_consensus(
             self.train_engine.stream_rollout_weights,
             is_sender=self.is_main_process, send=send_export,
-            group=getattr(self, "control", None),
+            group=self.control,
         )
 
         failure = None
         if self.is_main_process:
             try:
-                timeout = float(getattr(self.config, "rollout_weight_sync_timeout_s", 1200.0))
+                timeout = float(self.config.rollout_weight_sync_timeout_s)
                 deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
                 pending = set(offsets)
                 while pending and time.monotonic() < deadline:
@@ -1451,15 +1421,7 @@ class AsyncRLTrainer:
                         if not (control_dir / f"ack_{instance_id}_{target_version}.json").exists()
                     }
                     if pending:
-                        time.sleep(
-                            float(
-                                getattr(
-                                    self.config,
-                                    "rollout_weight_sync_poll_interval_s",
-                                    0.05,
-                                )
-                            )
-                        )
+                        time.sleep(float(self.config.rollout_weight_sync_poll_interval_s))
                 if pending:
                     raise TimeoutError(f"Timed out waiting for NCCL reload: {sorted(pending)}")
                 self._record_rollout_weight_version(
@@ -1479,7 +1441,7 @@ class AsyncRLTrainer:
                 failure = f"{type(exc).__name__}: {exc}"
         outcome = [failure]
         if dist.is_initialized():
-            dist.broadcast_object_list(outcome, src=0, group=getattr(self, "control", None))
+            dist.broadcast_object_list(outcome, src=0, group=self.control)
         if outcome[0]:
             raise RuntimeError(f"Rollout publication failed: {outcome[0]}")
         if dist.is_initialized():
@@ -1491,7 +1453,7 @@ class AsyncRLTrainer:
         enabled = (
             mode == "restart"
             and str(getattr(self.train_engine, "train_backend", "")) == "megatron_core"
-            and bool(getattr(self.config, "rollout_weight_sync_export_only", True))
+            and bool(self.config.rollout_weight_sync_export_only)
         )
         if not enabled:
             yield
@@ -1509,9 +1471,7 @@ class AsyncRLTrainer:
 
     def _sync_rollout_restart_with_sentinel(self, target_version: int) -> None:
         """Reload rollout servers without parking non-zero ranks in NCCL."""
-        control_dir_value = str(
-            getattr(self.config, "rollout_weight_sync_control_dir", "") or ""
-        )
+        control_dir_value = str(self.config.rollout_weight_sync_control_dir or "")
         if not control_dir_value:
             raise ValueError("restart weight synchronization requires rollout_weight_sync_control_dir")
         control_dir = Path(control_dir_value).resolve()
@@ -1561,9 +1521,7 @@ class AsyncRLTrainer:
                 raise
         else:
             self._record_weight_sync_phase("waiting_for_rollout_reload")
-            timeout = float(
-                getattr(self.config, "rollout_weight_sync_timeout_s", 1200.0)
-            )
+            timeout = float(self.config.rollout_weight_sync_timeout_s)
             deadline = time.monotonic() + timeout + 300.0
             while not done_path.exists() and not error_path.exists():
                 if time.monotonic() > deadline:
@@ -1605,8 +1563,8 @@ class AsyncRLTrainer:
         checkpoint_path: str,
         target_version: int,
     ) -> None:
-        mode = str(getattr(self.config, "rollout_weight_sync_mode", "none"))
-        required = bool(getattr(self.config, "require_rollout_weight_sync", False))
+        mode = str(self.config.rollout_weight_sync_mode)
+        required = bool(self.config.require_rollout_weight_sync)
         if mode == "none":
             if required:
                 raise RuntimeError(
@@ -1617,26 +1575,20 @@ class AsyncRLTrainer:
         if mode != "restart":
             raise ValueError(f"Unsupported rollout_weight_sync_mode: {mode}")
 
-        control_dir_value = str(
-            getattr(self.config, "rollout_weight_sync_control_dir", "") or ""
-        )
+        control_dir_value = str(self.config.rollout_weight_sync_control_dir or "")
         if not control_dir_value:
             raise ValueError("restart weight synchronization requires rollout_weight_sync_control_dir")
         control_dir = Path(control_dir_value).resolve()
         control_dir.mkdir(parents=True, exist_ok=True)
 
         instance_ids = self._current_rollout_instance_ids()
-        reload_method = str(
-            getattr(self.config, "rollout_weight_reload_method", "restart")
-        ).lower()
+        reload_method = str(self.config.rollout_weight_reload_method).lower()
         if reload_method not in {"restart", "inplace"}:
             raise ValueError(
                 "rollout_weight_reload_method must be 'restart' or 'inplace', "
                 f"got {reload_method!r}"
             )
-        reload_strategy = str(
-            getattr(self.config, "rollout_weight_reload_strategy", "parallel")
-        ).lower()
+        reload_strategy = str(self.config.rollout_weight_reload_strategy).lower()
         if reload_strategy not in {"parallel", "serial"}:
             raise ValueError(
                 "rollout_weight_reload_strategy must be 'parallel' or 'serial', "
@@ -1663,9 +1615,7 @@ class AsyncRLTrainer:
         request_tmp.write_text(json.dumps(request), encoding="utf-8")
         request_tmp.replace(request_path)
 
-        timeout = float(
-            getattr(self.config, "rollout_weight_sync_timeout_s", 1200.0)
-        )
+        timeout = float(self.config.rollout_weight_sync_timeout_s)
         deadline = time.monotonic() + timeout
         pending = set(instance_ids)
         while pending and time.monotonic() < deadline:
@@ -1740,9 +1690,7 @@ class AsyncRLTrainer:
         checkpoint_path: str,
         instance_ids: list[str],
     ) -> None:
-        control_dir_value = str(
-            getattr(self.config, "rollout_weight_sync_control_dir", "") or ""
-        )
+        control_dir_value = str(self.config.rollout_weight_sync_control_dir or "")
         if not control_dir_value:
             return
         self._write_json_atomic(
@@ -1753,7 +1701,7 @@ class AsyncRLTrainer:
                 "checkpoint_path": checkpoint_path,
                 "instances": sorted(instance_ids),
                 "updated_at": time.time(),
-                "mode": str(getattr(self.config, "rollout_weight_sync_mode", "none")),
+                "mode": str(self.config.rollout_weight_sync_mode),
             },
         )
 
@@ -1858,7 +1806,7 @@ class AsyncRLTrainer:
         for v in to_delete:
             try:
                 weight_dir = Path(version_dir_map[v]).resolve()
-                model_path_value = str(getattr(self.config, "model_path", "") or "")
+                model_path_value = str(self.config.model_path or "")
                 if model_path_value and Path(model_path_value).resolve() == weight_dir:
                     if self.is_main_process:
                         print(f"Preserving resume source weights: {weight_dir}")
@@ -1900,11 +1848,8 @@ class AsyncRLTrainer:
                 self._runtime_done_published = True
         else:
             if protocol is not None:
-                planner_cfg = getattr(self.config, "global_resource_planner", None)
                 protocol.wait_runtime_done(
-                    timeout=float(
-                        getattr(planner_cfg, "runtime_drain_timeout_s", 3600.0)
-                    )
+                    timeout=float(self.config.global_resource_planner.runtime_drain_timeout_s)
                 )
             if self.runtime_elastic_executor is not None:
                 self.runtime_elastic_executor.close()
@@ -2015,19 +1960,17 @@ class AsyncRLTrainer:
 
     def _init_global_resource_planner(self):
         """Init global resource planner."""
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        if (planner_cfg is not None and getattr(planner_cfg, "enabled", False)
-                and getattr(planner_cfg, "runtime_coordinate_reconfiguration_ranks", True)):
+        planner_cfg = self.config.global_resource_planner
+        if planner_cfg.enabled and planner_cfg.runtime_coordinate_reconfiguration_ranks:
             self._runtime_boundary_protocol = RuntimeBoundaryProtocol(
                 self._runtime_reconfiguration_coord_dir(), self.rank, self.world_size,
-                timeout=float(getattr(planner_cfg, "runtime_peer_request_wait_s", 45.0)),
+                timeout=float(planner_cfg.runtime_peer_request_wait_s),
             )
             self._runtime_boundary_protocol.join()
         if not self.is_main_process:
             self._start_runtime_reconfiguration_follower()
             return
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        if planner_cfg is None or not getattr(planner_cfg, "enabled", False):
+        if not planner_cfg.enabled:
             return
         if not self.train_engine or not self._is_rollout_source():
             return
@@ -2047,9 +1990,9 @@ class AsyncRLTrainer:
             self.runtime_elastic_executor.runtime_run_id = self._runtime_boundary_protocol.run_id
         if self._elastic_gradient_server is not None:
             self.runtime_elastic_executor.gradient_server = self._elastic_gradient_server
-        if getattr(planner_cfg, "runtime_async_planning", True):
+        if planner_cfg.runtime_async_planning:
             self._grp_executor = ThreadPoolExecutor(
-                max_workers=max(1, int(getattr(planner_cfg, "runtime_max_pending_plans", 1) or 1)),
+                max_workers=max(1, int(planner_cfg.runtime_max_pending_plans or 1)),
                 thread_name_prefix="global-resource-planner",
             )
         print(
@@ -2057,22 +2000,21 @@ class AsyncRLTrainer:
             f"interval={planner_cfg.plan_interval} "
             f"min_history={planner_cfg.min_history_size} "
             f"gain_threshold={planner_cfg.min_gain_ratio:.2%} "
-            f"async={getattr(planner_cfg, 'runtime_async_planning', True)}"
+            f"async={planner_cfg.runtime_async_planning}"
         )
 
     def _initialize_elastic_communication_domains(self) -> None:
         """Create the isolated elastic CCL domain on every training rank."""
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        if planner_cfg is None or not getattr(planner_cfg, "enabled", False):
+        planner_cfg = self.config.global_resource_planner
+        if not planner_cfg.enabled:
             return
-        if not any(
-            bool(getattr(planner_cfg, name, False))
-            for name in ("elastic_hybrid_planning_enabled", "hybrid_worker_launch_enabled", "elastic_hybrid_require_isolated_ccl")
+        if not (
+            planner_cfg.elastic_hybrid_planning_enabled
+            or planner_cfg.hybrid_worker_launch_enabled
+            or planner_cfg.elastic_hybrid_require_isolated_ccl
         ):
             return
-        if not bool(getattr(planner_cfg, "decouple_communication_domains", True)):
-            return
-        if not bool(getattr(planner_cfg, "elastic_hybrid_require_isolated_ccl", False)) and not bool(getattr(planner_cfg, "decouple_communication_domains", True)):
+        if not planner_cfg.decouple_communication_domains:
             return
         initializer = getattr(
             self.train_engine,
@@ -2095,47 +2037,47 @@ class AsyncRLTrainer:
 
     def _init_nonblocking_elastic_core(self) -> None:
         """Start one gradient endpoint per training rank for EHP lanes."""
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        if planner_cfg is None or not bool(getattr(planner_cfg, "enabled", False)):
+        planner_cfg = self.config.global_resource_planner
+        if not planner_cfg.enabled:
             return
-        if not any(bool(getattr(planner_cfg, name, False)) for name in ("elastic_hybrid_planning_enabled", "hybrid_worker_launch_enabled")):
+        if not (planner_cfg.elastic_hybrid_planning_enabled or planner_cfg.hybrid_worker_launch_enabled):
             return
         configure = getattr(self.train_engine, "configure_elastic_training", None)
         if not callable(configure):
             raise RuntimeError("EHP requires train-engine elastic gradient hooks")
         core_ids = list(getattr(self.train_engine, "get_elastic_core_replica_ids", lambda: ["dp0"])())
         replica_width = (
-            max(1, int(getattr(self.config, "train_tp_size", 1) or 1))
-            * max(1, int(getattr(self.config, "train_pp_size", 1) or 1))
-            * max(1, int(getattr(self.config, "train_cp_size", 1) or 1))
+            max(1, int(self.config.train_tp_size or 1))
+            * max(1, int(self.config.train_pp_size or 1))
+            * max(1, int(self.config.train_cp_size or 1))
         )
         try:
             domain = configure(
                 core_ids,
-                decouple_communication_domains=bool(getattr(planner_cfg, "decouple_communication_domains", True)),
+                decouple_communication_domains=bool(planner_cfg.decouple_communication_domains),
                 replica_world_size=replica_width,
             )
         except TypeError:
-            domain = configure(core_ids, decouple_communication_domains=bool(getattr(planner_cfg, "decouple_communication_domains", True)))
+            domain = configure(core_ids, decouple_communication_domains=bool(planner_cfg.decouple_communication_domains))
         setter = getattr(self.train_engine, "set_elastic_active_gradient_timeout", None)
         if callable(setter):
-            setter(float(getattr(planner_cfg, "hybrid_active_gradient_timeout_s", 300.0)))
-        task_dir = Path(getattr(planner_cfg, "hybrid_worker_task_dir", "./logs/elastic_training_tasks"))
+            setter(float(planner_cfg.hybrid_active_gradient_timeout_s))
+        task_dir = Path(planner_cfg.hybrid_worker_task_dir)
         endpoint_dir = task_dir / "core_endpoints"
         endpoint_dir.mkdir(parents=True, exist_ok=True)
         server = ElasticGradientServer(
-            host=str(getattr(planner_cfg, "gradient_server_host", "0.0.0.0")),
+            host=str(planner_cfg.gradient_server_host),
             port=0,
-            authkey=str(getattr(planner_cfg, "gradient_server_authkey", "")),
+            authkey=str(planner_cfg.gradient_server_authkey),
             on_payload=self.train_engine.enqueue_hybrid_gradient_payload,
-            update_timeout=float(getattr(planner_cfg, "hybrid_update_timeout_s", 300.0)),
+            update_timeout=float(planner_cfg.hybrid_update_timeout_s),
         )
         endpoint = server.start()
         self._elastic_gradient_server = server
         if self.is_main_process and self.runtime_elastic_executor is not None:
             self.runtime_elastic_executor.gradient_server = server
         lane = getattr(self.train_engine, "get_elastic_lane_state", lambda: {})()
-        public_host = str(getattr(planner_cfg, "gradient_server_public_host", "") or socket.gethostname())
+        public_host = str(planner_cfg.gradient_server_public_host or socket.gethostname())
         self._write_json_atomic(
             endpoint_dir / f"rank_{self.rank}.json",
             {**endpoint.to_dict(), **lane, "host": public_host, "backend": "tcp"},
@@ -2162,10 +2104,10 @@ class AsyncRLTrainer:
             callback_setter(publish_update)
 
     def _start_runtime_reconfiguration_follower(self) -> None:
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        if planner_cfg is None or not getattr(planner_cfg, "enabled", False):
+        planner_cfg = self.config.global_resource_planner
+        if not planner_cfg.enabled:
             return
-        if not getattr(planner_cfg, "runtime_coordinate_reconfiguration_ranks", True):
+        if not planner_cfg.runtime_coordinate_reconfiguration_ranks:
             return
         if self.train_engine is not None and not self._is_rollout_source():
             return
@@ -2194,12 +2136,7 @@ class AsyncRLTrainer:
         self._runtime_follow_thread.start()
 
     def _runtime_reconfiguration_coord_dir(self) -> Path:
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        configured = (
-            getattr(planner_cfg, "runtime_reconfiguration_coord_dir", "")
-            if planner_cfg is not None
-            else ""
-        )
+        configured = self.config.global_resource_planner.runtime_reconfiguration_coord_dir
         if configured:
             return Path(configured)
         return Path(self.config.log_dir) / "runtime_reconfiguration"
@@ -2208,12 +2145,12 @@ class AsyncRLTrainer:
         return self._runtime_reconfiguration_coord_dir() / "planning_pending.json"
 
     def _write_runtime_reconfiguration_pending(self, step: int) -> None:
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        if planner_cfg is None or not getattr(planner_cfg, "enabled", False):
+        planner_cfg = self.config.global_resource_planner
+        if not planner_cfg.enabled:
             return
         coord_dir = self._runtime_reconfiguration_coord_dir()
         coord_dir.mkdir(parents=True, exist_ok=True)
-        wait_s = float(getattr(planner_cfg, "runtime_peer_request_wait_s", 45.0))
+        wait_s = float(planner_cfg.runtime_peer_request_wait_s)
         self._write_json_atomic(
             self._runtime_reconfiguration_pending_path(),
             {
@@ -2308,10 +2245,10 @@ class AsyncRLTrainer:
             self._consume_runtime_reconfiguration_request(expected_coord_id=expected_coord_id)
 
     def _consume_runtime_reconfiguration_request(self, *, expected_coord_id: str = "") -> None:
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        if planner_cfg is None or not getattr(planner_cfg, "enabled", False):
+        planner_cfg = self.config.global_resource_planner
+        if not planner_cfg.enabled:
             return
-        if not getattr(planner_cfg, "runtime_coordinate_reconfiguration_ranks", True):
+        if not planner_cfg.runtime_coordinate_reconfiguration_ranks:
             return
         if expected_coord_id and expected_coord_id in self._runtime_handled_request_ids:
             return
@@ -2327,7 +2264,7 @@ class AsyncRLTrainer:
             return
         try:
             request = json.loads(request_path.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, json.JSONDecodeError):
             return
         current_job_id = os.environ.get("SLURM_JOB_ID", os.environ.get("JOB_ID", ""))
         request_job_id = str(request.get("job_id", ""))
@@ -2345,9 +2282,7 @@ class AsyncRLTrainer:
         # Followers must stay non-blocking too; otherwise their dispatcher
         # drain waits can deadlock with the main loop's post-rollout barrier.
         # The background follower will apply applied.json on a later poll.
-        if not bool(
-            getattr(planner_cfg, "runtime_drain_before_reconfigure", True)
-        ):
+        if not planner_cfg.runtime_drain_before_reconfigure:
             self._follow_applied_runtime_reconfiguration_if_available(coord_dir)
             return
 
@@ -2359,18 +2294,14 @@ class AsyncRLTrainer:
                 paused = True
                 if hasattr(self.dispatcher, "wait_until_idle"):
                     self.dispatcher.wait_until_idle(
-                        timeout=float(
-                            getattr(planner_cfg, "runtime_drain_timeout_s", 3600.0)
-                        )
+                        timeout=float(planner_cfg.runtime_drain_timeout_s)
                     )
             if (
                 self.rollout_engine is not None
                 and hasattr(self.rollout_engine, "wait_until_idle")
             ):
                 self.rollout_engine.wait_until_idle(
-                    timeout=float(
-                        getattr(planner_cfg, "runtime_drain_timeout_s", 3600.0)
-                    )
+                    timeout=float(planner_cfg.runtime_drain_timeout_s)
                 )
 
             ready_dir = coord_dir / "ready"
@@ -2392,7 +2323,7 @@ class AsyncRLTrainer:
             )
             tmp_ready.replace(ready_path)
 
-            timeout = float(getattr(planner_cfg, "runtime_drain_timeout_s", 3600.0))
+            timeout = float(planner_cfg.runtime_drain_timeout_s)
             deadline = time.monotonic() + timeout
             applied_path = coord_dir / "applied.json"
             aborted_path = coord_dir / "aborted.json"
@@ -2440,7 +2371,7 @@ class AsyncRLTrainer:
         if applied_path.exists():
             try:
                 state = json.loads(applied_path.read_text(encoding="utf-8"))
-            except Exception:
+            except (OSError, json.JSONDecodeError):
                 return
         else:
             state = self._runtime_reconfiguration_state_from_manifest()
@@ -2544,13 +2475,7 @@ class AsyncRLTrainer:
             self.rollout_engine = HeterogeneousRolloutEngine.from_config(self.config)
             if hasattr(self.rollout_engine, "wait_for_ready"):
                 self.rollout_engine.wait_for_ready(
-                    timeout=float(
-                        getattr(
-                            self.config.global_resource_planner,
-                            "vllm_ready_timeout_s",
-                            300.0,
-                        )
-                    )
+                    timeout=float(self.config.global_resource_planner.vllm_ready_timeout_s)
                 )
             self._runtime_reconfiguration_coord_id = str(state.get("coord_id", ""))
             print(
@@ -2565,7 +2490,7 @@ class AsyncRLTrainer:
             return None
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, json.JSONDecodeError):
             return None
         if (str(manifest.get("phase", "")) != "applied"
                 or not self._runtime_state_is_current(manifest)):
@@ -2642,29 +2567,19 @@ class AsyncRLTrainer:
             self.rollout_engine.reconfigure_from_plan(None, self.config)
         if hasattr(self.rollout_engine, "wait_for_ready"):
             self.rollout_engine.wait_for_ready(
-                timeout=float(
-                    getattr(
-                        self.config.global_resource_planner,
-                        "vllm_ready_timeout_s",
-                        300.0,
-                    )
-                )
+                timeout=float(self.config.global_resource_planner.vllm_ready_timeout_s)
             )
-        executor = getattr(self, "runtime_elastic_executor", None)
+        executor = self.runtime_elastic_executor
         if executor is not None:
             executor.rollout_engine = self.rollout_engine
         self._reset_rollout_pipeline_after_reconfigure()
         if self.is_main_process:
-            instances = getattr(self.config.heterogeneous_rollout, "instances", [])
-            default_host = (
-                getattr(self.config.heterogeneous_rollout, "vllm_host", "")
-                or "127.0.0.1"
-            )
+            instances = self.config.heterogeneous_rollout.instances
+            default_host = self.config.heterogeneous_rollout.vllm_host or "127.0.0.1"
             if default_host == "0.0.0.0":
                 default_host = "127.0.0.1"
             endpoints = [
-                f"{getattr(inst, 'host', '') or default_host}:"
-                f"{getattr(inst, 'port', '')}"
+                f"{inst.host or default_host}:{inst.port}"
                 for inst in instances
             ]
             print(
@@ -2708,16 +2623,10 @@ class AsyncRLTrainer:
 
         core_ids = [str(item) for item in state.get("core_replica_ids") or []]
         if not core_ids:
-            dp = max(1, int(getattr(self.config, "train_dp_size", 1) or 1))
+            dp = max(1, int(self.config.train_dp_size or 1))
             core_ids = [f"dp{i}" for i in range(dp)]
 
-        decoupled = bool(
-            getattr(
-                self.config.global_resource_planner,
-                "decouple_communication_domains",
-                True,
-            )
-        )
+        decoupled = bool(self.config.global_resource_planner.decouple_communication_domains)
         configure = getattr(self.train_engine, "configure_elastic_training", None)
         if callable(configure):
             try:
@@ -2734,11 +2643,7 @@ class AsyncRLTrainer:
                 core_replica_ids=core_ids,
                 decouple_communication_domains=decoupled,
                 require_isolated_process_group=bool(
-                    getattr(
-                        self.config.global_resource_planner,
-                        "elastic_hybrid_require_isolated_ccl",
-                        False,
-                    )
+                    self.config.global_resource_planner.elastic_hybrid_require_isolated_ccl
                 ),
             )
             setter = getattr(self.train_engine, "set_elastic_gradient_domain", None)
@@ -2808,13 +2713,27 @@ class AsyncRLTrainer:
         )
 
     def _is_rollout_source(self) -> bool:
-        if hasattr(self, "_rollout_source_rank"):
-            return self._rollout_source_rank is not None
+        if self._rollout_source_rank is not None:
+            return True
+        if self._rollout_source_world_size is not None:
+            return False
         return self.train_engine.is_batch_source()
 
     def _source_batch_sample_count(self) -> int:
-        source_size = int(getattr(self, "_rollout_source_world_size", self.train_engine.get_data_parallel_world_size()))
-        source_rank = getattr(self, "_rollout_source_rank", self.train_engine.get_data_parallel_rank())
+        source_size = int(
+            self._rollout_source_world_size
+            if self._rollout_source_world_size is not None
+            else self.train_engine.get_data_parallel_world_size()
+        )
+        source_rank = (
+            self._rollout_source_rank
+            if self._rollout_source_rank is not None
+            else (
+                None
+                if self._rollout_source_world_size is not None
+                else self.train_engine.get_data_parallel_rank()
+            )
+        )
         if source_rank is None:
             return 0
         counts = complete_group_sample_counts(
@@ -2837,15 +2756,20 @@ class AsyncRLTrainer:
                 )
             except Exception as exc:
                 trajectories, error = [], f"{type(exc).__name__}: {exc}"
+            source_rank = (
+                self._rollout_source_rank
+                if self._rollout_source_rank is not None
+                else self.train_engine.get_data_parallel_rank()
+            )
             record = {
-                "source_rank": int(getattr(self, "_rollout_source_rank", self.train_engine.get_data_parallel_rank())),
+                "source_rank": int(source_rank),
                 "trajectories": trajectories, "error": error,
             }
         # Rollout may run longer than the NCCL process-group timeout. Wait
         # through the existing out-of-band readiness protocol before entering
         # the data collective, including on a source that collected an error.
         self._wait_for_all_ranks_after_rollout(
-            int(getattr(self, "global_step", 0)),
+            int(self.global_step),
             record["trajectories"] if record is not None else [],
         )
         if dist.is_available() and dist.is_initialized():
@@ -2872,7 +2796,11 @@ class AsyncRLTrainer:
             if source["source_rank"] in sources:
                 raise RuntimeError(f"multiple logical batch sources for {source['source_rank']}")
             sources[source["source_rank"]] = source
-        source_size = int(getattr(self, "_rollout_source_world_size", self.train_engine.get_data_parallel_world_size()))
+        source_size = int(
+            self._rollout_source_world_size
+            if self._rollout_source_world_size is not None
+            else self.train_engine.get_data_parallel_world_size()
+        )
         if set(sources) != set(range(source_size)):
             raise RuntimeError("missing logical batch source")
         dp_size = int(self.train_engine.get_data_parallel_world_size())
@@ -2920,12 +2848,12 @@ class AsyncRLTrainer:
         return core_batch
 
     def _refresh_nonblocking_elastic_membership(self) -> None:
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
+        planner_cfg = self.config.global_resource_planner
         domain = getattr(self.train_engine, "elastic_gradient_domain", None)
         run_id = self._elastic_membership_run_id
-        if domain is None or planner_cfg is None or not run_id:
+        if domain is None or not run_id:
             return
-        membership_dir = Path(getattr(planner_cfg, "hybrid_worker_task_dir", "./logs/elastic_training_tasks")) / "membership"
+        membership_dir = Path(planner_cfg.hybrid_worker_task_dir) / "membership"
         for path in membership_dir.glob("*.json"):
             try:
                 state = json.loads(path.read_text(encoding="utf-8"))
@@ -2954,9 +2882,9 @@ class AsyncRLTrainer:
         if not self._pending_hybrid_training_batches or not self.is_main_process:
             return
         planner_cfg = self.config.global_resource_planner
-        task_dir = Path(getattr(planner_cfg, "hybrid_worker_task_dir", "./logs/elastic_training_tasks"))
+        task_dir = Path(planner_cfg.hybrid_worker_task_dir)
         task_dir.mkdir(parents=True, exist_ok=True)
-        lockstep = bool(getattr(planner_cfg, "hybrid_lockstep_gradient_sync", True))
+        lockstep = bool(planner_cfg.hybrid_lockstep_gradient_sync)
         domain = getattr(self.train_engine, "elastic_gradient_domain", None)
         frozen_epochs = domain.membership_state().get("membership_epochs", {}) if domain is not None else {}
         state_version = int(getattr(self.train_engine, "optimizer_revision", self.train_engine.get_version()))
@@ -2988,12 +2916,10 @@ class AsyncRLTrainer:
         self._pending_hybrid_training_batches.clear()
 
     def _runtime_length_profile_path(self) -> str:
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        if planner_cfg is None:
+        planner_cfg = self.config.global_resource_planner
+        if not planner_cfg.runtime_length_profile_enabled:
             return ""
-        if not getattr(planner_cfg, "runtime_length_profile_enabled", True):
-            return ""
-        return str(getattr(planner_cfg, "runtime_length_profile_jsonl", "") or "")
+        return str(planner_cfg.runtime_length_profile_jsonl or "")
 
     def _refresh_global_resource_history_from_profile(
         self,
@@ -3031,7 +2957,7 @@ class AsyncRLTrainer:
 
         planner_cfg = self.config.global_resource_planner
         runtime_profile_path = self._runtime_length_profile_path()
-        if not getattr(planner_cfg, "runtime_async_planning", True):
+        if not planner_cfg.runtime_async_planning:
             profile_records = self._refresh_global_resource_history_from_profile(
                 step=step,
                 stats=stats,
@@ -3255,13 +3181,7 @@ class AsyncRLTrainer:
                             "wait_until_idle",
                         ):
                             self.dispatcher.wait_until_idle(
-                                timeout=float(
-                                    getattr(
-                                        self.config.global_resource_planner,
-                                        "runtime_drain_timeout_s",
-                                        3600.0,
-                                    )
-                                )
+                                timeout=float(self.config.global_resource_planner.runtime_drain_timeout_s)
                             )
                         self._reset_rollout_pipeline_after_reconfigure()
                         print(
@@ -3284,14 +3204,10 @@ class AsyncRLTrainer:
                 if result.applied:
                     planner_cfg = self.config.global_resource_planner
                     rollout_runtime_enabled = bool(
-                        getattr(planner_cfg, "apply_to_runtime", True)
-                        or getattr(
-                            planner_cfg,
-                            "runtime_manage_rollout_processes",
-                            False,
-                        )
+                        planner_cfg.apply_to_runtime
+                        or planner_cfg.runtime_manage_rollout_processes
                     )
-                    if rollout_runtime_enabled and not getattr(self, "_rollout_unavailable_ids", ()):
+                    if rollout_runtime_enabled and not self._rollout_unavailable_ids:
                         self._rebind_rollout_engine_from_config(
                             reason="after_runtime_reconfiguration"
                         )
@@ -3336,35 +3252,17 @@ class AsyncRLTrainer:
             self.dispatcher.pause()
 
     def _resume_rollout_pipeline(self) -> None:
-        instances = getattr(getattr(self.config, "heterogeneous_rollout", None), "instances", ())
-        if instances and len(getattr(self, "_rollout_unavailable_ids", ())) == len(instances):
+        instances = self.config.heterogeneous_rollout.instances
+        if instances and len(self._rollout_unavailable_ids) == len(instances):
             return
         if self.dispatcher is not None and hasattr(self.dispatcher, "resume"):
             self.dispatcher.resume()
 
     def _should_pre_reset_rollout_pipeline_for_reconfigure(self) -> bool:
-        grp_cfg = getattr(self.config, "global_resource_planner", None)
-        if grp_cfg is None:
-            return False
-        strategy = str(
-            getattr(
-                grp_cfg,
-                "runtime_rollout_reconfigure_strategy",
-                getattr(grp_cfg, "rollout_reconfigure_strategy", "restart_all"),
-            )
-        ).lower()
-        cluster_swap = bool(
-            getattr(grp_cfg, "runtime_cluster_swap_enabled", False)
-            or strategy == "cluster_swap"
-        )
-        drain = bool(
-            getattr(
-                grp_cfg,
-                "runtime_drain_before_reconfigure",
-                getattr(grp_cfg, "drain_before_reconfigure", True),
-            )
-        )
-        return cluster_swap and not drain
+        grp_cfg = self.config.global_resource_planner
+        strategy = str(grp_cfg.runtime_rollout_reconfigure_strategy).lower()
+        cluster_swap = bool(grp_cfg.runtime_cluster_swap_enabled or strategy == "cluster_swap")
+        return cluster_swap and not grp_cfg.runtime_drain_before_reconfigure
 
     def _record_runtime_reconfiguration_event(self, step: int, decision, result) -> None:
         try:
@@ -3388,26 +3286,20 @@ class AsyncRLTrainer:
         """Init history collector."""
         if not self.is_main_process:
             return
-        planner_cfg = getattr(self.config, "global_resource_planner", None)
-        planner_enabled = bool(
-            planner_cfg is not None and getattr(planner_cfg, "enabled", False)
-        )
+        planner_cfg = self.config.global_resource_planner
         runtime_profile_enabled = bool(
-            planner_enabled
-            and getattr(planner_cfg, "runtime_length_profile_enabled", True)
+            planner_cfg.enabled and planner_cfg.runtime_length_profile_enabled
         )
-        if not getattr(self.config, "enable_history_collection", False) and not runtime_profile_enabled:
+        if not self.config.enable_history_collection and not runtime_profile_enabled:
             return
 
-        output_dir = getattr(self.config, "history_output_dir", "") or ""
-        if not output_dir:
-            output_dir = os.path.join(self.config.log_dir, "history")
+        output_dir = self.config.history_output_dir or os.path.join(
+            self.config.log_dir, "history"
+        )
 
         runtime_profile_path = ""
         if runtime_profile_enabled:
-            runtime_profile_path = str(
-                getattr(planner_cfg, "runtime_length_profile_jsonl", "") or ""
-            )
+            runtime_profile_path = str(planner_cfg.runtime_length_profile_jsonl or "")
             if not runtime_profile_path:
                 runtime_profile_path = os.path.join(
                     output_dir,
@@ -3415,7 +3307,7 @@ class AsyncRLTrainer:
                 )
             planner_cfg.runtime_length_profile_jsonl = runtime_profile_path
 
-        experiment_name = getattr(self.config, "history_experiment_name", "") or ""
+        experiment_name = self.config.history_experiment_name or ""
         # Keep history artifacts isolated per launched run.  The validated
         # six-node configs intentionally share a history root/name so that
         # operators do not need to edit YAML between EHP and non-EHP runs.
@@ -3429,8 +3321,8 @@ class AsyncRLTrainer:
 
         self.history_collector = HistoryDataCollector(
             output_dir=output_dir,
-            save_raw_lengths=getattr(self.config, "history_save_raw_lengths", False),
-            flush_interval=getattr(self.config, "history_flush_interval", 10),
+            save_raw_lengths=self.config.history_save_raw_lengths,
+            flush_interval=self.config.history_flush_interval,
             experiment_name=experiment_name,
             length_profile_path=runtime_profile_path,
         )

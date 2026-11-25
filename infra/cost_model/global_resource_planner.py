@@ -403,62 +403,30 @@ class GlobalResourcePlanner:
             allowed_rollout_tp=planner_cfg.allowed_rollout_tp,
             require_heterogeneous_rollout_tp=planner_cfg.require_heterogeneous_rollout_tp,
             allowed_train_tp=planner_cfg.allowed_train_tp or None,
-            allowed_train_ep=getattr(planner_cfg, "allowed_train_ep", []) or None,
+            allowed_train_ep=planner_cfg.allowed_train_ep or None,
             allowed_train_pp=planner_cfg.allowed_train_pp or None,
-            train_comm_compute_ratio_threshold=getattr(
-                planner_cfg, "train_comm_compute_ratio_threshold", float("inf")
-            ),
-            train_ep_comm_compute_ratio_threshold=getattr(
-                planner_cfg, "train_ep_comm_compute_ratio_threshold", float("inf")
-            ),
-            train_pipeline_bubble_ratio_threshold=getattr(
-                planner_cfg, "train_pipeline_bubble_ratio_threshold", 0.30
-            ),
+            train_comm_compute_ratio_threshold=planner_cfg.train_comm_compute_ratio_threshold,
+            train_ep_comm_compute_ratio_threshold=planner_cfg.train_ep_comm_compute_ratio_threshold,
+            train_pipeline_bubble_ratio_threshold=planner_cfg.train_pipeline_bubble_ratio_threshold,
             fixed_train_gpus=planner_cfg.fixed_train_gpus,
-            initial_allocation_strategy=getattr(
-                planner_cfg, "initial_allocation_strategy", "grp"
-            ),
-            allocation_granularity_gpus=getattr(
-                planner_cfg, "allocation_granularity_gpus", 1
-            ),
-            min_train_gpus=getattr(planner_cfg, "min_train_gpus", 1),
-            min_rollout_gpus=getattr(planner_cfg, "min_rollout_gpus", 1),
+            initial_allocation_strategy=planner_cfg.initial_allocation_strategy,
+            allocation_granularity_gpus=planner_cfg.allocation_granularity_gpus,
+            min_train_gpus=planner_cfg.min_train_gpus,
+            min_rollout_gpus=planner_cfg.min_rollout_gpus,
             micro_batch_sizes=planner_cfg.micro_batch_sizes or None,
             max_history_size=planner_cfg.max_history_size,
-            online_replanning=getattr(planner_cfg, "runtime_online_replanning", True),
-            replan_cooldown_steps=getattr(
-                planner_cfg, "runtime_replan_cooldown_steps", 1
-            ),
-            queue_pressure_threshold=getattr(
-                planner_cfg, "runtime_queue_pressure_threshold", 0.75
-            ),
-            active_rollout_pressure_threshold=getattr(
-                planner_cfg, "runtime_active_rollout_pressure_threshold", 0.85
-            ),
-            rejected_rollout_delta_threshold=getattr(
-                planner_cfg, "runtime_rejected_rollout_delta_threshold", 8
-            ),
-            rollout_train_imbalance_threshold=getattr(
-                planner_cfg, "runtime_rollout_train_imbalance_threshold", 1.25
-            ),
-            elastic_hybrid_planning_enabled=getattr(
-                planner_cfg, "elastic_hybrid_planning_enabled", False
-            ),
-            elastic_hybrid_max_workers=getattr(
-                planner_cfg, "elastic_hybrid_max_workers", 0
-            ),
-            elastic_hybrid_borrow_train_rollout_ratio=getattr(
-                planner_cfg, "elastic_hybrid_borrow_train_rollout_ratio", 1.15
-            ),
-            elastic_hybrid_release_train_rollout_ratio=getattr(
-                planner_cfg, "elastic_hybrid_release_train_rollout_ratio", 0.90
-            ),
-            elastic_hybrid_max_rollout_pressure=getattr(
-                planner_cfg, "elastic_hybrid_max_rollout_pressure", 0.80
-            ),
-            elastic_hybrid_signal_ttl_steps=getattr(
-                planner_cfg, "elastic_hybrid_signal_ttl_steps", 20
-            ),
+            online_replanning=planner_cfg.runtime_online_replanning,
+            replan_cooldown_steps=planner_cfg.runtime_replan_cooldown_steps,
+            queue_pressure_threshold=planner_cfg.runtime_queue_pressure_threshold,
+            active_rollout_pressure_threshold=planner_cfg.runtime_active_rollout_pressure_threshold,
+            rejected_rollout_delta_threshold=planner_cfg.runtime_rejected_rollout_delta_threshold,
+            rollout_train_imbalance_threshold=planner_cfg.runtime_rollout_train_imbalance_threshold,
+            elastic_hybrid_planning_enabled=planner_cfg.elastic_hybrid_planning_enabled,
+            elastic_hybrid_max_workers=planner_cfg.elastic_hybrid_max_workers,
+            elastic_hybrid_borrow_train_rollout_ratio=planner_cfg.elastic_hybrid_borrow_train_rollout_ratio,
+            elastic_hybrid_release_train_rollout_ratio=planner_cfg.elastic_hybrid_release_train_rollout_ratio,
+            elastic_hybrid_max_rollout_pressure=planner_cfg.elastic_hybrid_max_rollout_pressure,
+            elastic_hybrid_signal_ttl_steps=planner_cfg.elastic_hybrid_signal_ttl_steps,
             verbose=planner_cfg.verbose,
         )
 
@@ -632,7 +600,7 @@ class GlobalResourcePlanner:
             rollout_gpus=(
                 sum(forced_rollout_tp)
                 if forced_rollout_tp is not None
-                else int(getattr(config, "rollout_gpus", 0) or 0)
+                else int(config.rollout_gpus or 0)
             ),
         )
         forced_candidate = forced_rollout_tp is not None or forced_train is not None
@@ -653,11 +621,10 @@ class GlobalResourcePlanner:
             min_train_gpus=self.min_train_gpus,
             min_rollout_gpus=self.min_rollout_gpus,
             rollout_node_tp_pattern=list(
-                getattr(config.global_resource_planner, "rollout_node_tp_pattern", [])
-                or []
+                config.global_resource_planner.rollout_node_tp_pattern or []
             ),
-            train_cp_size=max(1, int(getattr(config, "train_cp_size", 1) or 1)),
-            dp_batch_group_size=max(1, int(getattr(config, "n_samples", 1) or 1)),
+            train_cp_size=max(1, int(config.train_cp_size or 1)),
+            dp_batch_group_size=max(1, int(config.n_samples or 1)),
         )
         candidate = self._plan_from_result(result, config)
         if candidate is None and not forced_candidate:
@@ -748,10 +715,9 @@ class GlobalResourcePlanner:
                     fixed_train_gpus=capabilities.world_size,
                     allocation_granularity_gpus=self.allocation_granularity_gpus,
                     min_train_gpus=self.min_train_gpus, min_rollout_gpus=self.min_rollout_gpus,
-                    rollout_node_tp_pattern=list(getattr(config.global_resource_planner,
-                        "rollout_node_tp_pattern", []) or []),
+                    rollout_node_tp_pattern=list(config.global_resource_planner.rollout_node_tp_pattern or []),
                     train_cp_size=capabilities.cp,
-                    dp_batch_group_size=max(1, int(getattr(config, "n_samples", 1) or 1)))
+                    dp_batch_group_size=max(1, int(config.n_samples or 1)))
                 candidate = self._plan_from_result(feasible, config) or current
                 result = feasible
             else:
@@ -849,14 +815,12 @@ class GlobalResourcePlanner:
             return None
 
         planner_cfg = config.global_resource_planner
-        replica_size = int(
-            getattr(planner_cfg, "elastic_hybrid_replica_size_gpus", 0) or 0
-        )
+        replica_size = int(planner_cfg.elastic_hybrid_replica_size_gpus or 0)
         topology_width = (
-            max(1, int(getattr(config, "train_tp_size", 1) or 1))
-            * max(1, int(getattr(config, "train_ep_size", 1) or 1))
-            * max(1, int(getattr(config, "train_pp_size", 1) or 1))
-            * max(1, int(getattr(config, "train_cp_size", 1) or 1))
+            max(1, int(config.train_tp_size or 1))
+            * max(1, int(config.train_ep_size or 1))
+            * max(1, int(config.train_pp_size or 1))
+            * max(1, int(config.train_cp_size or 1))
         )
         if replica_size > 0 and replica_size != topology_width:
             raise ValueError(
@@ -867,7 +831,7 @@ class GlobalResourcePlanner:
             replica_size = topology_width
         min_rollout_gpus = max(
             0,
-            int(getattr(planner_cfg, "elastic_hybrid_min_rollout_gpus", 0) or 0),
+            int(planner_cfg.elastic_hybrid_min_rollout_gpus or 0),
         )
         capacity_replicas = max(
             0,
@@ -992,14 +956,7 @@ class GlobalResourcePlanner:
         else:
             tp_list = [
                 int(value)
-                for value in (
-                    getattr(
-                        config.global_resource_planner,
-                        "runtime_forced_rollout_tp_list",
-                        [],
-                    )
-                    or []
-                )
+                for value in (config.global_resource_planner.runtime_forced_rollout_tp_list or [])
             ]
         if not tp_list:
             return None
@@ -1007,14 +964,9 @@ class GlobalResourcePlanner:
             raise ValueError(f"GRP_FORCE_ROLLOUT_TP_LIST must be positive: {tp_list}")
         forced_train_raw = os.environ.get("GRP_FORCE_TRAIN_GPUS", "").strip()
         configured_forced_train = int(
-            getattr(
-                config.global_resource_planner,
-                "runtime_forced_train_gpus",
-                0,
-            )
-            or 0
+            config.global_resource_planner.runtime_forced_train_gpus or 0
         )
-        rollout_gpus = int(getattr(config, "rollout_gpus", 0) or sum(tp_list))
+        rollout_gpus = int(config.rollout_gpus or sum(tp_list))
         if forced_train_raw:
             try:
                 forced_train_gpus = int(forced_train_raw)
@@ -1046,14 +998,7 @@ class GlobalResourcePlanner:
             except ValueError as exc:
                 raise ValueError(f"Invalid GRP_FORCE_TRAIN_GPUS={raw!r}") from exc
         else:
-            train_gpus = int(
-                getattr(
-                    config.global_resource_planner,
-                    "runtime_forced_train_gpus",
-                    0,
-                )
-                or 0
-            )
+            train_gpus = int(config.global_resource_planner.runtime_forced_train_gpus or 0)
             if train_gpus == 0:
                 return None
         if train_gpus <= 0:
@@ -1066,7 +1011,7 @@ class GlobalResourcePlanner:
         tp = int(current.train_config.tp)
         ep = int(current.train_config.ep)
         pp = int(current.train_config.pp)
-        cp = max(1, int(getattr(config, "train_cp_size", 1) or 1))
+        cp = max(1, int(config.train_cp_size or 1))
         model_parallel = max(1, tp * ep * pp * cp)
         if train_gpus % model_parallel != 0:
             raise ValueError(
@@ -1254,15 +1199,12 @@ class GlobalResourcePlanner:
         requests: list[RequestInfo],
     ) -> GlobalResourcePlan:
         requests = representative_global_batch(requests, int(config.batch_size))
+        ep = max(1, int(config.train_ep_size or 1))
         train = TrainParallelConfig(
             tp=config.train_tp_size,
-            ep=max(1, int(getattr(config, "train_ep_size", 1) or 1)),
+            ep=ep,
             pp=config.train_pp_size,
-            dp=max(
-                1,
-                int(config.train_dp_size)
-                // max(1, int(getattr(config, "train_ep_size", 1) or 1)),
-            ),
+            dp=max(1, int(config.train_dp_size) // ep),
             cp=config.train_cp_size,
             b_micro=config.micro_batch_size,
         )

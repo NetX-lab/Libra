@@ -2,7 +2,7 @@
 base_config: base.yaml
 
 hardware_config: hardware_config/a800_80g.yaml
-model_arch_config: model_arch_config/qwen2.5-3b.yaml
+model_arch_config: model_arch_config/qwen3-4b.yaml
 
 model_path: "/path/to/Qwen3-4B"
 tokenizer_path: "/path/to/Qwen3-4B"

@@ -29,13 +29,12 @@ def _capacity(physical, width):
 
 
 def _choose_engines(executor, required):
-    loan = getattr(executor, "_lent_rollout", None) or {}
+    loan = executor._lent_rollout or {}
     old_ids = {meta.instance_id for meta in loan.get("engines", [])}
     metas = sorted((meta for meta in executor._process_meta.values()
                     if meta.instance_id not in old_ids), key=lambda meta: meta.instance_id)
     width = executor._elastic_replica_size_gpus()
-    reserve = max(0, int(getattr(executor.config.global_resource_planner,
-                               "elastic_hybrid_min_rollout_gpus", 0) or 0))
+    reserve = max(0, int(executor.config.global_resource_planner.elastic_hybrid_min_rollout_gpus or 0))
     serving = {(meta.host, int(gpu)) for meta in metas for gpu in meta.gpus}
     existing = {(slot["host"], int(gpu)) for slot in loan.get("slots", {}).values()
                 for gpu in slot["gpus"]}
@@ -70,7 +69,7 @@ def _restart_engines(executor, saved):
 
 
 def _rollback_expansion(executor):
-    pending = getattr(executor, "_rollout_loan_rollback", None)
+    pending = executor._rollout_loan_rollback
     if pending is None:
         return
     # A failed stop may have signalled a process without proving its exit.
@@ -101,12 +100,12 @@ def lend_rollout(executor, required_gpu_count):
     eligible for training together, after every new stop is acknowledged.
     """
     required = int(required_gpu_count)
-    previous = getattr(executor, "_lent_rollout", None)
+    previous = executor._lent_rollout
     existing = previous["slots"] if previous else {}
     physical = {(slot["host"], int(gpu)) for slot in existing.values() for gpu in slot["gpus"]}
     if required < 1 or _capacity(physical, executor._elastic_replica_size_gpus()) >= required:
         return deepcopy(existing)
-    if getattr(executor, "_rollout_loan_rollback", None):
+    if executor._rollout_loan_rollback:
         raise RuntimeError("an incomplete rollout loan expansion must be recovered before retry")
     executor._adopt_existing_rollout_processes()
     selected = _choose_engines(executor, required)
@@ -128,15 +127,15 @@ def lend_rollout(executor, required_gpu_count):
                              for handle in getattr(scheduler, "_instances", [])
                              if handle.instance_id in selected_ids}}
     executor._rollout_loan_rollback = pending
-    dispatcher = getattr(executor, "dispatcher", None)
+    dispatcher = executor.dispatcher
     paused_here = dispatcher is not None and not dispatcher.is_paused()
     if paused_here:
         dispatcher.pause()
-    timeout = float(getattr(executor.config.global_resource_planner, "runtime_drain_timeout_s", 3600.))
+    timeout = float(executor.config.global_resource_planner.runtime_drain_timeout_s)
     try:
         if dispatcher is not None:
             dispatcher.wait_until_idle(timeout=timeout)
-        engine = getattr(executor, "rollout_engine", None)
+        engine = executor.rollout_engine
         if engine is not None and hasattr(engine, "wait_until_idle"):
             engine.wait_until_idle(timeout=timeout)
         _set_unavailable(executor, {meta.instance_id for meta in selected})
@@ -168,7 +167,7 @@ def lend_rollout(executor, required_gpu_count):
             if any(handle.is_ready for handle in getattr(scheduler, "_instances", [])):
                 dispatcher.resume()
             else:
-                saved = getattr(executor, "_lent_rollout", None)
+                saved = executor._lent_rollout
                 if saved is not None:
                     saved["resume_dispatcher_after_publication"] = True
 
@@ -176,7 +175,7 @@ def lend_rollout(executor, required_gpu_count):
 def wait_hybrid_stopped(executor, worker_id, request_id=None):
     """Await the controller's proof that the recorded remote process exited."""
     directory = Path(executor._hybrid_worker_control_dir())
-    timeout = float(getattr(executor.config.global_resource_planner, "hybrid_worker_stop_timeout_s", 60.))
+    timeout = float(executor.config.global_resource_planner.hybrid_worker_stop_timeout_s)
     deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
     while True:
         done = directory / f".stop_{worker_id}.done"
@@ -202,11 +201,11 @@ def return_rollout(executor):
     revision to the new service generation and explicitly reopens admission.
     """
     _rollback_expansion(executor)
-    saved = getattr(executor, "_lent_rollout", None)
+    saved = executor._lent_rollout
     if not saved:
         return []
     physical = {(meta.host, int(gpu)) for meta in saved["engines"] for gpu in meta.gpus}
-    for worker_id, meta in list(getattr(executor, "_hybrid_worker_meta", {}).items()):
+    for worker_id, meta in list(executor._hybrid_worker_meta.items()):
         if not any((meta.host, int(gpu)) in physical for gpu in meta.gpus):
             continue
         # The executor retains ownership until a matching remote exit ACK (or

@@ -5,6 +5,7 @@ import asyncio
 import pytest
 import torch
 
+from RL_Framework.config import AsyncRLConfig
 from RL_Framework.infra.execution.async_runner import AsyncTaskRunner, TaskResult
 from RL_Framework.infra.execution.batch_dispatcher import BatchTaskDispatcher, TaskInput
 from RL_Framework.infra.sync.staleness import StalenessManager
@@ -24,9 +25,14 @@ class _FakeTrainEngine:
 
 def _trainer(n_samples=4):
     trainer = object.__new__(AsyncRLTrainer)
-    trainer.config = SimpleNamespace(n_samples=n_samples)
+    trainer.config = AsyncRLConfig(model_path="/tmp/fake-model", n_samples=n_samples)
     trainer.train_engine = _FakeTrainEngine()
+    trainer.is_main_process = True
     trainer._task_counter = 0
+    trainer._consumed_grpo_group_ids = set()
+    trainer._advantage_stats = {}
+    trainer._rollout_source_rank = None
+    trainer._rollout_source_world_size = None
     return trainer
 
 

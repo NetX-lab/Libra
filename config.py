@@ -589,6 +589,7 @@ class GlobalResourcePlannerConfig:
     runtime_rollout_log_dir: str = ""
     runtime_rollout_manifest_path: str = ""
     runtime_rollout_pid_registry_path: str = ""
+    runtime_reconfiguration_coord_dir: str = ""
     runtime_wait_rollout_process_start_ready: bool = False
     runtime_post_rollout_stop_grace_s: float = 0.0
     runtime_reconfigure_training: bool = False
@@ -615,6 +616,7 @@ class GlobalResourcePlannerConfig:
     hybrid_worker_command_template: str = ""
     hybrid_worker_task_dir: str = "./logs/elastic_training_tasks"
     hybrid_worker_ready_timeout_s: float = 60.0
+    hybrid_worker_stop_timeout_s: float = 60.0
     hybrid_worker_remote_control_enabled: bool = False
     hybrid_worker_remote_control_dir: str = ""
     elastic_hybrid_planning_enabled: bool = False

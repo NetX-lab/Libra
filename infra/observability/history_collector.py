@@ -250,6 +250,7 @@ class HistoryDataCollector:
         self._lock = threading.Lock()
         self._record_count = 0
         self._initialized = False
+        self._last_resource_config: ResourceConfig = ResourceConfig()
 
     def initialize(self):
         """Initialize."""
@@ -436,7 +437,7 @@ class HistoryDataCollector:
 
         if resource_config is not None:
             self._last_resource_config = resource_config
-        rc = getattr(self, "_last_resource_config", ResourceConfig())
+        rc = self._last_resource_config
 
 
         record = StepRecord(
@@ -473,58 +474,29 @@ class HistoryDataCollector:
     @staticmethod
     def snapshot_resource_config(config) -> ResourceConfig:
         """Snapshot resource config."""
+        if config is None:
+            return ResourceConfig()
+        hetero = config.heterogeneous_rollout
         return ResourceConfig(
-            n_total_gpus=getattr(config, "n_total_gpus", 0) or (
-                getattr(config, "train_gpus", 0) + getattr(config, "rollout_gpus", 0)
-            ),
-            train_gpus=getattr(config, "train_gpus", 0),
-            rollout_gpus=getattr(config, "rollout_gpus", 0),
-            train_backend=getattr(config, "train_backend", "fsdp"),
-            train_tp=getattr(
-                config,
-                "train_tp_size",
-                getattr(config, "tp_size", 1),
-            ),
-            train_pp=getattr(config, "train_pp_size", 1),
-            train_dp=getattr(config, "train_dp_size", 1),
-            rollout_tp_list=(
-                list(getattr(
-                    getattr(config, "heterogeneous_rollout", None),
-                    "tp_list",
-                    [],
-                ))
-                if getattr(
-                    getattr(config, "heterogeneous_rollout", None),
-                    "enabled",
-                    False,
-                )
-                else []
-            ),
-            vllm_tp_size=getattr(config, "vllm_tp_size", 1),
-            vllm_num_instances=(
-                getattr(
-                    getattr(config, "heterogeneous_rollout", None),
-                    "n_instances",
-                    0,
-                )
-                if getattr(
-                    getattr(config, "heterogeneous_rollout", None),
-                    "enabled",
-                    False,
-                )
-                else getattr(config, "vllm_num_instances", 1)
-            ),
-            batch_size=getattr(config, "batch_size", 32),
-            micro_batch_size=getattr(config, "micro_batch_size", 4),
-            B_global=getattr(config, "batch_size", 32),
-            max_new_tokens=getattr(config, "max_new_tokens", 1024),
-            max_seq_length=getattr(config, "max_seq_length", 2048),
-            n_samples=getattr(config, "n_samples", 4),
-            temperature=getattr(config, "temperature", 1.0),
-            model_path=getattr(config, "model_path", ""),
-            model_params=getattr(
-                getattr(config, "model_arch", None), "num_params", 0.0
-            ),
+            n_total_gpus=config.n_total_gpus or (config.train_gpus + config.rollout_gpus),
+            train_gpus=config.train_gpus,
+            rollout_gpus=config.rollout_gpus,
+            train_backend=config.train_backend,
+            train_tp=config.train_tp_size or config.tp_size,
+            train_pp=config.train_pp_size,
+            train_dp=config.train_dp_size,
+            rollout_tp_list=list(hetero.tp_list) if hetero.enabled else [],
+            vllm_tp_size=config.vllm_tp_size,
+            vllm_num_instances=hetero.n_instances if hetero.enabled else config.vllm_num_instances,
+            batch_size=config.batch_size,
+            micro_batch_size=config.micro_batch_size,
+            B_global=config.batch_size,
+            max_new_tokens=config.max_new_tokens,
+            max_seq_length=config.max_seq_length,
+            n_samples=config.n_samples,
+            temperature=config.temperature,
+            model_path=config.model_path,
+            model_params=config.model_arch.num_params,
         )
 
 
