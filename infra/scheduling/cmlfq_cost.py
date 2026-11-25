@@ -44,6 +44,8 @@ class CMLFQRoutingCosts:
     def decode_seconds(
         self, tp: int, bin_name: str, remaining: float, context: int,
     ) -> float:
+        if self.rollout_model is not None and self.rollout_model.check_oom(math.ceil(context + remaining), tp):
+            return math.inf
         value = self.decode_ms.get(str(tp), {}).get(bin_name)
         if value is not None:
             return float(value) / 1000.0
@@ -52,8 +54,6 @@ class CMLFQRoutingCosts:
         # Midpoint integration is exact for the analytic model's affine
         # dependence on active context length. This is one trajectory's cost,
         # not the whole cluster makespan used by the planner.
-        if self.rollout_model.check_oom(math.ceil(context + remaining), tp):
-            return math.inf
         return remaining * self.rollout_model.compute_decode_step_time(
             math.ceil(context + remaining / 2), tp
         )
@@ -78,10 +78,34 @@ class CMLFQRoutingCosts:
         if self.rollout_model is None:
             return "recompute", math.inf
         # No measured transfer cost => use the supported recompute path.
+        return "recompute", self.prefill_seconds(target["tp_degree"], context)
+
+    def prefill_seconds(self, tp: int, context: int) -> float:
+        """Common cold-cache baseline; no cache residency is queried online."""
+        if self.rollout_model is None:
+            return 0.0
         model = self.rollout_model
         chunk = max(1, int(model.L_chunk))
-        full, tail = divmod(context, chunk)
-        seconds = full * model.compute_prefill_step_time(1, chunk, target["tp_degree"])
-        if tail:
-            seconds += model.compute_prefill_step_time(1, tail, target["tp_degree"])
-        return "recompute", seconds
+        return max(0, context) / chunk * model.compute_prefill_step_time(1, chunk, tp)
+
+    def completion_seconds(self, tp: int, bin_name: str, remaining: float,
+                           context: int, other_requests: int = 0) -> float:
+        """Estimate standalone completion, including one prefill, if the sequence fits."""
+        if self.rollout_model is not None and self.rollout_model.check_oom(math.ceil(context + remaining), tp):
+            return math.inf
+        return self.decode_work_seconds(tp, bin_name, remaining, context, other_requests) + self.prefill_seconds(tp, context)
+
+    def decode_work_seconds(self, tp: int, bin_name: str, remaining: float,
+                            context: int, other_requests: int = 0) -> float:
+        """Price decode for a representative cohort after admission checks."""
+        count = max(0, int(other_requests)) + 1
+        value = self.decode_ms.get(str(tp), {}).get(bin_name)
+        if value is not None:
+            return float(value) / 1000.0 * count
+        if self.rollout_model is None:
+            return math.inf
+        from RL_Framework.infra.cost_model.model import RequestInfo
+
+        requests = [RequestInfo(max(0, context), max(0, math.ceil(remaining))) for _ in range(count)]
+        elapsed = self.rollout_model.compute_instance_makespan(requests, tp)
+        return max(0.0, elapsed - count * self.prefill_seconds(tp, context))

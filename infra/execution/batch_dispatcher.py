@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
@@ -23,6 +23,10 @@ _DEFAULT_WAIT_TIMEOUT_SECONDS = float(7 * 24 * 3600)
 
 TInput = TypeVar("TInput")
 TResult = TypeVar("TResult")
+
+
+def _is_successful(data: Any) -> bool:
+    return data is not None and (not isinstance(data, dict) or data.get("status") != "failed")
 
 
 @dataclass
@@ -55,6 +59,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self._pending_inputs: deque[TInput] = deque()
         self._pending_results: dict[int, TaskResult] = {}
         self._active_task_ids: set[int] = set()
+        self._task_inputs: dict[int, TInput] = {}
+        self._input_generator = None
 
 
         self._input_lock = threading.Lock()
@@ -62,10 +68,10 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self._result_lock = threading.Lock()
         self._result_cv = threading.Condition(self._result_lock)
         self._reconfigure_lock = threading.RLock()
-        self._resetting_runner = threading.Event()
 
 
         self._shutdown_event = threading.Event()
+        self._resetting_runner = threading.Event()
         self._commit_thread: threading.Thread | None = None
         self._fetch_thread: threading.Thread | None = None
 
@@ -86,6 +92,17 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 raise RuntimeError(
                     f"background thread error: {self._thread_exception}"
                 ) from self._thread_exception
+
+    def report_fatal_error(self, exc: Exception):
+        """Stop admission and wake callers after a task reports invalid evidence."""
+        self._set_thread_exception(exc)
+        self.runner.pause()
+        # Do not hold the exception lock while taking either condition lock:
+        # waiting callers check that exception while holding the conditions.
+        with self._input_cv:
+            self._input_cv.notify_all()
+        with self._result_cv:
+            self._result_cv.notify_all()
 
     def _has_runner_capacity(self) -> bool:
         """Has runner capacity."""
@@ -164,7 +181,10 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                         self.runner.submit(
                             task_fn, task_id=task_input.task_id
                         )
-                        self.staleness_manager.on_rollout_submitted()
+                        if self.staleness_manager.group_reservations_enabled:
+                            self.staleness_manager.on_member_submitted(str(task_input.group_id), task_input.task_id)
+                        else:
+                            self.staleness_manager.on_rollout_submitted()
                         if self.enable_tracing:
                             stats = self.staleness_manager.get_stats()
                             logger.info(
@@ -198,12 +218,11 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 self._check_thread_exception()
 
 
-                if (
-                    not self.runner.paused.is_set()
-                    and self.staleness_manager.get_capacity() > 0
-                    and self._pending_inputs
-                ):
-                    return self._pending_inputs[0]
+                if not self.runner.paused.is_set():
+                    if not self._pending_inputs:
+                        self._admit_group()
+                    if self.staleness_manager.get_capacity() > 0 and self._pending_inputs:
+                        return self._pending_inputs[0]
 
 
                 self._input_cv.wait(timeout=0.5)
@@ -227,10 +246,20 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 except TimeoutError:
                     continue
 
-                with self._result_cv:
-                    for result in results:
-                        self._pending_results[result.task_id] = result
-                    self._result_cv.notify_all()
+                with self._reconfigure_lock:
+                    if self.staleness_manager.group_reservations_enabled:
+                        for result in results:
+                            self._accept_group_result(result)
+                        with self._result_cv:
+                            self._result_cv.notify_all()
+                    else:
+                        with self._result_cv:
+                            for result in results:
+                                if result.task_id not in self._active_task_ids:
+                                    continue
+                                self.staleness_manager.on_rollout_finished(_is_successful(result.data))
+                                self._pending_results[result.task_id] = result
+                            self._result_cv.notify_all()
 
 
                 with self._input_cv:
@@ -250,15 +279,120 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
 
 
-    def submit_task_input(self, task_input: TInput) -> None:
-        """Submit task input."""
+    def start_production(self, input_generator, group_size: int) -> None:
+        """Start the producer once; ready results and training do not stop it."""
         self._check_thread_exception()
         with self._input_cv:
+            if self._input_generator is not None:
+                if self._input_generator is not input_generator:
+                    raise RuntimeError("rollout production already owns another input generator")
+                return
+            self.staleness_manager.configure_groups(group_size)
+            self._input_generator = input_generator
+            self._input_cv.notify_all()
+
+    def _admit_group(self) -> None:
+        # Called with _input_cv held by the single producer. Read the generator
+        # only when a complete reservation can be made; no hidden prefetch.
+        manager = self.staleness_manager
+        if self._input_generator is None or not manager.can_reserve_group():
+            return
+        try:
+            members = [next(self._input_generator) for _ in range(manager.group_size)]
+        except StopIteration:
+            raise RuntimeError("rollout input generator exhausted before a complete group") from None
+        group_id = str(members[0].group_id)
+        if (members[0].group_id is None or any(str(member.group_id) != group_id for member in members)
+                or {member.rollout_index for member in members} != set(range(manager.group_size))):
+            raise ValueError("rollout generator must yield contiguous complete groups")
+        promise = manager.reserve_group(group_id, [member.task_id for member in members])
+        if promise is None:
+            raise RuntimeError("group admission changed outside the producer boundary")
+        for member in members:
+            member.version = promise
+            self._pending_inputs.append(member)
+            self._task_inputs[member.task_id] = member
+            self._active_task_ids.add(member.task_id)
+
+    def _accept_group_result(self, result: TaskResult) -> None:
+        task = self._task_inputs.get(result.task_id)
+        if task is None:
+            return  # A terminated group's cancellation/late result cannot revive it.
+        if result.error is not None:
+            raise result.error
+        packet = result.data
+        if isinstance(packet, dict) and packet.get("failure_reason") == "task_timeout":
+            self._terminate_group(str(task.group_id))
+            return
+        if not isinstance(packet, dict) or packet.get("status") == "failed":
+            raise RuntimeError(f"rollout task {result.task_id} failed without a task_timeout result")
+        if str(packet.get("grpo_group_id")) != str(task.group_id):
+            raise ValueError("rollout result group differs from its reservation")
+        revision = packet.get("sample_revision")
+        if type(revision) is not int:
+            raise ValueError("rollout result requires its actual integer sample_revision")
+        with self._result_cv:
+            self.staleness_manager.on_member_completed(str(task.group_id), result.task_id, revision)
+            self._pending_results[result.task_id] = result
+
+    def _terminate_group(self, group_id: str) -> None:
+        task_ids = set(self.staleness_manager.terminate_group(group_id))
+        if not task_ids:
+            return
+        with self._input_cv:
+            self._pending_inputs = deque(item for item in self._pending_inputs if item.task_id not in task_ids)
+            self._input_cv.notify_all()
+        with self._result_cv:
+            for task_id in task_ids:
+                self._pending_results.pop(task_id, None)
+                self._task_inputs.pop(task_id, None)
+                self._active_task_ids.discard(task_id)
+            self._result_cv.notify_all()
+        self.runner.cancel_tasks(task_ids)
+
+    def collect_batch(self, batch_size: int, optimizer_revision: int) -> list[Any]:
+        """Claim complete groups by deadline without releasing their slots."""
+        manager = self.staleness_manager
+        if not manager.group_reservations_enabled or batch_size != manager.consumer_batch_size:
+            raise ValueError("collection must request the configured complete training batch")
+        with self._result_cv:
+            while not self._shutdown_event.is_set():
+                self._check_thread_exception()
+                group_ids = manager.select_groups(batch_size // manager.group_size, optimizer_revision)
+                if group_ids is not None:
+                    selected = []
+                    for group_id in group_ids:
+                        task_ids = manager.get_group_task_ids(group_id)
+                        members = sorted((self._pending_results[task_id] for task_id in task_ids),
+                                         key=lambda result: result.data["grpo_rollout_index"])
+                        for member in members:
+                            selected.append(self._pending_results.pop(member.task_id).data)
+                            self._active_task_ids.discard(member.task_id)
+                    return selected
+                self._result_cv.wait(timeout=.5)
+        raise RuntimeError("dispatcher stopped before a complete batch was available")
+
+    def retire_batch(self, trajectories: list[dict], optimizer_revision: int) -> None:
+        group_ids = {str(trajectory["grpo_group_id"]) for trajectory in trajectories}
+        with self._reconfigure_lock, self._input_cv:
+            self.staleness_manager.retire_batch(group_ids, optimizer_revision)
+            for trajectory in trajectories:
+                self._task_inputs.pop(trajectory["task_id"], None)
+            self._input_cv.notify_all()
+
+    def on_publication(self, published_revision: int) -> None:
+        with self._input_cv:
+            self.staleness_manager.on_publication(published_revision)
+            self._input_cv.notify_all()
+
+    def submit_task_input(self, task_input: TInput) -> None:
+        """Queue an input for the legacy pull-based collector."""
+        self._check_thread_exception()
+        with self._input_cv, self._result_cv:
             self._pending_inputs.append(task_input)
+            self._active_task_ids.add(task_input.task_id)
             self.staleness_manager.on_rollout_enqueued()
             self._input_cv.notify()
-        with self._result_cv:
-            self._active_task_ids.add(task_input.task_id)
 
     def wait_results(
         self,
@@ -269,6 +403,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         """Wait results."""
         if count <= 0:
             raise ValueError(f"count must be positive; got {count}")
+        self._check_thread_exception()
 
         start_time = time.perf_counter()
         if timeout is None:
@@ -291,6 +426,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 self._result_cv.wait(timeout=min(remaining, 1.0))
 
 
+            self._check_thread_exception()
             drained = list(self._pending_results.values())
             self._pending_results.clear()
 
@@ -309,73 +445,48 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         return selected
 
     def peek_ready_data(self) -> list[Any]:
-        """Observe admitted results without consuming or resubmitting them."""
+        """Snapshot ready payloads in consumption order without changing queues."""
         with self._result_cv:
             ready = sorted(self._pending_results.values(), key=lambda result: result.create_time)
             return [result.data for result in ready]
 
     def active_submit_and_wait(
         self,
-        input_generator: Generator[TInput, None, None],
+        input_generator: Iterator[TInput],
         batch_size: int,
         timeout: float | None = None,
     ) -> list[Any]:
-        """Active submit and wait."""
-        accepted_cnt = 0
+        """Keep the legacy batch collector supplied until it receives enough results."""
         results = []
-        start_time = time.monotonic()
-
-        while True:
-            if timeout is not None and timeout > 0:
-                elapsed = time.monotonic() - start_time
-                if elapsed >= timeout:
-                    raise TimeoutError(
-                        "active batch collection timed out: "
-                        f"accepted={accepted_cnt}/{batch_size}, "
-                        f"runtime_metrics={self.get_runtime_metrics()}"
-                    )
+        started = time.monotonic()
+        while len(results) < batch_size:
+            remaining = None if timeout is None else timeout - (time.monotonic() - started)
+            if remaining is not None and remaining <= 0:
+                # This call has already removed these successes from the result
+                # queue. Release their credit if timing out discards them.
+                self.staleness_manager.on_batch_consumed(sum(
+                    _is_successful(result) for result in results
+                ))
+                raise TimeoutError(f"active batch collection timed out: {len(results)}/{batch_size}")
 
             with self._input_cv:
                 pending_inputs = len(self._pending_inputs)
-            cap_staleness = self.staleness_manager.get_pending_limit() - pending_inputs
-            cap_queue = self.runner.max_queue_size - (
-                self.runner.input_queue.qsize() + batch_size
+            capacity = min(
+                self.staleness_manager.get_pending_limit() - pending_inputs,
+                self.runner.max_queue_size - self.runner.input_queue.qsize(),
             )
-            capacity = min(cap_staleness, cap_queue)
+            for _ in range(min(batch_size - len(results), capacity)):
+                try:
+                    self.submit_task_input(next(input_generator))
+                except StopIteration:
+                    raise RuntimeError("rollout input generator exhausted") from None
 
-            if capacity > 0:
-                for _ in range(min(batch_size, capacity)):
-                    try:
-                        self.submit_task_input(next(input_generator))
-                    except StopIteration:
-                        raise RuntimeError(
-                            "The input generator is exhausted; use an infinite generator"
-                        ) from None
-
-
-            try:
-                arrived = self.wait_results(
-                    count=batch_size - accepted_cnt,
-                    timeout=1.0,
-                    raise_timeout=False,
-                )
-            except TimeoutError:
-                arrived = []
-
-            for task_result in arrived:
-
-                if task_result.data is None:
-                    continue
-
-                accepted_cnt += 1
-                results.append(task_result.data)
-
-                if accepted_cnt >= batch_size:
-                    break
-
-            if accepted_cnt >= batch_size:
-                break
-
+            arrived = self.wait_results(
+                count=batch_size - len(results),
+                timeout=1.0 if remaining is None else min(1.0, remaining),
+                raise_timeout=False,
+            )
+            results.extend(result.data for result in arrived if result.data is not None)
         return results
 
     def pause(self):
@@ -405,10 +516,15 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 for task_id in cancelled_ids:
                     self._active_task_ids.discard(task_id)
                 self._result_cv.notify_all()
-            self.staleness_manager.on_rollouts_cancelled(
-                enqueued=len(dispatcher_ids),
-                running=len(runner_ids),
-            )
+            if self.staleness_manager.group_reservations_enabled:
+                group_ids = {str(self._task_inputs[task_id].group_id) for task_id in cancelled_ids
+                             if task_id in self._task_inputs}
+                for group_id in group_ids:
+                    self._terminate_group(group_id)
+            else:
+                self.staleness_manager.on_rollouts_cancelled(
+                    enqueued=len(dispatcher_ids), running=len(runner_ids),
+                )
         return {
             "dispatcher_queue": len(dispatcher_ids),
             "runner_queue": len(runner_ids),
@@ -416,27 +532,22 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         }
 
     def reset_after_reconfigure(self) -> None:
-        """Drop dispatcher-side state that belongs to the old rollout pool."""
+        """Drop admitted work after an explicit rollout runtime cutover."""
         self._resetting_runner.set()
         try:
             with self._reconfigure_lock:
-                with self._input_cv:
+                with self._input_cv, self._result_cv:
                     self._pending_inputs.clear()
-                    self._input_cv.notify_all()
-                with self._result_cv:
                     self._pending_results.clear()
                     self._active_task_ids.clear()
+                    self._task_inputs.clear()
+                    self._input_cv.notify_all()
                     self._result_cv.notify_all()
                 if hasattr(self.runner, "reset_runtime_state"):
                     self.runner.reset_runtime_state()
-                if hasattr(self.staleness_manager, "reset_runtime_state"):
-                    self.staleness_manager.reset_runtime_state()
+                self.staleness_manager.reset_runtime_state()
         finally:
             self._resetting_runner.clear()
-            with self._input_cv:
-                self._input_cv.notify_all()
-            with self._result_cv:
-                self._result_cv.notify_all()
 
     def resume(self):
         """Resume."""
@@ -470,4 +581,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             "staleness_accepted": staleness_stats.accepted,
             "staleness_rejected": staleness_stats.rejected,
             "paused": self.is_paused(),
+            "group_reservations": self.staleness_manager.get_group_reservations(),
+            "published_revision": self.staleness_manager.published_revision,
+            "optimizer_revision": self.staleness_manager.optimizer_revision,
         }

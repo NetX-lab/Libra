@@ -89,6 +89,7 @@ def make_trainer(tmp_path, rank=0, dp_size=1, dp_rank=0, source=True, hybrids=()
     trainer.control = None
     trainer.runtime_elastic_executor = None
     trainer._use_heterogeneous = False
+    trainer._bounded_rollout_production = False
     trainer.staleness_manager = None
     trainer._pending_hybrid_training_batches = {}
     trainer._consumed_grpo_group_ids = set()
@@ -146,6 +147,19 @@ def test_actual_train_collects_fixed_batch_and_dispatches_complete_groups(tmp_pa
 def _gloo_collection_worker(rank, rendezvous, directory):
     dist.init_process_group("gloo", rank=rank, world_size=4,
                             init_method=f"file://{rendezvous}", timeout=timedelta(seconds=30))
+    # Gloo's async all-gather destructor can need the GIL to free tensors.
+    # Keep them alive while the Python thread holds the GIL and joins its workers.
+    from torch.distributed import distributed_c10d
+
+    all_gather = distributed_c10d.all_gather
+    collective_tensors = []
+
+    def gather_with_owned_tensors(outputs, tensor, *args, **kwargs):
+        collective_tensors.extend(outputs)
+        collective_tensors.append(tensor)
+        return all_gather(outputs, tensor, *args, **kwargs)
+
+    distributed_c10d.all_gather = gather_with_owned_tensors
     try:
         path = Path(directory)
         results = []
@@ -168,6 +182,7 @@ def _gloo_collection_worker(rank, rendezvous, directory):
         with pytest.raises(RuntimeError, match="incomplete fixed batch"):
             trainer._collect_fixed_global_batch(None, trainer._source_batch_sample_count(), [])
     finally:
+        distributed_c10d.all_gather = all_gather
         dist.destroy_process_group()
 
 
@@ -204,7 +219,10 @@ def test_logical_sampler_cursor_survives_rollout_client_rebind(tmp_path):
     dataset = [{"id": index} for index in range(12)]
     stream = AsyncRLTrainer._create_data_generator(trainer, dataset, None)
     first = [next(stream) for _ in range(4)]
-    trainer._reset_rollout_pipeline_after_reconfigure()
+    rebound = []
+    trainer.rollout_engine = SimpleNamespace(reconfigure_from_plan=lambda plan, config: rebound.append(config))
+    trainer._rebind_rollout_engine_from_config(reason="runtime_topology_change")
+    assert rebound == [trainer.config]
     second = [next(stream) for _ in range(4)]
     assert [task.task_id for task in first + second] == list(range(8))
     assert {task.group_id for task in first} == {"dp0:epoch0:sample0"}
@@ -219,7 +237,10 @@ def test_rebind_preserves_admitted_results_and_incomplete_group_members(tmp_path
     pending = {"group": trajectories("part", 3)}
     trainer._pending_grpo_groups = pending
     trainer.dispatcher = SimpleNamespace(reset_after_reconfigure=lambda: pytest.fail("valid work discarded"))
-    trainer._reset_rollout_pipeline_after_reconfigure()
+    rebound = []
+    trainer.rollout_engine = SimpleNamespace(reconfigure_from_plan=lambda plan, config: rebound.append(config))
+    trainer._rebind_rollout_engine_from_config(reason="runtime_topology_change")
+    assert rebound == [trainer.config]
     assert trainer._pending_grpo_groups is pending
     assert len(pending["group"]) == 3
 
@@ -235,4 +256,57 @@ def test_dispatch_rejects_membership_generation_change_before_update(tmp_path):
     with pytest.raises(RuntimeError, match="generation changed"):
         trainer.train(None, dataset=[1])
     assert not trainer.train_engine.updated
+    assert not (tmp_path / "hybrid0.step_0.pt").exists()
+
+
+def dispatch_trainer(tmp_path):
+    trainer = make_trainer(tmp_path, hybrids=["hybrid0"])
+    (tmp_path / "membership").mkdir()
+    (tmp_path / "membership" / "hybrid0.json").write_text(json.dumps(
+        dict(run_id="fixed-b-test", role="hybrid_training", membership_epoch=7)))
+    trainer._pending_hybrid_training_batches = {"hybrid0": trajectories("batch", 4)}
+    return trainer
+
+
+@pytest.mark.parametrize("suffix", ["", ".done", ".failed", ".error", ".cancelled"])
+def test_dispatch_preserves_existing_task_or_terminal_file(tmp_path, suffix):
+    trainer = dispatch_trainer(tmp_path)
+    existing = tmp_path / ("hybrid0.step_0.pt" + suffix)
+    existing.write_bytes(b"previous task")
+    with pytest.raises(RuntimeError, match="already exists"):
+        trainer._dispatch_hybrid_training_batches(0)
+    assert existing.read_bytes() == b"previous task"
+    assert not (tmp_path / "hybrid0.step_0.pt.tmp").exists()
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_dispatch_registers_before_publish_and_retires_unpublished_failure(tmp_path, monkeypatch, cleanup_fails):
+    trainer = dispatch_trainer(tmp_path)
+    pending = {}
+
+    def record(worker, data, *task_path):
+        pending[worker] = data
+
+    def forget(worker, data):
+        assert pending[worker] is data
+        pending.pop(worker)
+
+    trainer.runtime_elastic_executor = SimpleNamespace(
+        hybrid_task_identity=lambda worker: {"launch_owner": "owner"},
+        record_hybrid_task_assignment=record, forget_hybrid_task_assignment=forget)
+
+    def fail_publish(source, target):
+        assert source.exists() and "hybrid0" in pending
+        assert not target.exists()
+        raise OSError("publish denied")
+
+    monkeypatch.setattr(Path, "replace", fail_publish)
+    if cleanup_fails:
+        def fail_cleanup(path, **kwargs):
+            raise OSError("cleanup denied")
+        monkeypatch.setattr(Path, "unlink", fail_cleanup)
+    with pytest.raises(OSError, match="publish denied"):
+        trainer._dispatch_hybrid_training_batches(0)
+    assert pending == {}
+    assert (tmp_path / "hybrid0.step_0.pt.tmp").exists() is cleanup_fails
     assert not (tmp_path / "hybrid0.step_0.pt").exists()

@@ -42,10 +42,42 @@ def test_short_completion_does_not_retire_long_request(scheduler_cls):
         await engine.generate("short", input_tokens=20, max_new_tokens=8)
         assert scheduler.get_instance_handle(0).active_tokens == initial
         with pytest.raises(TimeoutError):
-            engine.wait_until_idle(timeout=0)
+            engine.wait_until_idle(timeout=0.01)
         release.set()
         await long
         assert scheduler.get_instance_handle(0).active_tokens == 0
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("scheduler_cls", [LoadBalanceScheduler, LengthAwareScheduler, LAMLFQScheduler])
+def test_zero_idle_timeout_waits_until_async_request_finishes(scheduler_cls):
+    async def run():
+        scheduler = scheduler_cls(load_metric="tokens")
+        engine = HeterogeneousRolloutEngine("m", scheduler)
+        engine.add_instance("a", "localhost", 1, 1)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class Endpoint:
+            async def generate(self, prompt, **kwargs):
+                entered.set()
+                await release.wait()
+                return {"text": "x", "tokens": [1], "logprobs": []}
+
+        engine.engines = [Endpoint()]
+        request = asyncio.create_task(engine.generate("long", input_tokens=9000, max_new_tokens=64))
+        await entered.wait()
+        # The waiter is synchronous. A worker thread lets the event loop finish
+        # the request whose completion the unlimited waiter is observing.
+        waiter = asyncio.create_task(asyncio.to_thread(engine.wait_until_idle, timeout=0))
+        try:
+            await asyncio.sleep(0.03)
+            assert not waiter.done()
+        finally:
+            release.set()
+            await request
+        await asyncio.wait_for(waiter, timeout=1)
+        assert scheduler.get_instance_handle(0).active_tokens == 0
+
     asyncio.run(run())
 
 

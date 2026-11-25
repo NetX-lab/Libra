@@ -1,0 +1,12 @@
+# ============================================================
+#   hardware_config: hardware_config/h20_3e_141g.yaml
+#   NVIDIA H20-3e (141 GB HBM3e, 78 SMs, NVLink 4.0, 4x 200Gb/s NDR IB)
+# ============================================================
+
+flops_peak: 1.48e+14          # 148 TFLOPS BF16 dense (measured cuBLAS GEMM ~131.7 TFLOPS)
+mem_bw: 4.8e+12                 # 4.8 TB/s HBM3e (measured copy BW ~3.82 TB/s)
+mem_capacity: 1.501e+11         # 143,771 MiB / 150,121,283,584 bytes
+bw_intra_node: 9.0e+11          # NVLink 4.0 (NV18) ~900 GB/s
+bw_inter_node: 1.0e+11          # 4x 200 Gb/s InfiniBand NDR (~100 GB/s node aggregate)
+gpus_per_node: 8
+tp_comm_overhead: 5.0e-6        # ~5us
