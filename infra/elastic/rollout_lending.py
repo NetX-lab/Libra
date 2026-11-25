@@ -69,8 +69,7 @@ def _choose_engines(executor, required, instance_ids=None):
     live = {name: meta for name, meta in executor._process_meta.items() if name not in old_ids}
     instances = [*existing, *live.values()]
     width = executor._elastic_replica_size_gpus()
-    reserve = max(0, int(getattr(executor.config.global_resource_planner,
-                               "elastic_hybrid_min_rollout_gpus", 0) or 0))
+    reserve = max(0, int(executor.config.global_resource_planner.elastic_hybrid_min_rollout_gpus or 0))
     old_capacity = loan_replica_capacity(existing, existing, width, 0)
 
     def fits(added):
@@ -123,7 +122,7 @@ def _restart_engines(executor, saved):
 
 
 def _rollback_expansion(executor):
-    pending = getattr(executor, "_rollout_loan_rollback", None)
+    pending = executor._rollout_loan_rollback
     if pending is None:
         return
     # A failed stop may have signalled a process without proving its exit.
@@ -197,7 +196,7 @@ def lend_rollout(executor, required_gpu_count, *, instance_ids=None):
                              if handle.instance_id in selected_ids}}
     executor._rollout_loan_rollback = pending
     dispatcher = getattr(executor, "dispatcher", None)
-    timeout = float(getattr(executor.config.global_resource_planner, "runtime_drain_timeout_s", 3600.))
+    timeout = float(executor.config.global_resource_planner.runtime_drain_timeout_s)
     local = supports_local_lending(executor) and len(selected) < len(executor._process_meta)
     paused_here = False
     try:
@@ -255,7 +254,7 @@ def lend_rollout(executor, required_gpu_count, *, instance_ids=None):
 def wait_hybrid_stopped(executor, worker_id, request_id=None):
     """Await the controller's proof that the recorded remote process exited."""
     directory = Path(executor._hybrid_worker_control_dir())
-    timeout = float(getattr(executor.config.global_resource_planner, "hybrid_worker_stop_timeout_s", 60.))
+    timeout = float(executor.config.global_resource_planner.hybrid_worker_stop_timeout_s)
     deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
     while True:
         done = directory / f".stop_{worker_id}.done"
@@ -281,11 +280,11 @@ def return_rollout(executor):
     revision to the new service generation and explicitly reopens admission.
     """
     _rollback_expansion(executor)
-    saved = getattr(executor, "_lent_rollout", None)
+    saved = executor._lent_rollout
     if not saved:
         return []
     physical = {(meta.host, int(gpu)) for meta in saved["engines"] for gpu in meta.gpus}
-    for worker_id, meta in list(getattr(executor, "_hybrid_worker_meta", {}).items()):
+    for worker_id, meta in list(executor._hybrid_worker_meta.items()):
         if not any((meta.host, int(gpu)) in physical for gpu in meta.gpus):
             continue
         # The executor retains ownership until a matching remote exit ACK (or

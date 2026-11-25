@@ -1,4 +1,5 @@
 import json
+import shlex
 import sys
 import tempfile
 import unittest
@@ -63,7 +64,7 @@ json.dump({"t_train": 10.0 / tp, "source": "fake_sailor"}, open(out, "w"))
             cfg.global_resource_planner.train_backend = "sailor"
             cfg.global_resource_planner.sailor_path = str(sailor)
             cfg.global_resource_planner.sailor_train_command = (
-                f"{sys.executable} {script} {{input_json}} {{output_json}}"
+                f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} {{input_json}} {{output_json}}"
             )
 
             evaluator = HybridSimulatorCostModel(cfg)
@@ -96,7 +97,7 @@ json.dump({"makespan": 7.5, "num_requests": num_requests}, open(out, "w"))
             cfg.global_resource_planner.rollout_backend = "vidur"
             cfg.global_resource_planner.vidur_path = str(vidur)
             cfg.global_resource_planner.vidur_rollout_command = (
-                f"{sys.executable} {script} {{trace_csv}} {{output_json}}"
+                f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} {{trace_csv}} {{output_json}}"
             )
 
             evaluator = HybridSimulatorCostModel(cfg)
@@ -173,10 +174,10 @@ json.dump({"makespan": 80.0 / max(gpus, 1)}, open(sys.argv[2], "w"))
             cfg.global_resource_planner.sailor_path = str(sailor)
             cfg.global_resource_planner.vidur_path = str(vidur)
             cfg.global_resource_planner.sailor_train_command = (
-                f"{sys.executable} {sailor_script} {{input_json}} {{output_json}}"
+                f"{shlex.quote(sys.executable)} {shlex.quote(str(sailor_script))} {{input_json}} {{output_json}}"
             )
             cfg.global_resource_planner.vidur_rollout_command = (
-                f"{sys.executable} {vidur_script} {{trace_csv}} {{output_json}} {{tp_list}}"
+                f"{shlex.quote(sys.executable)} {shlex.quote(str(vidur_script))} {{trace_csv}} {{output_json}} {{tp_list}}"
             )
 
             planner = GlobalResourcePlanner.from_config(cfg)

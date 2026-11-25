@@ -9,7 +9,7 @@ import torch.distributed as dist
 def _broadcast(trainer, value):
     packet = [value]
     if dist.is_available() and dist.is_initialized():
-        dist.broadcast_object_list(packet, src=0, group=getattr(trainer, "control", None))
+        dist.broadcast_object_list(packet, src=0, group=trainer.control)
     if packet[0].get("error"):
         raise RuntimeError(packet[0]["error"])
     return packet[0]
@@ -74,9 +74,11 @@ def restore_for_publication(trainer):
 
 
 def reopen_after_publication(trainer):
+    # A subset rollback has a separate owner: its publication must neither
+    # withdraw an existing loan nor open routing before rank consensus.
     if getattr(trainer, "_publication_target_ids", None) is not None:
         return
-    if not getattr(trainer, "_restored_rollouts_pending_publication", None):
+    if not trainer._restored_rollouts_pending_publication:
         return
     pending = trainer._restored_rollouts_pending_publication
     apply_availability(trainer, set(getattr(trainer, "_rollout_unavailable_ids", ())) - pending)
@@ -95,19 +97,19 @@ def publish_with_consensus(trainer, revision, **sync_options):
     errors = [error]
     if dist.is_available() and dist.is_initialized():
         errors = [None] * dist.get_world_size()
-        dist.all_gather_object(errors, error, group=getattr(trainer, "control", None))
+        dist.all_gather_object(errors, error, group=trainer.control)
     if any(errors):
         raise RuntimeError(f"Rollout publication failed across core ranks: {errors}")
 
 
 def ensure_batch_supply(trainer):
     """Restore the generating pool before waiting for an impossible next batch."""
-    cfg = getattr(trainer.config, "global_resource_planner", None)
-    if not (getattr(cfg, "enabled", False)
-            and getattr(cfg, "runtime_reconfigure_training", False)
-            and getattr(cfg, "hybrid_worker_launch_enabled", False)
-            and not getattr(cfg, "runtime_training_pool_plan_only", True)
-            and int(getattr(cfg, "elastic_hybrid_min_rollout_gpus", 0) or 0) <= 0):
+    cfg = trainer.config.global_resource_planner
+    if not (cfg.enabled
+            and cfg.runtime_reconfigure_training
+            and cfg.hybrid_worker_launch_enabled
+            and not cfg.runtime_training_pool_plan_only
+            and int(cfg.elastic_hybrid_min_rollout_gpus or 0) <= 0):
         return
     outcome = None
     if trainer.is_main_process:
@@ -125,7 +127,7 @@ def ensure_batch_supply(trainer):
     records = [sufficient]
     if dist.is_available() and dist.is_initialized():
         records = [None] * dist.get_world_size()
-        dist.all_gather_object(records, sufficient, group=getattr(trainer, "control", None))
+        dist.all_gather_object(records, sufficient, group=trainer.control)
     if all(records):
         return
 

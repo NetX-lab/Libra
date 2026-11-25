@@ -1,4 +1,5 @@
 import json
+import shlex
 import sys
 import tempfile
 from pathlib import Path
@@ -53,10 +54,10 @@ json.dump({"makespan": 300.0 / max(sum(tp_list), 1)}, open(sys.argv[2], "w"))
     cfg.global_resource_planner.sailor_path = str(sailor)
     cfg.global_resource_planner.vidur_path = str(vidur)
     cfg.global_resource_planner.sailor_train_command = (
-        f"{sys.executable} {sailor_script} {{input_json}} {{output_json}}"
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(sailor_script))} {{input_json}} {{output_json}}"
     )
     cfg.global_resource_planner.vidur_rollout_command = (
-        f"{sys.executable} {vidur_script} {{trace_csv}} {{output_json}} {{tp_list}}"
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(vidur_script))} {{trace_csv}} {{output_json}} {{tp_list}}"
     )
     cfg.global_resource_planner.allowed_train_tp = [1, 2]
     cfg.global_resource_planner.allowed_train_pp = [1]

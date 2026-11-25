@@ -64,9 +64,7 @@ class HeterogeneousRolloutEngine:
         from RL_Framework.infra.scheduling.base import MetricsFeedbackConfig
         from RL_Framework.infra.scheduling.metrics_feed import VLLMMetricsPoller
 
-        feedback = MetricsFeedbackConfig.from_scheduling(
-            getattr(hetero_cfg, "scheduling", None)
-        )
+        feedback = MetricsFeedbackConfig.from_scheduling(hetero_cfg.scheduling)
         single_dynamic = isinstance(self.scheduler, CMLFQDynamicKVCostScheduler)
         if not feedback.enabled and not single_dynamic:
             self._stop_metrics_poller()
@@ -131,8 +129,8 @@ class HeterogeneousRolloutEngine:
 
     def _setup_shared_state(self, hetero_cfg: Any) -> None:
         """Create the cross-rank load state once per engine lifetime."""
-        sched = getattr(hetero_cfg, "scheduling", None)
-        directory = str(getattr(sched, "shared_load_dir", "") or "")
+        sched = hetero_cfg.scheduling
+        directory = str(sched.shared_load_dir or "")
         if not directory:
             return
         if hasattr(self.scheduler, "get_request_route"):
@@ -144,11 +142,9 @@ class HeterogeneousRolloutEngine:
 
         self._shared_state = SharedTokenLoadState(
             directory=directory,
-            ttl_s=float(getattr(sched, "shared_load_ttl_s", 30.0)),
-            heartbeat_interval_s=float(
-                getattr(sched, "shared_load_heartbeat_s", 10.0)
-            ),
-            cache_ttl_s=float(getattr(sched, "shared_load_cache_ttl_s", 1.0)),
+            ttl_s=float(sched.shared_load_ttl_s),
+            heartbeat_interval_s=float(sched.shared_load_heartbeat_s),
+            cache_ttl_s=float(sched.shared_load_cache_ttl_s),
         )
         if self.scheduler is not None:
             self.scheduler.attach_shared_state(self._shared_state)
@@ -253,7 +249,7 @@ class HeterogeneousRolloutEngine:
                     engine.close_sync()
 
             hetero = config.heterogeneous_rollout
-            scheduler_type = getattr(hetero.scheduling, "scheduler_type", "length_aware")
+            scheduler_type = hetero.scheduling.scheduler_type
             scheduler = SchedulerFactory.create(
                 scheduler_type=scheduler_type,
                 hetero_config=hetero,
@@ -557,8 +553,8 @@ class HeterogeneousRolloutEngine:
         ).rollout_model
         sched = config.heterogeneous_rollout.scheduling
         self._cmlfq_backend = CMLFQGenerationBackend(
-            mode=getattr(sched, "cmlfq_kv_backend", "recompute"),
-            transfer_tp_pairs=getattr(sched, "cmlfq_kv_transfer_tp_pairs", []),
+            mode=sched.cmlfq_kv_backend,
+            transfer_tp_pairs=sched.cmlfq_kv_transfer_tp_pairs,
         )
         self._configure_cost_runtime()
 
@@ -895,7 +891,7 @@ class HeterogeneousRolloutEngine:
         hetero = config.heterogeneous_rollout
 
 
-        scheduler_type = getattr(hetero.scheduling, "scheduler_type", "length_aware")
+        scheduler_type = hetero.scheduling.scheduler_type
         scheduler = SchedulerFactory.create(
             scheduler_type=scheduler_type,
             hetero_config=hetero,
@@ -975,10 +971,3 @@ class HeterogeneousRolloutEngine:
             f"tp_list={self.tp_list}, "
             f"scheduler={self.scheduler.name})"
         )
-
-    def __del__(self):
-        for engine in self.engines:
-            try:
-                engine.__del__()
-            except Exception:
-                pass
