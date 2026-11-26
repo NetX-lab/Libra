@@ -184,19 +184,24 @@ class DAPOMathWorkflow:
                 feedback = self.tokenizer.decode(feedback_tokens, skip_special_tokens=True)
                 segments.append((feedback_tokens, feedback_logprobs, 0))
                 generated_tokens = sum(len(toks) for toks, _, _ in segments[1:])
+                pure_generated_tokens = sum(len(toks) for toks, _, mask in segments if mask == 1)
                 tool_event = {
                     "tool_type": "dapo_math_validator",
                     "output": feedback,
                     "status": "success" if metrics["accuracy"] >= 1.0 else "failure",
                     "payload_tokens": len(feedback_tokens),
                     "token_position": generated_tokens,
+                    "generated_token_position": pure_generated_tokens,
                     "turn": turn,
                     "reward": metrics["reward"],
                     "accuracy": metrics["accuracy"],
                 }
                 tool_returns.append(tool_event)
+                record_tool_return = getattr(engine, "record_cmlfq_tool_return", None)
                 route_tool_return = getattr(engine, "route_cmlfq_tool_return", None)
-                if cmlfq_request_id and callable(route_tool_return):
+                if cmlfq_request_id and callable(record_tool_return):
+                    record_tool_return(cmlfq_request_id, tool_event, generated_tokens)
+                elif cmlfq_request_id and callable(route_tool_return):
                     route_tool_return(cmlfq_request_id, tool_event, generated_tokens)
                 current_text += output_text + "\n" + feedback + "\n"
         except BaseException:
@@ -226,7 +231,10 @@ class DAPOMathWorkflow:
             tr["remaining_length"] = max(0, total_output_tokens - pos)
         finish_cmlfq = getattr(engine, "finish_cmlfq_request", None)
         if cmlfq_request_id and callable(finish_cmlfq):
-            finish_cmlfq(cmlfq_request_id, total_output_tokens)
+            try:
+                finish_cmlfq(cmlfq_request_id, total_output_tokens, generated_tokens=output_len)
+            except TypeError:
+                finish_cmlfq(cmlfq_request_id, total_output_tokens)
         reward = self.reward_fn(prompt=prompt_text, completion=final_completion, ground_truth=answer, answer=answer)
         seq = torch.tensor(input_ids, dtype=torch.long)
         return {

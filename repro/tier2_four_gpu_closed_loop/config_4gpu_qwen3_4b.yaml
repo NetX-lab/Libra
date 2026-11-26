@@ -1,0 +1,95 @@
+# Tier 2: 4-GPU Heterogeneous Small-Scale Closed Loop (1 Train + 3 Rollout GPUs)
+# Verified baseline: DAPO-Math + Qwen3-4B (no Slurm required).
+hardware_config: ../../configs/hardware_config/a800_80g.yaml
+model_arch_config: ../../configs/model_arch_config/qwen3-4b.yaml
+
+model_path: "Qwen/Qwen3-4B"
+tokenizer_path: "Qwen/Qwen3-4B"
+
+train_backend: "fsdp"
+train_gpus: 1
+rollout_gpus: 3
+tp_size: 1
+train_tp_size: 1
+train_pp_size: 1
+train_dp_size: 1
+
+batch_size: 8
+micro_batch_size: 1
+total_steps: 8
+learning_rate: 1.0e-6
+ppo_epochs: 1
+kl_coef: 0.001
+clip_epsilon: 0.2
+gamma: 1.0
+recompute_logprobs: true
+
+max_concurrent_rollouts: 16
+max_head_offpolicyness: 4
+queue_size: 32
+max_new_tokens: 512
+max_seq_length: 2048
+n_samples: 2
+temperature: 0.8
+top_p: 0.95
+
+sync_interval: 4
+rollout_sync_drain_lead_steps: 1
+weight_sync_mode: "disk"
+sync_path: "./logs/tier2_4gpu/weights"
+rollout_weight_sync_mode: "restart"
+rollout_weight_reload_method: "inplace"
+rollout_weight_reload_strategy: "parallel"
+rollout_weight_sync_control_dir: "./logs/tier2_4gpu/control"
+rollout_weight_sync_timeout_s: 1200
+require_rollout_weight_sync: true
+
+eval_interval: 0
+save_interval: 0
+log_dir: "./logs/tier2_4gpu"
+seed: 42
+
+enable_history_collection: true
+history_output_dir: "./logs/tier2_4gpu/history"
+history_save_raw_lengths: true
+history_flush_interval: 1
+history_experiment_name: "tier2_4gpu_dapo_math"
+
+heterogeneous_rollout:
+  enabled: true
+  total_gpus: 3
+  vllm_host: "127.0.0.1"
+  vllm_base_port: 18920
+  max_model_len: 2048
+  gpu_memory_utilization: 0.65
+
+  instances:
+    - instance_id: "tp1"
+      tp: 1
+      gpus: [1]
+      host: "127.0.0.1"
+      port: 18920
+    - instance_id: "tp2"
+      tp: 2
+      gpus: [2, 3]
+      host: "127.0.0.1"
+      port: 18921
+
+  scheduling:
+    scheduler_type: "cmlfq_cost"
+    load_balance_strategy: "least_connections"
+    max_queue_length: 16
+    enable_fallback: true
+    cmlfq_rebuild_interval: 8
+    cmlfq_tree_path: "./logs/tier2_4gpu/tree.json"
+    cmlfq_kv_backend: "recompute"
+    cmlfq_kv_transfer_tp_pairs:
+      - [1, 2]
+      - [2, 1]
+    cmlfq_buckets:
+      short:
+        tp_degrees: [1]
+        max_tokens: 512
+      long:
+        tp_degrees: [2]
+        max_tokens: 2048

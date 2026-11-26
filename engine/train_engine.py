@@ -49,6 +49,30 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.lower() not in {"0", "false", "no", "off"}
 
 
+_DTYPE_ALIASES = {
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "float32": torch.float32,
+    "fp32": torch.float32,
+}
+
+
+def _resolve_train_dtype() -> torch.dtype:
+    """Resolve model/FSDP precision from FSDP_DTYPE, falling back safely on pre-Ampere GPUs."""
+    raw = os.environ.get("FSDP_DTYPE", "auto").strip().lower()
+    if raw in ("", "auto"):
+        if not torch.cuda.is_available() or torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float32
+    if raw not in _DTYPE_ALIASES:
+        raise ValueError(
+            f"Unsupported FSDP_DTYPE={raw!r}; expected auto, bfloat16, float16, or float32"
+        )
+    return _DTYPE_ALIASES[raw]
+
+
 def _checkpoint_only_with_grad(
     function: Any,
     *args: Any,
@@ -251,9 +275,10 @@ class FSDPTrainEngine:
         if self.is_main_process:
             print(f"Loading model: {self.model_path}")
 
+        model_dtype = _resolve_train_dtype()
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=model_dtype,
             device_map=None,
             trust_remote_code=True,
         )
@@ -279,9 +304,9 @@ class FSDPTrainEngine:
 
         if self.is_distributed:
             mp_policy = MixedPrecision(
-                param_dtype=torch.bfloat16,
+                param_dtype=model_dtype,
                 reduce_dtype=torch.float32,
-                buffer_dtype=torch.bfloat16,
+                buffer_dtype=model_dtype,
             )
             decoder_layers = getattr(
                 getattr(self.model, "model", None),

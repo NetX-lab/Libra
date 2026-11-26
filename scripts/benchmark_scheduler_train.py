@@ -2,6 +2,7 @@
 import json
 import os
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -10,8 +11,15 @@ import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from RL_Framework import AsyncRLTrainer, parse_args_and_load_config
-from RL_Framework.examples.dapo_math_async_rl import _preprocess
+try:
+    from examples.dapo_math_async_rl import _preprocess
+except ImportError:
+    from RL_Framework.examples.dapo_math_async_rl import _preprocess
 from RL_Framework.workflow.dapo_math import DAPOMathWorkflow
 
 OUT = Path(os.environ['BENCH_RUN_DIR'])
@@ -65,13 +73,26 @@ def main():
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
-    dataset = load_dataset('json', data_files=os.environ['DAPO_MATH_PATH'], split='train')
+    data_path = os.environ['DAPO_MATH_PATH']
+    data_format = 'parquet' if data_path.endswith('.parquet') else 'json'
+    dataset = load_dataset(data_format, data_files=data_path, split='train')
     dataset = dataset.map(_preprocess, with_indices=True)
     dataset = dataset.filter(lambda r: bool(r['question']) and bool(r['ground_truth']))
-    tokenizer = AutoTokenizer.from_pretrained(config.model_path)
-    workflow = MeasuredWorkflow(tokenizer=tokenizer, max_turns=2,
-        max_new_tokens=config.max_new_tokens, max_seq_length=config.max_seq_length,
-        max_prompt_tokens=512, temperature=config.temperature, top_p=config.top_p)
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.tokenizer_path or config.model_path,
+        trust_remote_code=True,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    workflow = MeasuredWorkflow(
+        tokenizer=tokenizer,
+        max_turns=int(os.environ.get('DAPO_MAX_TURNS', '2')),
+        max_new_tokens=config.max_new_tokens,
+        max_seq_length=config.max_seq_length,
+        max_prompt_tokens=int(os.environ.get('DAPO_MAX_PROMPT_TOKENS', '512')),
+        temperature=config.temperature,
+        top_p=config.top_p,
+    )
     trainer = MeasuredTrainer(config)
     started = time.time()
     trainer.train(workflow, dataset)
