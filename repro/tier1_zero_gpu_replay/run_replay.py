@@ -1,28 +1,45 @@
 #!/usr/bin/env python3
-"""Tier 1 (0-GPU) Libra scheduling replay and GRP offline benchmark.
+"""Tier 1 Libra scheduling replay and GRP offline benchmark.
 
-Evaluates heterogeneous rollout scheduling policies and the Global Resource
-Planner (GRP) on real or sample agentic RL traces using CPU-only production
-schedulers and Libra's analytic ``CostModel`` (zero GPU required).
+Supports two evaluation pathways:
+1. ``--eval-mode analytic`` (default, 0-GPU): Evaluates heterogeneous rollout
+   scheduling policies and the Global Resource Planner (GRP) on CPU using
+   production schedulers and Libra's analytic ``CostModel``
+   (``evaluation_mode: "analytic_cost_model_replay"``).
+2. ``--eval-mode vllm`` (Real-GPU Live vLLM): Eliminates the CostModel simulator
+   from evaluation by dispatching the exact same multi-turn trajectories and
+   scheduler decisions against live heterogeneous vLLM servers on physical GPUs
+   and measuring wall-clock makespan and token throughput
+   (``evaluation_mode: "live_vllm_gpu_replay"``).
 
-All rollout/training timing numbers come from ``RL_Framework.infra.cost_model``
-and are labeled ``evaluation_mode: "analytic_cost_model_replay"``. Controller
-latencies (``avg_us``, ``p99_us``) are directly measured wall-clock CPU timings.
+Controller latencies (``avg_us``, ``p99_us``) are directly measured wall-clock
+CPU timings in both modes.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import concurrent.futures
+import contextlib
 import heapq
 import importlib.util
+import inspect
 import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
+import urllib.request
 import uuid
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import mean
 from typing import Any
+from urllib.parse import urlparse
 
 
 def _ensure_rl_framework_importable() -> Path:
@@ -76,6 +93,8 @@ SUPPORTED_POLICIES = (
 
 SUPPORTED_KV_BACKENDS = ("recompute", "nixl", "cpu_offload")
 
+SUPPORTED_EVAL_MODES = ("analytic", "vllm")
+
 _STATIC_POLICIES = ("round_robin", "least_connections", "length_aware")
 
 _BUCKET_CUTOFFS = (4000, 10000, 20000, 32768)
@@ -111,6 +130,10 @@ class PolicyReplayResult:
     ctrl_avg_us: float
     ctrl_p99_us: float
     tp_distribution: dict[int, int]
+    evaluation_mode: str = "analytic_cost_model_replay"
+    wall_makespan_s: float | None = None
+    total_generated_tokens: int = 0
+    throughput_tok_per_s: float | None = None
 
 
 def _classify_archetype(total_output_tokens: int) -> str:
@@ -134,6 +157,7 @@ def _normalize_trace_row(raw: dict[str, Any], index: int) -> dict[str, Any]:
         pos = min(pos, max(total_output, pos))
         prev_pos = pos
         item["token_position"] = pos
+        item.setdefault("generated_token_position", pos)
         if "tool" not in item and "tool_type" in item:
             item["tool"] = item["tool_type"]
         if "tool_type" not in item:
@@ -146,12 +170,14 @@ def _normalize_trace_row(raw: dict[str, Any], index: int) -> dict[str, Any]:
     prompt_id = str(raw.get("prompt_id") or f"prompt_{index}")
     request_id = str(raw.get("request_id") or f"{prompt_id}_req_{index}")
     archetype = str(raw.get("archetype") or _classify_archetype(total_output))
+    norm_output = max(1, total_output)
     return {
         "request_id": request_id,
         "prompt_id": prompt_id,
         "archetype": archetype,
         "input_tokens": max(1, input_tokens),
-        "total_output_tokens": max(1, total_output),
+        "total_output_tokens": norm_output,
+        "output_len": max(1, int(raw.get("output_len", norm_output))),
         "tool_returns": normalized_returns,
     }
 
@@ -196,6 +222,239 @@ def parse_tp_layout(raw: str) -> list[int]:
     if any(tp <= 0 for tp in layout):
         raise ValueError(f"All TP degrees must be positive, got {layout}")
     return layout
+
+
+def _parse_single_endpoint(raw: str) -> tuple[str, int]:
+    """Parse ``host:port`` or ``http(s)://host:port`` into ``(host, port)``."""
+    text = raw.strip()
+    if not text:
+        raise ValueError("Endpoint entry must not be empty")
+    candidate = text if "://" in text else f"http://{text}"
+    parsed = urlparse(candidate)
+    if not parsed.hostname or parsed.port is None or parsed.port <= 0:
+        raise ValueError(f"Invalid vLLM endpoint {raw!r}; expected 'host:port'")
+    return parsed.hostname, int(parsed.port)
+
+
+def parse_vllm_endpoints(
+    endpoints_raw: str | Sequence[str | tuple[str, int]] | None,
+    tp_layout: list[int],
+    host: str = "127.0.0.1",
+    base_port: int = 8000,
+) -> list[tuple[str, int]]:
+    """Parse or synthesize ``(host, port)`` pairs matching ``tp_layout``."""
+    if endpoints_raw is None:
+        return [(host, base_port + i) for i in range(len(tp_layout))]
+
+    endpoints: list[tuple[str, int]] = []
+    if isinstance(endpoints_raw, str):
+        items = [part.strip() for part in endpoints_raw.split(",") if part.strip()]
+        endpoints = [_parse_single_endpoint(item) for item in items]
+    else:
+        for item in endpoints_raw:
+            if isinstance(item, str):
+                endpoints.append(_parse_single_endpoint(item))
+            else:
+                ep_host, ep_port = item
+                if not str(ep_host).strip() or int(ep_port) <= 0:
+                    raise ValueError(f"Invalid vLLM endpoint tuple {item!r}")
+                endpoints.append((str(ep_host).strip(), int(ep_port)))
+
+    if len(endpoints) != len(tp_layout):
+        raise ValueError(
+            f"Expected {len(tp_layout)} vLLM endpoints for tp_layout={tp_layout}, "
+            f"got {len(endpoints)} ({endpoints})"
+        )
+    return endpoints
+
+
+class VLLMServerCluster:
+    """Manage local heterogeneous ``vllm.entrypoints.openai.api_server`` processes."""
+
+    def __init__(
+        self,
+        tp_layout: list[int],
+        model: str,
+        *,
+        gpus_raw: str | None = None,
+        host: str = "127.0.0.1",
+        base_port: int = 8000,
+        max_model_len: int = 32768,
+        gpu_memory_utilization: float = 0.85,
+        max_num_seqs: int = 32,
+        log_dir: Path | None = None,
+        startup_timeout_s: float = 600.0,
+    ) -> None:
+        self.tp_layout = list(tp_layout)
+        self.model = model
+        self.host = host
+        self.base_port = int(base_port)
+        self.max_model_len = int(max_model_len)
+        self.gpu_memory_utilization = float(gpu_memory_utilization)
+        self.max_num_seqs = int(max_num_seqs)
+        self.startup_timeout_s = float(startup_timeout_s)
+
+        total_gpus = sum(self.tp_layout)
+        if gpus_raw is not None and gpus_raw.strip():
+            self.gpu_ids = [int(g.strip()) for g in gpus_raw.split(",") if g.strip()]
+        else:
+            self.gpu_ids = list(range(total_gpus))
+        if len(self.gpu_ids) != total_gpus:
+            raise ValueError(
+                f"tp_layout={self.tp_layout} requires {total_gpus} GPUs, "
+                f"got {len(self.gpu_ids)} ({self.gpu_ids})"
+            )
+
+        self.endpoints: list[tuple[str, int]] = [
+            (self.host, self.base_port + idx) for idx in range(len(self.tp_layout))
+        ]
+        self._owns_log_dir = log_dir is None
+        self.log_dir = (
+            log_dir
+            if log_dir is not None
+            else Path(tempfile.mkdtemp(prefix="libra_tier1_vllm_logs_"))
+        )
+        self._procs: list[subprocess.Popen[Any]] = []
+        self._log_handles: list[Any] = []
+        self._log_paths: list[Path] = []
+        self._cache_dirs: list[Path] = []
+
+    def _wait_healthy(self) -> None:
+        deadline = time.monotonic() + self.startup_timeout_s
+        for idx, (ep_host, ep_port) in enumerate(self.endpoints):
+            health_url = f"http://{ep_host}:{ep_port}/health"
+            while True:
+                proc = self._procs[idx]
+                rc = proc.poll()
+                if rc is not None:
+                    tail = ""
+                    if self._log_paths[idx].exists():
+                        lines = self._log_paths[idx].read_text(
+                            encoding="utf-8", errors="replace"
+                        ).splitlines()
+                        tail = "\n".join(lines[-25:])
+                    raise RuntimeError(
+                        f"vLLM instance {idx} (tp={self.tp_layout[idx]}, port={ep_port}) "
+                        f"exited early with code {rc}.\nLog tail:\n{tail}"
+                    )
+                try:
+                    with urllib.request.urlopen(health_url, timeout=2.0) as resp:
+                        if resp.status == 200:
+                            break
+                except Exception:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"Timed out waiting {self.startup_timeout_s:.0f}s for vLLM instance {idx} "
+                        f"at {health_url}; inspect {self._log_paths[idx]}"
+                    )
+                time.sleep(2.0)
+
+    def __enter__(self) -> VLLMServerCluster:
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        shm = Path("/dev/shm")
+        cache_base = shm if shm.is_dir() and os.access(shm, os.W_OK) else Path(tempfile.gettempdir())
+        run_tag = f"{os.getpid()}_{int(time.time())}"
+        cursor = 0
+        try:
+            for idx, tp in enumerate(self.tp_layout):
+                assigned = self.gpu_ids[cursor : cursor + tp]
+                cursor += tp
+                ep_host, ep_port = self.endpoints[idx]
+                cache_root = cache_base / f"libra_tier1_vllm_{run_tag}_inst{idx}"
+                for sub in ("vllm", "inductor", "triton"):
+                    (cache_root / sub).mkdir(parents=True, exist_ok=True)
+                self._cache_dirs.append(cache_root)
+
+                env = os.environ.copy()
+                env.update(
+                    {
+                        "CUDA_VISIBLE_DEVICES": ",".join(str(g) for g in assigned),
+                        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+                        "OMP_NUM_THREADS": "1",
+                        "VLLM_USE_V1": "1",
+                        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+                        "TOKENIZERS_PARALLELISM": "false",
+                        "VLLM_CACHE_ROOT": str(cache_root / "vllm"),
+                        "TORCHINDUCTOR_CACHE_DIR": str(cache_root / "inductor"),
+                        "TRITON_CACHE_DIR": str(cache_root / "triton"),
+                    }
+                )
+                log_path = self.log_dir / f"vllm_inst{idx}_tp{tp}.log"
+                log_file = log_path.open("w", encoding="utf-8")
+                self._log_paths.append(log_path)
+                self._log_handles.append(log_file)
+
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "vllm.entrypoints.openai.api_server",
+                    "--model",
+                    self.model,
+                    "--host",
+                    ep_host,
+                    "--port",
+                    str(ep_port),
+                    "--tensor-parallel-size",
+                    str(tp),
+                    "--dtype",
+                    "bfloat16",
+                    "--max-model-len",
+                    str(self.max_model_len),
+                    "--gpu-memory-utilization",
+                    str(self.gpu_memory_utilization),
+                    "--max-num-seqs",
+                    str(self.max_num_seqs),
+                    "--enable-prefix-caching",
+                    "--disable-log-requests",
+                    "--seed",
+                    "42",
+                ]
+                proc = subprocess.Popen(
+                    cmd,
+                    env=env,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                self._procs.append(proc)
+
+            self._wait_healthy()
+            return self
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        del exc_type, exc, tb
+        for proc in self._procs:
+            if proc.poll() is not None:
+                continue
+            try:
+                os.killpg(proc.pid, 15)
+            except Exception:
+                proc.terminate()
+        deadline = time.monotonic() + 5.0
+        for proc in self._procs:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, 9)
+                except Exception:
+                    proc.kill()
+        for handle in self._log_handles:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        for cache_root in self._cache_dirs:
+            shutil.rmtree(cache_root, ignore_errors=True)
+        self._procs.clear()
+        self._log_handles.clear()
+        self._cache_dirs.clear()
 
 
 def _build_bucket_spec(
@@ -244,6 +503,7 @@ def build_hetero_config(
     hardware: HardwareConfig,
     kv_backend: str = "recompute",
     cost_profile: Path | str | None = None,
+    endpoints: list[tuple[str, int]] | None = None,
 ) -> tuple[str, HeterogeneousRolloutConfig]:
     """Build factory key and ``HeterogeneousRolloutConfig`` for a replay policy."""
     if policy not in SUPPORTED_POLICIES:
@@ -252,21 +512,28 @@ def build_hetero_config(
         raise ValueError(
             f"Unsupported kv_backend {kv_backend!r}; choose from {SUPPORTED_KV_BACKENDS}"
         )
+    if endpoints is not None and len(endpoints) != len(tp_layout):
+        raise ValueError(
+            f"Expected {len(tp_layout)} endpoints for tp_layout={tp_layout}, got {len(endpoints)}"
+        )
 
     gpus_per_node = max(1, int(hardware.gpus_per_node))
     instances: list[HeterogeneousInstanceConfig] = []
     gpu_cursor = 0
     for idx, tp in enumerate(tp_layout):
         gpu_ids = list(range(gpu_cursor, gpu_cursor + tp))
-        host = f"node-{gpu_cursor // gpus_per_node}"
+        default_host = f"node-{gpu_cursor // gpus_per_node}"
         gpu_cursor += tp
+        inst_host, inst_port = (
+            endpoints[idx] if endpoints is not None else (default_host, 8000 + idx)
+        )
         instances.append(
             HeterogeneousInstanceConfig(
                 instance_id=f"rollout-{idx}-tp{tp}",
                 tp=tp,
                 gpus=gpu_ids,
-                host=host,
-                port=8000 + idx,
+                host=inst_host,
+                port=inst_port,
             )
         )
 
@@ -581,6 +848,130 @@ def _run_static_batch(
     return instance_segments, instance_migration_cost, oom_count, long_total, long_on_max_tp
 
 
+def _schedule_turn0_request(
+    policy: str,
+    scheduler: Any,
+    req: dict[str, Any],
+) -> tuple[str, int, str, int, int]:
+    """Run initial Turn-0 routing and return ``(req_id, idx, bucket, reserved, init_migs)``."""
+    route = scheduler.schedule(
+        input_tokens=req["input_tokens"],
+        prompt_id=req["prompt_id"],
+        n_samples=1,
+    )
+    req_id = route.request_id or f"{req['request_id']}_{uuid.uuid4().hex[:8]}"
+    cur_idx = route.instance_index
+    cur_bucket = route.category
+    init_migs = 0
+    if policy == "la_mlfq":
+        scheduler.migration_controller.register_request(
+            request_id=req_id,
+            prompt_id=req["prompt_id"],
+            instance_index=cur_idx,
+            bucket=cur_bucket,
+        )
+    elif policy == "cmlfq_cost":
+        d0 = scheduler.reserve_generation(req_id, context_tokens=req["input_tokens"])
+        scheduler.commit_generation(req_id, d0)
+        if d0.should_migrate:
+            init_migs = 1
+            cur_idx = d0.target_instance_index
+            cur_bucket = d0.target_bucket
+    return req_id, cur_idx, cur_bucket, route.reserved_tokens, init_migs
+
+
+def _apply_dynamic_turn_hook(
+    policy: str,
+    scheduler: Any,
+    req_id: str,
+    req: dict[str, Any],
+    tr: dict[str, Any],
+    pos: int,
+    old_idx: int,
+    cur_bucket: str,
+    reserved_tokens: int,
+) -> tuple[int, str, int]:
+    """Invoke dynamic scheduler migration hook on one tool return."""
+    new_idx = old_idx
+    new_bucket = cur_bucket
+    new_reserved = reserved_tokens
+    if policy == "cmlfq":
+        decision = scheduler.on_tool_return(req_id, tr, generated_tokens=pos)
+        if decision.should_migrate:
+            res = scheduler.execute_migration(req_id, decision)
+            if res.instance_index >= 0:
+                new_idx = res.instance_index
+                new_bucket = res.category
+    elif policy == "cmlfq_cost":
+        scheduler.on_tool_return(req_id, tr, generated_tokens=pos)
+        res = scheduler.reserve_generation(
+            req_id, context_tokens=req["input_tokens"] + pos
+        )
+        scheduler.commit_generation(req_id, res)
+        if res.should_migrate and res.target_instance_index >= 0:
+            new_idx = res.target_instance_index
+            new_bucket = res.target_bucket
+    elif policy == "la_mlfq":
+        decision = scheduler.check_and_migrate(req_id, generated_tokens=pos)
+        if decision.should_migrate:
+            scheduler._complete_route(
+                old_idx,
+                output_tokens=0,
+                category=cur_bucket,
+                reserved_tokens=reserved_tokens,
+            )
+            res = scheduler._route_to_bucket(
+                decision.target_bucket,
+                0,
+                req["prompt_id"],
+                reason="la_mlfq_migration",
+            )
+            if res.instance_index >= 0:
+                new_idx = res.instance_index
+                new_bucket = res.category
+                new_reserved = res.reserved_tokens
+    return new_idx, new_bucket, new_reserved
+
+
+def _complete_trajectory(
+    policy: str,
+    scheduler: Any,
+    req_id: str,
+    req: dict[str, Any],
+    final_idx: int,
+    final_bucket: str,
+    reserved_tokens: int,
+) -> None:
+    """Release scheduler tracking state upon trajectory completion."""
+    if policy in ("cmlfq", "cmlfq_cost"):
+        params = inspect.signature(scheduler.finish_request).parameters
+        if "generated_tokens" in params:
+            scheduler.finish_request(
+                req_id,
+                req["total_output_tokens"],
+                generated_tokens=req["total_output_tokens"],
+            )
+        else:
+            scheduler.finish_request(req_id, req["total_output_tokens"])
+    elif policy == "la_mlfq":
+        scheduler.migration_controller.on_request_done(req_id)
+        scheduler.on_request_done(
+            final_idx,
+            prompt_id=req["prompt_id"],
+            final_bucket=final_bucket,
+            output_tokens=req["total_output_tokens"],
+            reserved_tokens=reserved_tokens,
+        )
+    else:
+        scheduler.on_request_done(
+            final_idx,
+            prompt_id=req["prompt_id"],
+            final_bucket=final_bucket,
+            output_tokens=req["total_output_tokens"],
+            reserved_tokens=reserved_tokens,
+        )
+
+
 def _run_dynamic_batch(
     policy: str,
     scheduler: Any,
@@ -607,28 +998,10 @@ def _run_dynamic_batch(
     active_states: list[dict[str, Any]] = []
     for req in batch:
         t0 = time.perf_counter_ns()
-        route = scheduler.schedule(
-            input_tokens=req["input_tokens"],
-            prompt_id=req["prompt_id"],
-            n_samples=1,
+        req_id, cur_idx, cur_bucket, reserved_tokens, init_migs = _schedule_turn0_request(
+            policy, scheduler, req
         )
-        req_id = route.request_id or f"{req['request_id']}_{uuid.uuid4().hex[:8]}"
-        cur_idx = route.instance_index
-        cur_bucket = route.category
-        if policy == "la_mlfq":
-            scheduler.migration_controller.register_request(
-                request_id=req_id,
-                prompt_id=req["prompt_id"],
-                instance_index=cur_idx,
-                bucket=cur_bucket,
-            )
-        elif policy == "cmlfq_cost":
-            d0 = scheduler.reserve_generation(req_id, context_tokens=req["input_tokens"])
-            scheduler.commit_generation(req_id, d0)
-            if d0.should_migrate:
-                batch_migrations += 1
-                cur_idx = d0.target_instance_index
-                cur_bucket = d0.target_bucket
+        batch_migrations += init_migs
         ctrl_latencies_us.append((time.perf_counter_ns() - t0) / 1000.0)
 
         tool_returns = req["tool_returns"]
@@ -643,7 +1016,7 @@ def _run_dynamic_batch(
                 "req_id": req_id,
                 "cur_idx": cur_idx,
                 "cur_bucket": cur_bucket,
-                "reserved_tokens": route.reserved_tokens,
+                "reserved_tokens": reserved_tokens,
                 "open_span": SegmentSpan(
                     kv_start_ctx=req["input_tokens"],
                     new_prefill_tokens=req["input_tokens"],
@@ -670,49 +1043,20 @@ def _run_dynamic_batch(
             seg_gen = max(0, next_pos - pos)
             payload_tokens = _tool_payload_tokens(tr)
             old_idx = st["cur_idx"]
-            new_idx = old_idx
-            new_bucket = st["cur_bucket"]
 
             t0 = time.perf_counter_ns()
-            if policy == "cmlfq":
-                decision = scheduler.on_tool_return(
-                    st["req_id"], tr, generated_tokens=pos
-                )
-                if decision.should_migrate:
-                    res = scheduler.execute_migration(st["req_id"], decision)
-                    if res.instance_index >= 0:
-                        new_idx = res.instance_index
-                        new_bucket = res.category
-            elif policy == "cmlfq_cost":
-                scheduler.on_tool_return(st["req_id"], tr, generated_tokens=pos)
-                res = scheduler.reserve_generation(
-                    st["req_id"], context_tokens=req["input_tokens"] + pos
-                )
-                scheduler.commit_generation(st["req_id"], res)
-                if res.should_migrate and res.target_instance_index >= 0:
-                    new_idx = res.target_instance_index
-                    new_bucket = res.target_bucket
-            elif policy == "la_mlfq":
-                decision = scheduler.check_and_migrate(
-                    st["req_id"], generated_tokens=pos
-                )
-                if decision.should_migrate:
-                    scheduler._complete_route(
-                        old_idx,
-                        output_tokens=0,
-                        category=st["cur_bucket"],
-                        reserved_tokens=st["reserved_tokens"],
-                    )
-                    res = scheduler._route_to_bucket(
-                        decision.target_bucket,
-                        0,
-                        req["prompt_id"],
-                        reason="la_mlfq_migration",
-                    )
-                    if res.instance_index >= 0:
-                        new_idx = res.instance_index
-                        new_bucket = res.category
-                        st["reserved_tokens"] = res.reserved_tokens
+            new_idx, new_bucket, new_reserved = _apply_dynamic_turn_hook(
+                policy,
+                scheduler,
+                st["req_id"],
+                req,
+                tr,
+                pos,
+                old_idx,
+                st["cur_bucket"],
+                st["reserved_tokens"],
+            )
+            st["reserved_tokens"] = new_reserved
             ctrl_latencies_us.append((time.perf_counter_ns() - t0) / 1000.0)
 
             if new_idx != old_idx:
@@ -758,17 +1102,15 @@ def _run_dynamic_batch(
         if rollout_model.check_oom(peak_ctx, final_tp):
             oom_count += 1
 
-        if policy in ("cmlfq", "cmlfq_cost"):
-            scheduler.finish_request(st["req_id"], req["total_output_tokens"])
-        else:
-            scheduler.migration_controller.on_request_done(st["req_id"])
-            scheduler.on_request_done(
-                final_idx,
-                prompt_id=req["prompt_id"],
-                final_bucket=st["cur_bucket"],
-                output_tokens=req["total_output_tokens"],
-                reserved_tokens=st["reserved_tokens"],
-            )
+        _complete_trajectory(
+            policy,
+            scheduler,
+            st["req_id"],
+            req,
+            final_idx,
+            st["cur_bucket"],
+            st["reserved_tokens"],
+        )
 
     return (
         instance_segments,
@@ -779,6 +1121,300 @@ def _run_dynamic_batch(
         long_total,
         long_on_max_tp,
     )
+
+
+def _resolve_tokenizer(vllm_tokenizer: Any) -> Any:
+    """Resolve an optional HF tokenizer path/name or passthrough tokenizer instance."""
+    if vllm_tokenizer is None or vllm_tokenizer == "":
+        return None
+    if isinstance(vllm_tokenizer, (str, Path)):
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(str(vllm_tokenizer), trust_remote_code=True)
+    return vllm_tokenizer
+
+
+def _build_padded_text(
+    target_tokens: int,
+    header: str,
+    filler_token: str = " token",
+    tokenizer: Any = None,
+) -> str:
+    """Build deterministic text starting with ``header`` of length ``target_tokens``."""
+    target = max(1, int(target_tokens))
+    if tokenizer is not None:
+        header_ids = tokenizer.encode(header, add_special_tokens=False)
+        if len(header_ids) >= target:
+            return tokenizer.decode(header_ids[:target], skip_special_tokens=True)
+        filler_ids = tokenizer.encode(filler_token, add_special_tokens=False) or [0]
+        filler_n = max(1, target - len(header_ids))
+        pad_text = ""
+        for _ in range(3):
+            rep = (filler_n // max(1, len(filler_ids))) + 2
+            pad_text = tokenizer.decode(
+                (filler_ids * rep)[: max(0, filler_n)],
+                skip_special_tokens=True,
+            )
+            full_len = len(tokenizer.encode(header + pad_text, add_special_tokens=False))
+            diff = target - full_len
+            if diff == 0:
+                return header + pad_text
+            filler_n = max(0, filler_n + diff)
+        return header + pad_text
+
+    words = header.split()
+    if len(words) >= target:
+        return " ".join(words[:target])
+    filler_word = filler_token.strip() or "token"
+    prefix = header.rstrip()
+    pad = " ".join([filler_word] * (target - len(words)))
+    return f"{prefix} {pad}" if prefix else pad
+
+
+async def _vllm_complete(
+    client: Any,
+    base_url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    *,
+    ignore_eos: bool = True,
+    extra_body: dict[str, Any] | None = None,
+) -> tuple[str, int, float]:
+    """Send one async completion request to a live vLLM endpoint and time it."""
+    token_budget = max(1, int(max_tokens))
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": token_budget,
+        "min_tokens": token_budget,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "n": 1,
+        "ignore_eos": ignore_eos,
+        "skip_special_tokens": False,
+        "spaces_between_special_tokens": False,
+    }
+    if extra_body:
+        payload.update(extra_body)
+
+    t0 = time.perf_counter()
+    resp = await client.post(f"{base_url}/v1/completions", json=payload)
+    dur_s = time.perf_counter() - t0
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"vLLM completion failed (status={resp.status_code}) at {base_url}: {resp.text}"
+        )
+
+    data = resp.json()
+    choices = data.get("choices") or []
+    first_choice = choices[0] if choices else {}
+    out_text = str(first_choice.get("text", ""))
+    usage = data.get("usage") or {}
+    if usage.get("completion_tokens") is not None:
+        out_tokens = int(usage["completion_tokens"])
+    else:
+        logprobs_tokens = (first_choice.get("logprobs") or {}).get("tokens")
+        if isinstance(logprobs_tokens, list) and logprobs_tokens:
+            out_tokens = len(logprobs_tokens)
+        elif out_text.strip():
+            out_tokens = len(out_text.split())
+        else:
+            out_tokens = token_budget
+    return out_text, out_tokens, dur_s
+
+
+async def _run_vllm_batch(
+    policy: str,
+    scheduler: Any,
+    batch: list[dict[str, Any]],
+    hetero: HeterogeneousRolloutConfig,
+    *,
+    batch_idx: int,
+    vllm_model: str,
+    tokenizer: Any,
+    eff_concurrency: int,
+    max_tp: int,
+    ctrl_latencies_us: list[float],
+    tp_dist: dict[int, int],
+) -> tuple[float, int, float, int, int, int]:
+    """Execute one batch against live vLLM HTTP servers and measure wall-clock makespan."""
+    import httpx
+
+    base_urls = [f"http://{inst.host}:{inst.port}" for inst in hetero.instances]
+    use_trust_env = not all(
+        inst.host in ("127.0.0.1", "localhost", "::1") for inst in hetero.instances
+    )
+    sem = asyncio.Semaphore(max(1, eff_concurrency))
+    timeout = httpx.Timeout(connect=30.0, read=1800.0, write=30.0, pool=30.0)
+    deferred_completions: list[tuple[str, dict[str, Any], int, str, int]] = []
+
+    async with httpx.AsyncClient(timeout=timeout, trust_env=use_trust_env) as client:
+        async def _run_one(seq_i: int, req: dict[str, Any]) -> tuple[int, bool, int, float, int]:
+            async with sem:
+                t0 = time.perf_counter_ns()
+                req_id, cur_idx, cur_bucket, reserved_tokens, mig_count = _schedule_turn0_request(
+                    policy, scheduler, req
+                )
+                ctrl_latencies_us.append((time.perf_counter_ns() - t0) / 1000.0)
+                if cur_idx < 0:
+                    raise RuntimeError(
+                        f"Scheduler {policy!r} returned invalid instance_index={cur_idx} "
+                        f"for {req['request_id']}"
+                    )
+
+                gen_tokens = 0
+                mig_wall_s = 0.0
+                try:
+                    session_tag = f"[session={policy}_b{batch_idx}_r{seq_i}_{req['request_id']}] "
+                    cur_prompt = _build_padded_text(
+                        req["input_tokens"],
+                        header=session_tag,
+                        tokenizer=tokenizer,
+                    )
+                    tool_returns = req["tool_returns"]
+                    first_end = (
+                        tool_returns[0]["token_position"]
+                        if tool_returns
+                        else req["total_output_tokens"]
+                    )
+                    if first_end > 0:
+                        out_text, out_tok, _ = await _vllm_complete(
+                            client,
+                            base_urls[cur_idx],
+                            vllm_model,
+                            cur_prompt,
+                            first_end,
+                        )
+                        cur_prompt += out_text
+                        gen_tokens += out_tok
+
+                    for turn_idx, tr in enumerate(tool_returns):
+                        pos = tr["token_position"]
+                        next_pos = (
+                            tool_returns[turn_idx + 1]["token_position"]
+                            if turn_idx + 1 < len(tool_returns)
+                            else req["total_output_tokens"]
+                        )
+                        seg_gen = max(0, next_pos - pos)
+                        payload_tokens = _tool_payload_tokens(tr)
+                        old_idx = cur_idx
+                        new_idx = old_idx
+                        new_bucket = cur_bucket
+
+                        if policy not in _STATIC_POLICIES:
+                            t0 = time.perf_counter_ns()
+                            new_idx, new_bucket, reserved_tokens = _apply_dynamic_turn_hook(
+                                policy,
+                                scheduler,
+                                req_id,
+                                req,
+                                tr,
+                                pos,
+                                old_idx,
+                                cur_bucket,
+                                reserved_tokens,
+                            )
+                            ctrl_latencies_us.append((time.perf_counter_ns() - t0) / 1000.0)
+
+                        if payload_tokens > 0:
+                            tool_header = (
+                                f"[tool={tr.get('tool_type', 'tool')} "
+                                f"status={tr.get('status', 'ok')}] "
+                            )
+                            tool_text = _build_padded_text(
+                                payload_tokens,
+                                header=tool_header,
+                                tokenizer=tokenizer,
+                            )
+                            cur_prompt += f"\n{tool_text}\n"
+
+                        migrated = new_idx != old_idx
+                        if migrated:
+                            mig_count += 1
+                            cur_idx = new_idx
+                        cur_bucket = new_bucket
+
+                        if seg_gen > 0:
+                            turn_text, turn_tok, turn_dur_s = await _vllm_complete(
+                                client,
+                                base_urls[cur_idx],
+                                vllm_model,
+                                cur_prompt,
+                                seg_gen,
+                            )
+                            cur_prompt += turn_text
+                            gen_tokens += turn_tok
+                            if migrated:
+                                mig_wall_s += turn_dur_s
+                finally:
+                    if policy in ("cmlfq", "cmlfq_cost"):
+                        deferred_completions.append(
+                            (req_id, req, cur_idx, cur_bucket, reserved_tokens)
+                        )
+                    else:
+                        _complete_trajectory(
+                            policy,
+                            scheduler,
+                            req_id,
+                            req,
+                            cur_idx,
+                            cur_bucket,
+                            reserved_tokens,
+                        )
+
+                final_tp = hetero.instances[cur_idx].tp
+                return final_tp, req["archetype"] == "long", mig_count, mig_wall_s, gen_tokens
+
+        t_batch_start = time.perf_counter()
+        try:
+            ep_outputs = await asyncio.gather(*(_run_one(i, r) for i, r in enumerate(batch)))
+            batch_makespan_s = time.perf_counter() - t_batch_start
+        finally:
+            for comp_req_id, comp_req, comp_idx, comp_bucket, comp_reserved in deferred_completions:
+                _complete_trajectory(
+                    policy,
+                    scheduler,
+                    comp_req_id,
+                    comp_req,
+                    comp_idx,
+                    comp_bucket,
+                    comp_reserved,
+                )
+
+    batch_migrations = 0
+    batch_mig_overhead_s = 0.0
+    total_gen_tokens = 0
+    long_total = 0
+    long_on_max_tp = 0
+    for final_tp, is_long, migs, mig_s, gen_tok in ep_outputs:
+        tp_dist[final_tp] = tp_dist.get(final_tp, 0) + 1
+        if is_long:
+            long_total += 1
+            if final_tp == max_tp:
+                long_on_max_tp += 1
+        batch_migrations += migs
+        batch_mig_overhead_s += mig_s
+        total_gen_tokens += gen_tok
+
+    return (
+        batch_makespan_s,
+        batch_migrations,
+        batch_mig_overhead_s,
+        total_gen_tokens,
+        long_total,
+        long_on_max_tp,
+    )
+
+
+def _run_coro_sync(coro: Any) -> Any:
+    """Execute an async coroutine cleanly whether or not a loop is already running."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
 def replay_policy(
@@ -795,15 +1431,43 @@ def replay_policy(
     kv_backend: str = "recompute",
     cost_profile: Path | str | None = None,
     max_seq_length: int = 32768,
+    eval_mode: str = "analytic",
+    vllm_endpoints: str | Sequence[str | tuple[str, int]] | None = None,
+    vllm_host: str = "127.0.0.1",
+    vllm_base_port: int = 8000,
+    vllm_model: str = "Qwen/Qwen3-14B",
+    vllm_tokenizer: Any = None,
+    vllm_concurrency: int = 0,
 ) -> PolicyReplayResult:
-    """Replay traces through a real Libra scheduler and score with ``RolloutCostModel``."""
+    """Replay traces through a real Libra scheduler using analytic or live vLLM scoring."""
+    if eval_mode not in SUPPORTED_EVAL_MODES:
+        raise ValueError(
+            f"Unsupported eval_mode {eval_mode!r}; choose from {SUPPORTED_EVAL_MODES}"
+        )
+
+    resolved_endpoints = (
+        parse_vllm_endpoints(
+            vllm_endpoints,
+            tp_layout,
+            host=vllm_host,
+            base_port=vllm_base_port,
+        )
+        if eval_mode == "vllm" or vllm_endpoints is not None
+        else None
+    )
+
     resolved_profile = (
         cost_profile
         if cost_profile is not None
         else (DEFAULT_COST_PROFILE if DEFAULT_COST_PROFILE.exists() else None)
     )
     factory_key, hetero = build_hetero_config(
-        policy, tp_layout, hardware, kv_backend, cost_profile=resolved_profile
+        policy,
+        tp_layout,
+        hardware,
+        kv_backend,
+        cost_profile=resolved_profile,
+        endpoints=resolved_endpoints,
     )
     cost_model = CostModel(
         hardware=hardware,
@@ -839,13 +1503,52 @@ def replay_policy(
     total_makespan_s = 0.0
     total_migrations = 0
     total_migration_overhead_s = 0.0
+    total_gen_tokens = 0
     oom_count = 0
     long_total = 0
     long_on_max_tp = 0
 
+    tokenizer = _resolve_tokenizer(vllm_tokenizer) if eval_mode == "vllm" else None
     effective_batch = max(1, batch_size)
-    for batch_start in range(0, len(eval_traces), effective_batch):
+    for batch_idx, batch_start in enumerate(range(0, len(eval_traces), effective_batch)):
         batch = eval_traces[batch_start : batch_start + effective_batch]
+        if eval_mode == "vllm":
+            if vllm_concurrency > 0:
+                eff_conc = vllm_concurrency
+            elif policy in _STATIC_POLICIES:
+                eff_conc = concurrency if concurrency > 0 else len(batch)
+            else:
+                eff_conc = len(batch)
+            (
+                batch_makespan,
+                b_mig,
+                b_mig_s,
+                b_gen_tok,
+                b_long_tot,
+                b_long_max,
+            ) = _run_coro_sync(
+                _run_vllm_batch(
+                    policy,
+                    scheduler,
+                    batch,
+                    hetero,
+                    batch_idx=batch_idx,
+                    vllm_model=vllm_model,
+                    tokenizer=tokenizer,
+                    eff_concurrency=eff_conc,
+                    max_tp=max_tp,
+                    ctrl_latencies_us=ctrl_latencies_us,
+                    tp_dist=tp_dist,
+                )
+            )
+            total_migrations += b_mig
+            total_migration_overhead_s += b_mig_s
+            total_gen_tokens += b_gen_tok
+            long_total += b_long_tot
+            long_on_max_tp += b_long_max
+            total_makespan_s += batch_makespan
+            continue
+
         if policy in _STATIC_POLICIES:
             (
                 instance_segments,
@@ -902,12 +1605,19 @@ def replay_policy(
         total_makespan_s += batch_makespan
 
     long_rate = (long_on_max_tp / long_total) if long_total > 0 else 0.0
+    rounded_makespan = round(total_makespan_s, 3)
+    is_vllm = eval_mode == "vllm"
+    throughput = (
+        round(total_gen_tokens / total_makespan_s, 2)
+        if is_vllm and total_makespan_s > 0
+        else (0.0 if is_vllm else None)
+    )
     return PolicyReplayResult(
         policy=policy,
         kv_backend=kv_backend,
         eval_trajectories=len(eval_traces),
         warmup_trajectories=warmup_count,
-        analytic_makespan_s=round(total_makespan_s, 3),
+        analytic_makespan_s=rounded_makespan,
         speedup_vs_round_robin=1.0,
         long_tail_high_tp_rate=round(long_rate, 4),
         migrations=total_migrations,
@@ -916,6 +1626,10 @@ def replay_policy(
         ctrl_avg_us=round(mean(ctrl_latencies_us), 2) if ctrl_latencies_us else 0.0,
         ctrl_p99_us=round(_percentile(ctrl_latencies_us, 99.0), 2),
         tp_distribution=tp_dist,
+        evaluation_mode="live_vllm_gpu_replay" if is_vllm else "analytic_cost_model_replay",
+        wall_makespan_s=rounded_makespan if is_vllm else None,
+        total_generated_tokens=total_gen_tokens,
+        throughput_tok_per_s=throughput,
     )
 
 
@@ -1057,6 +1771,9 @@ def format_markdown_report(
     concurrency: int = 12,
     online_only: bool = False,
     cost_profile: Path | str | None = None,
+    eval_mode: str = "analytic",
+    vllm_model: str | None = None,
+    vllm_concurrency: int = 0,
 ) -> str:
     """Format replay and GRP offline benchmark results as Markdown tables."""
     unique_tps = sorted(set(tp_layout))
@@ -1069,27 +1786,80 @@ def format_markdown_report(
         else f"`{warmup_n}` warmup + `{eval_n}` unseen eval"
     )
     profile_desc = Path(cost_profile).name if cost_profile else "analytic_rollout_model"
+    is_vllm = eval_mode == "vllm"
+
+    if is_vllm:
+        title = "# Libra Tier 1 — Live vLLM Real-GPU Scheduling Replay & GRP Benchmark"
+        eval_desc = (
+            "`live_vllm_gpu_replay` (real vLLM engines + physical GPUs; "
+            "zero `RolloutCostModel` simulator in evaluation)"
+        )
+        conc_desc = (
+            f"vLLM concurrency={vllm_concurrency}"
+            if vllm_concurrency > 0
+            else f"static bounded concurrency={concurrency}, dynamic full-batch concurrency"
+        )
+        sched_line = (
+            f"- **Scheduling Setup**: {conc_desc}; `vllm_model={vllm_model}`; "
+            f"`length_aware` prompt cutoffs `(1550/1950/2400)`; "
+            f"MLFQ output buckets `short<=4000 / medium<=10000 / long<=32768`; "
+            f"`cmlfq_cost` profile=`{profile_desc}`"
+        )
+        table_header = (
+            f"| Policy | KV Backend | Makespan (s, Real-GPU Wall) | Speedup vs RR | "
+            f"Throughput (tok/s) | Long-Tail Max-TP Rate | Final TP Dist ({tp_header}) | "
+            f"Migrations | Mig Cost (s) | Ctrl Avg/P99 (us) |"
+        )
+        table_sep = "| :--- | :--- | ---: | ---: | ---: | ---: | :---: | ---: | ---: | ---: |"
+    else:
+        title = "# Libra Tier 1 — 0-GPU Scheduling Replay & GRP Offline Benchmark"
+        eval_desc = (
+            "`analytic_cost_model_replay` (water-filling continuous-batching "
+            "`RolloutCostModel`; zero GPU compute)"
+        )
+        sched_line = (
+            f"- **Scheduling Setup**: static bounded in-flight `concurrency={concurrency}`; "
+            f"`length_aware` prompt cutoffs `(1550/1950/2400)`; "
+            f"MLFQ output buckets `short<=4000 / medium<=10000 / long<=32768`; "
+            f"`cmlfq_cost` profile=`{profile_desc}`"
+        )
+        table_header = (
+            f"| Policy | KV Backend | Makespan (s, Analytic) | Speedup vs RR | "
+            f"Long-Tail Max-TP Rate | Final TP Dist ({tp_header}) | "
+            f"Migrations | Mig Cost (s) | Ctrl Avg/P99 (us) |"
+        )
+        table_sep = "| :--- | :--- | ---: | ---: | ---: | :---: | ---: | ---: | ---: |"
 
     lines = [
-        "# Libra Tier 1 — 0-GPU Scheduling Replay & GRP Offline Benchmark",
+        title,
         "",
         "## Experimental Setup",
         "",
-        f"- **Evaluation Mode**: `analytic_cost_model_replay` (water-filling continuous-batching `RolloutCostModel`; zero GPU compute)",
-        f"- **Workload Trace**: `{trace_path.name}` ({split_desc}; prompt tokens `980–2291`)",
+        f"- **Evaluation Mode**: {eval_desc}",
+        f"- **Workload Trace**: `{trace_path.name}` ({split_desc}; prompt tokens `1050–2230`)",
         f"- **Rollout Cluster Layout**: `TP={tp_layout}` (`{sum(tp_layout)} GPUs` across `{len(tp_layout)}` instances, `max_batch_per_tp=4`)",
         f"- **Hardware & Model**: hardware=`{hardware_path.name}`, model=`{model_arch_path.name}`",
-        f"- **Scheduling Setup**: static bounded in-flight `concurrency={concurrency}`; `length_aware` prompt cutoffs `(1550/1950/2400)`; MLFQ output buckets `short<=4000 / medium<=10000 / long<=32768`; `cmlfq_cost` profile=`{profile_desc}`",
+        sched_line,
         "",
         "## 1. Rollout Scheduling Policy Comparison",
         "",
-        f"| Policy | KV Backend | Makespan (s, Analytic) | Speedup vs RR | Long-Tail Max-TP Rate | Final TP Dist ({tp_header}) | Migrations | Mig Cost (s) | Ctrl Avg/P99 (us) |",
-        "| :--- | :--- | ---: | ---: | ---: | :---: | ---: | ---: | ---: |",
+        table_header,
+        table_sep,
     ]
     for r in results:
+        makespan = (
+            r.wall_makespan_s
+            if is_vllm and r.wall_makespan_s is not None
+            else r.analytic_makespan_s
+        )
+        tput_col = (
+            f" {r.throughput_tok_per_s:.1f} |"
+            if is_vllm and r.throughput_tok_per_s is not None
+            else (" — |" if is_vllm else "")
+        )
         lines.append(
-            f"| `{r.policy}` | `{r.kv_backend}` | {r.analytic_makespan_s:.3f} | "
-            f"{r.speedup_vs_round_robin:.2f}x | {r.long_tail_high_tp_rate * 100:.1f}% | "
+            f"| `{r.policy}` | `{r.kv_backend}` | {makespan:.3f} | "
+            f"{r.speedup_vs_round_robin:.2f}x |{tput_col} {r.long_tail_high_tp_rate * 100:.1f}% | "
             f"`{_format_tp_dist(r.tp_distribution, unique_tps)}` | "
             f"{r.migrations} | {r.migration_overhead_s:.3f} | "
             f"{r.ctrl_avg_us:.1f} / {r.ctrl_p99_us:.1f} |"
@@ -1127,7 +1897,13 @@ def format_markdown_report(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Libra Tier 1 (0-GPU) heterogeneous scheduling replay and GRP benchmark"
+        description="Libra Tier 1 heterogeneous scheduling replay (0-GPU analytic or live vLLM real-GPU)"
+    )
+    parser.add_argument(
+        "--eval-mode",
+        default="analytic",
+        choices=list(SUPPORTED_EVAL_MODES),
+        help="Evaluation pathway: 'analytic' (0-GPU CostModel) or 'vllm' (real-GPU live vLLM judge)",
     )
     parser.add_argument(
         "--trace",
@@ -1201,6 +1977,66 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Measured decode_ms/migrations JSON profile for cmlfq_cost (default: sample_traces/r2e_cost_profile.json)",
     )
     parser.add_argument(
+        "--vllm-endpoints",
+        default=None,
+        help="Comma-separated host:port endpoints for existing vLLM servers matching --tp-layout",
+    )
+    parser.add_argument(
+        "--vllm-host",
+        default="127.0.0.1",
+        help="Host for live vLLM servers when --vllm-endpoints is omitted (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--vllm-base-port",
+        type=int,
+        default=8000,
+        help="Starting port for live vLLM servers when --vllm-endpoints is omitted (default: 8000)",
+    )
+    parser.add_argument(
+        "--vllm-model",
+        default="Qwen/Qwen3-14B",
+        help="Model ID/path sent to vLLM /v1/completions (default: Qwen/Qwen3-14B)",
+    )
+    parser.add_argument(
+        "--vllm-tokenizer",
+        default=None,
+        help="Optional HF tokenizer path/name for exact token-ID padding in vLLM mode",
+    )
+    parser.add_argument(
+        "--vllm-concurrency",
+        type=int,
+        default=0,
+        help="Max concurrent requests in vLLM mode (0 = --concurrency for static, full batch for dynamic)",
+    )
+    parser.add_argument(
+        "--launch-vllm",
+        action="store_true",
+        help="Auto-launch local heterogeneous vLLM servers for --tp-layout (requires --eval-mode vllm)",
+    )
+    parser.add_argument(
+        "--vllm-gpus",
+        default=None,
+        help="Comma-separated GPU IDs for --launch-vllm (default: 0..sum(tp_layout)-1)",
+    )
+    parser.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=32768,
+        help="Max sequence length for --launch-vllm servers (default: 32768)",
+    )
+    parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=0.85,
+        help="GPU memory utilization for --launch-vllm servers (default: 0.85)",
+    )
+    parser.add_argument(
+        "--vllm-max-num-seqs",
+        type=int,
+        default=32,
+        help="Max concurrent sequences per --launch-vllm server (default: 32)",
+    )
+    parser.add_argument(
         "--skip-grp",
         action="store_true",
         help="Skip GlobalResourcePlanner offline benchmark",
@@ -1217,16 +2053,55 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.launch_vllm and args.eval_mode != "vllm":
+        parser.error("--launch-vllm requires --eval-mode vllm")
 
     tp_layout = parse_tp_layout(args.tp_layout)
     traces = load_trace(args.trace)
     hardware = HardwareConfig.from_file(str(args.hardware))
     model_arch = ModelArchConfig.from_file(str(args.model_arch))
+    tokenizer = _resolve_tokenizer(args.vllm_tokenizer) if args.eval_mode == "vllm" else None
 
-    results: list[PolicyReplayResult] = []
-    for policy in args.policies:
-        results.append(
-            replay_policy(
+    vllm_log_dir = (
+        args.output.parent / "vllm_logs"
+        if args.output is not None
+        else REPO_ROOT / "logs/tier1_vllm"
+    )
+    cluster_cm = (
+        VLLMServerCluster(
+            tp_layout,
+            args.vllm_model,
+            gpus_raw=args.vllm_gpus,
+            host=args.vllm_host,
+            base_port=args.vllm_base_port,
+            max_model_len=args.vllm_max_model_len,
+            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            max_num_seqs=args.vllm_max_num_seqs,
+            log_dir=vllm_log_dir,
+        )
+        if args.launch_vllm
+        else contextlib.nullcontext(None)
+    )
+
+    with cluster_cm as cluster:
+        resolved_endpoints = (
+            cluster.endpoints
+            if cluster is not None
+            else (
+                parse_vllm_endpoints(
+                    args.vllm_endpoints,
+                    tp_layout,
+                    host=args.vllm_host,
+                    base_port=args.vllm_base_port,
+                )
+                if args.eval_mode == "vllm"
+                else None
+            )
+        )
+
+        results: list[PolicyReplayResult] = []
+        for policy in args.policies:
+            res = replay_policy(
                 policy=policy,
                 traces=traces,
                 tp_layout=tp_layout,
@@ -1238,8 +2113,23 @@ def main(argv: list[str] | None = None) -> int:
                 online_only=args.online_only,
                 kv_backend=args.kv_backend,
                 cost_profile=args.cost_profile,
+                eval_mode=args.eval_mode,
+                vllm_endpoints=resolved_endpoints,
+                vllm_host=args.vllm_host,
+                vllm_base_port=args.vllm_base_port,
+                vllm_model=args.vllm_model,
+                vllm_tokenizer=tokenizer,
+                vllm_concurrency=args.vllm_concurrency,
             )
-        )
+            results.append(res)
+            if args.eval_mode == "vllm":
+                print(
+                    f"[vllm-replay] policy={res.policy} wall_makespan_s={res.wall_makespan_s:.3f} "
+                    f"tput_tok_s={res.throughput_tok_per_s:.1f} migrations={res.migrations} "
+                    f"tp_dist={res.tp_distribution}",
+                    file=sys.stderr,
+                    flush=True,
+                )
     _populate_speedups(results)
 
     grp_result = (
@@ -1265,12 +2155,18 @@ def main(argv: list[str] | None = None) -> int:
             concurrency=args.concurrency,
             online_only=args.online_only,
             cost_profile=args.cost_profile,
+            eval_mode=args.eval_mode,
+            vllm_model=args.vllm_model,
+            vllm_concurrency=args.vllm_concurrency,
         )
     )
 
     if args.output is not None:
+        eval_mode_label = (
+            "live_vllm_gpu_replay" if args.eval_mode == "vllm" else "analytic_cost_model_replay"
+        )
         payload = {
-            "evaluation_mode": "analytic_cost_model_replay",
+            "evaluation_mode": eval_mode_label,
             "trace_path": str(args.trace),
             "tp_layout": tp_layout,
             "concurrency": args.concurrency,
@@ -1278,6 +2174,12 @@ def main(argv: list[str] | None = None) -> int:
             "cost_profile": str(args.cost_profile) if args.cost_profile else None,
             "hardware_config": str(args.hardware),
             "model_arch_config": str(args.model_arch),
+            "vllm_model": args.vllm_model if args.eval_mode == "vllm" else None,
+            "vllm_endpoints": (
+                [f"{h}:{p}" for h, p in resolved_endpoints]
+                if resolved_endpoints is not None
+                else None
+            ),
             "scheduling_results": [asdict(r) for r in results],
             "grp_offline": grp_result,
         }
