@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from RL_Framework.config import AsyncRLConfig
+from RL_Framework.config import AsyncRLConfig, validate_grpo_objective
 from RL_Framework.engine.megatron_core_train_engine import MegatronCoreTrainEngine
 from RL_Framework.engine.megatron_train_engine import Megatron3DTrainEngine
 from RL_Framework.engine.train_engine import FSDPTrainEngine, TrainEngine
@@ -10,6 +10,7 @@ from RL_Framework.engine.train_engine import FSDPTrainEngine, TrainEngine
 
 def create_train_engine(config: AsyncRLConfig) -> TrainEngine:
     """Create train engine."""
+    validate_grpo_objective(config)
     backend = getattr(config, "train_backend", "fsdp")
 
     if backend == "fsdp":
@@ -39,8 +40,14 @@ def create_train_engine(config: AsyncRLConfig) -> TrainEngine:
         )
 
     if backend == "megatron_core":
-        return MegatronCoreTrainEngine(
+        engine_type = MegatronCoreTrainEngine
+        if getattr(config, "megatron_model_family", "default") == "deepseek_v4":
+            from RL_Framework.engine.deepseek_v4_train_engine import DeepSeekV4TrainEngine
+
+            engine_type = DeepSeekV4TrainEngine
+        return engine_type(
             model_path=config.model_path,
+            grpo_objective=getattr(config, "grpo_objective", "legacy"),
             learning_rate=config.learning_rate,
             kl_coef=config.kl_coef,
             clip_epsilon=config.clip_epsilon,

@@ -245,6 +245,9 @@ class ProfilingConfig:
 
     train_workspace_bytes: float = 0.5e9  # 500MB
 
+    # Offline backend calibration, shared by GRP, CMLFQ and EHP.
+    calibration: dict = field(default_factory=dict)
+
     @classmethod
     def from_dict(cls, d: dict) -> "ProfilingConfig":
         """Build an instance from a dictionary."""
@@ -280,7 +283,7 @@ class HeterogeneousInstanceConfig:
 class SchedulingConfig:
     """Scheduling config implementation."""
 
-    scheduler_type: str = "length_aware"  # length_aware / la_mlfq / cmlfq / cmlfq_cost / load_balance
+    scheduler_type: str = "length_aware"  # length_aware / la_mlfq / cmlfq / cmlfq_cost / cmlfq_cost_kv_dynamic / load_balance
 
 
 
@@ -589,6 +592,7 @@ class GlobalResourcePlannerConfig:
     runtime_rollout_log_dir: str = ""
     runtime_rollout_manifest_path: str = ""
     runtime_rollout_pid_registry_path: str = ""
+    runtime_reconfiguration_coord_dir: str = ""
     runtime_wait_rollout_process_start_ready: bool = False
     runtime_post_rollout_stop_grace_s: float = 0.0
     runtime_reconfigure_training: bool = False
@@ -615,6 +619,7 @@ class GlobalResourcePlannerConfig:
     hybrid_worker_command_template: str = ""
     hybrid_worker_task_dir: str = "./logs/elastic_training_tasks"
     hybrid_worker_ready_timeout_s: float = 60.0
+    hybrid_worker_stop_timeout_s: float = 60.0
     hybrid_worker_remote_control_enabled: bool = False
     hybrid_worker_remote_control_dir: str = ""
     elastic_hybrid_planning_enabled: bool = False
@@ -652,6 +657,38 @@ class GlobalResourcePlannerConfig:
         return _from_dict(cls, d)
 
 
+def validate_grpo_objective(config) -> None:
+    """Validate the opt-in probability contract before allocating workers."""
+    objective = getattr(config, "grpo_objective", "legacy")
+    if objective not in {"legacy", "decoupled"}:
+        raise ValueError("grpo_objective must be 'legacy' or 'decoupled'")
+    if objective == "legacy":
+        return
+    if config.train_backend != "megatron_core":
+        raise ValueError("decoupled GRPO requires train_backend='megatron_core'")
+    if not config.recompute_logprobs:
+        raise ValueError("decoupled GRPO requires recompute_logprobs=True")
+    if config.rollout_backend != "vllm":
+        raise ValueError("decoupled GRPO requires actual vLLM behavior probabilities")
+    if config.weight_sync_mode != "nccl" or config.rollout_weight_sync_mode != "nccl":
+        raise ValueError(
+            "decoupled GRPO currently requires weight_sync_mode='nccl' and "
+            "rollout_weight_sync_mode='nccl'; checkpoint publication is not supported"
+        )
+    scheduling = config.heterogeneous_rollout.scheduling
+    if scheduling.cmlfq_kv_backend != "recompute":
+        raise ValueError("decoupled GRPO requires cmlfq_kv_backend='recompute' until versioned KV migration is available")
+    planner = getattr(config, "global_resource_planner", None)
+    hybrid_enabled = any(getattr(planner, field, False) for field in (
+        "hybrid_worker_launch_enabled", "elastic_hybrid_planning_enabled",
+        "hybrid_training_prewarm_enabled",
+    ))
+    if config.ppo_epochs != 1:
+        raise ValueError("decoupled GRPO requires ppo_epochs=1")
+    if hybrid_enabled and planner.hybrid_worker_mode != "megatron_core":
+        raise ValueError("decoupled GRPO requires hybrid_worker_mode='megatron_core'")
+
+
 @dataclass
 class AsyncRLConfig:
     """Async r l config implementation."""
@@ -678,6 +715,7 @@ class AsyncRLConfig:
     virtual_pipeline_model_parallel_size: int = 0
     sequence_parallel: bool = True
     use_distributed_optimizer: bool = True
+    megatron_model_family: str = "default"  # default | deepseek_v4
     megatron_grad_reduce_in_fp32: bool = False
     megatron_use_precision_aware_optimizer: bool = False
     megatron_optimizer_cpu_offload: bool = False
@@ -701,6 +739,7 @@ class AsyncRLConfig:
     rollout_sync_drain_lead_steps: int = 2
 
 
+    grpo_objective: str = "legacy"  # legacy | decoupled
     recompute_logprobs: bool = True
     # Recompute can use a smaller temporary batch than the training update.
     # This preserves the requested training micro-batch while bounding logits.
@@ -800,6 +839,30 @@ class AsyncRLConfig:
         default_factory=GlobalResourcePlannerConfig
     )
 
+    def _validate_deepseek_v4_training(self) -> None:
+        if self.train_backend != "megatron_core" or not self.megatron_use_transformer_engine:
+            raise ValueError("DeepSeek V4 requires Megatron-Core with Transformer Engine")
+        if (self.train_tp_size, self.expert_tensor_parallel_size) != (1, 1):
+            raise ValueError("The CUDA DeepSeek V4 provider requires TP=ETP=1")
+        if self.train_cp_size < 1:
+            raise ValueError("DeepSeek V4 requires a positive CP size")
+        if self.train_pp_size < 2:
+            raise ValueError("The CUDA DeepSeek V4 training path requires PP >= 2")
+        if self.train_dp_size < 1 or self.n_samples < 1:
+            raise ValueError("DeepSeek V4 requires positive DP size and GRPO group size")
+        if self.batch_size % (self.train_dp_size * self.n_samples):
+            raise ValueError("DeepSeek V4 requires an equal number of complete GRPO groups per DP rank")
+        local_batch = self.batch_size // self.train_dp_size
+        if self.recompute_micro_batch_size < 1 or local_batch % self.recompute_micro_batch_size:
+            raise ValueError("DeepSeek V4 requires complete recompute microbatches")
+        if self.rollout_weight_sync_mode != "none" or self.require_rollout_weight_sync:
+            raise ValueError("DeepSeek V4 rollout weight publication has not been validated")
+        if self.megatron_streaming_export:
+            raise ValueError("Set megatron_streaming_export=false for DeepSeek V4 training checkpoints")
+        planner = self.global_resource_planner
+        if planner.enabled:
+            raise ValueError("DeepSeek V4 requires a static training topology until GRP/EHP validation")
+
     def __post_init__(self):
         """Post init."""
         if not self.tokenizer_path:
@@ -825,10 +888,15 @@ class AsyncRLConfig:
                     f"train_gpus={self.train_gpus}, model_parallel={denom}"
                 )
             self.train_dp_size = self.train_gpus // denom
+        if self.megatron_model_family not in {"default", "deepseek_v4"}:
+            raise ValueError("Unknown megatron_model_family")
+        if self.megatron_model_family == "deepseek_v4":
+            self._validate_deepseek_v4_training()
         if self.train_backend not in ["fsdp", "megatron3d", "megatron_core"]:
             raise ValueError(
                 "train_backend must be 'fsdp', 'megatron3d', or 'megatron_core'"
             )
+        validate_grpo_objective(self)
 
 
         if self.train_gpus <= 0:
@@ -912,7 +980,7 @@ class AsyncRLConfig:
                     "megatron_optimizer_offload_fraction requires "
                     "megatron_optimizer_cpu_offload=true"
                 )
-            if self.train_pp_size != 1:
+            if self.train_pp_size != 1 and self.megatron_model_family != "deepseek_v4":
                 raise ValueError(
                     "MegatronCoreTrainEngine currently requires train_pp_size=1"
                 )
@@ -927,10 +995,17 @@ class AsyncRLConfig:
                     "expert_tensor_parallel_size must divide train_tp_size: "
                     f"{self.expert_tensor_parallel_size} vs {self.train_tp_size}"
                 )
-            if self.train_dp_size % self.train_ep_size != 0:
+            # Megatron's V4 expert rank generator consumes the dense DP×CP
+            # slots and keeps the same pipeline groups.
+            expert_slots = self.train_dp_size
+            expert_axis = "train_dp_size"
+            if self.megatron_model_family == "deepseek_v4":
+                expert_slots *= self.train_cp_size
+                expert_axis = "DP × CP"
+            if expert_slots % self.train_ep_size != 0:
                 raise ValueError(
-                    "train_ep_size must divide train_dp_size: "
-                    f"{self.train_ep_size} vs {self.train_dp_size}"
+                    f"train_ep_size must divide {expert_axis}: "
+                    f"{self.train_ep_size} vs {expert_slots}"
                 )
             if self.model_arch.num_experts > 1:
                 if self.model_arch.num_experts % self.train_ep_size != 0:

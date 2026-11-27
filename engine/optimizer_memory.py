@@ -1,6 +1,7 @@
 """Bound temporary storage in the native PyTorch Adam fallback."""
 
 from functools import wraps
+import math
 
 import torch
 from torch.optim import optimizer as optimizer_module
@@ -81,7 +82,7 @@ def _stream_main_gradient_step(optimizer):
 
 
 def _install_mcore_bf16_streaming(root, wrappers):
-    """Defer MCore's FP32 copies, only with its exact local norm/scale backend."""
+    """Guard existing BF16 norms and defer copies with the exact local backend."""
     try:
         from megatron.core import utils
         from megatron.core.optimizer import clip_grads
@@ -89,19 +90,17 @@ def _install_mcore_bf16_streaming(root, wrappers):
         from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
     except ImportError:
         return
-    if not (
+    local_backend = (
         clip_grads.multi_tensor_applier is utils.local_multi_tensor_applier
         and clip_grads.l2_norm_impl is utils.local_multi_tensor_l2_norm
         and clip_grads.multi_tensor_scale_impl is utils.local_multi_tensor_scale
-    ):
-        return
+    )
 
-    def eligible(wrapper):
+    def supported(wrapper):
         config = getattr(wrapper, 'config', None)
         return (
             type(wrapper) is DistributedOptimizer
             and type(wrapper.optimizer) in (torch.optim.Adam, torch.optim.AdamW)
-            and _native_streaming_eligible(wrapper.optimizer)
             and bool(getattr(config, 'bf16', False))
             and getattr(wrapper, 'grad_scaler', None) is None
             and not getattr(config, 'log_num_zeros_in_grad', False)
@@ -109,28 +108,58 @@ def _install_mcore_bf16_streaming(root, wrappers):
             and not getattr(config, 'use_precision_aware_optimizer', False)
             and not getattr(config, 'use_precision_aware_optimizer_no_fp8_or_ds_fp8', False)
             and not getattr(config, 'optimizer_cpu_offload', False)
+            and getattr(config, 'clip_grad', 0.) > 0
             and not getattr(getattr(wrapper, 'ddp_config', None), 'use_megatron_fsdp', False)
             and hasattr(wrapper, 'model_float16_groups')
         )
 
+    def eligible(wrapper):
+        return local_backend and supported(wrapper) and _native_streaming_eligible(wrapper.optimizer)
+
+    installed = []
     for wrapper in wrappers:
+        if supported(wrapper) and not getattr(wrapper, '_libra_streamed_bf16_norm', False):
+            _record_gradient_norm(wrapper)
+            # MCore's eager clip method bypasses get_grad_norm. Reuse its same
+            # norm and clip helpers, placing the scalar check between them.
+            original_clip = wrapper.clip_grad_norm
+
+            @wraps(original_clip)
+            def guarded_clip(max_norm, wrapper=wrapper):
+                parameters = wrapper.get_parameters()
+                value = wrapper.get_grad_norm()
+                if parameters:
+                    mcore_optimizer.clip_grad_by_total_norm_fp32(
+                        parameters, max_norm, value,
+                        wrapper.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8)
+                return value
+
+            wrapper.clip_grad_norm = guarded_clip
         if eligible(wrapper) and not getattr(wrapper, '_libra_streamed_bf16_main_gradients', False):
             _install_mcore_bf16_child(wrapper, eligible, clip_grads, mcore_optimizer)
+            installed.append(wrapper)
     # ChainedOptimizer computes a common norm before clipping any child. Keep
     # that original call and its collectives, then share its exact coefficient.
     for wrapper in wrappers:
-        if (any(getattr(child, '_libra_streamed_bf16_main_gradients', False) for child in wrappers)
+        if (any(supported(child) for child in wrappers)
                 and getattr(wrapper, 'chained_optimizers', None) is not None
                 and not getattr(wrapper, '_libra_streamed_bf16_norm', False)):
             _record_gradient_norm(wrapper)
+    if installed:
+        print('MCORE_OPTIMIZER_MEMORY streamed_bf16_main_gradients_enabled '
+              f'children={len(installed)}', flush=True)
 
 
 def _record_gradient_norm(wrapper):
+    if getattr(wrapper, '_libra_streamed_bf16_norm', False):
+        return
     original_norm = wrapper.get_grad_norm
 
     @wraps(original_norm)
     def norm():
         value = original_norm()
+        if not math.isfinite(value):
+            raise FloatingPointError(f'Megatron optimizer has non-finite gradient norm: {value}')
         pending = [wrapper]
         while pending:
             child = pending.pop()
@@ -233,6 +262,8 @@ def bound_default_torch_adam_memory(optimizer, *, release_main_gradients=False) 
     BF16 accumulation, FP32 clipping/Adam arithmetic and checkpoint state stay
     unchanged; existing moments no longer overlap a full FP32 gradient copy
     on the second or subsequent update. Unsupported paths retain eager copy.
+    The supported BF16 path also rejects non-finite existing norms before
+    clipping or Adam, including eager fallback and a chain's common norm.
     """
     pending = [optimizer]
     visited = set()

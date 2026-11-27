@@ -144,12 +144,20 @@ def main() -> int:
     control_dir = Path(args.control_dir)
     control_dir.mkdir(parents=True, exist_ok=True)
     request_path = control_dir / "reload_request.json"
-    try:
-        startup_request = _request_identity(request_path.stat())
-    except FileNotFoundError:
-        startup_request = None
+    while True:
+        try:
+            startup_request = _request_identity(request_path.stat())
+            break
+        except FileNotFoundError:
+            startup_request = None
+            break
+        except OSError:
+            # Retain the original short retry for inaccessible control files,
+            # but never launch without knowing which transaction predates us.
+            time.sleep(max(0.05, args.poll_interval))
     current_version = 0
     current_snapshot = None
+    current_session_id = ''
     process: subprocess.Popen | None = None
 
     def request_shutdown(signum, _frame):
@@ -199,13 +207,22 @@ def main() -> int:
                 # new request file, even if it names the same revision/snapshot.
                 # Capture happened before launch, so requests written while
                 # waiting for the child's health are still consumed normally.
-                if reload_mode == "nccl" and request_identity == startup_request:
+                # Borrowed services also ignore publications to another subset
+                # before changing their local revision or request identity.
+                if reload_mode == "nccl" and (request_identity == startup_request or
+                        args.instance_id not in request.get("nccl_rank_offsets", {})):
+                    time.sleep(max(0.05, args.poll_interval))
+                    continue
+                selected = request.get("instance_ids")
+                if reload_mode == "checkpoint" and selected is not None and args.instance_id not in selected:
                     time.sleep(max(0.05, args.poll_interval))
                     continue
                 requested_snapshot = request.get('snapshot_id')
+                requested_session_id = request.get('nccl_session_id', '') if reload_mode == 'nccl' else ''
                 if (requested_version > current_version or
-                        requested_version == current_version and requested_snapshot
-                        and requested_snapshot != current_snapshot):
+                        requested_version == current_version and (
+                            requested_snapshot and requested_snapshot != current_snapshot
+                            or requested_session_id and requested_session_id != current_session_id)):
                     if reload_mode == "checkpoint" and not Path(checkpoint_path).is_dir():
                         raise FileNotFoundError(checkpoint_path)
                     current_version = requested_version
@@ -234,7 +251,8 @@ def main() -> int:
                                         "chunk_bytes": int(request["nccl_chunk_bytes"]),
                                         **{key: request[key] for key in ('snapshot_id', 'optimizer_revision', 'expected_tensor_count')
                                            if key in request},
-                                        **(dict(session_id=request['nccl_session_id'])
+                                        **(dict(session_id=request['nccl_session_id'],
+                                            expected_service_instance_id=request['expected_service_instance_ids'][args.instance_id])
                                            if request.get('nccl_session_id') else {}),
                                     },
                                     args.ready_timeout,
@@ -290,6 +308,7 @@ def main() -> int:
                         },
                     )
                     current_snapshot = requested_snapshot
+                    current_session_id = requested_session_id
                     print(
                         f"[vllm-reloader] ready version={current_version} "
                         f"method={reload_method} strategy={reload_strategy} "

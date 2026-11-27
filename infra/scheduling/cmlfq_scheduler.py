@@ -47,7 +47,7 @@ class CMLFQRequestState:
     collected_return_states: list[ToolReturnState] = field(default_factory=list)
     generated_tokens: int = 0
     tool_return_token_positions: list[int] = field(default_factory=list)
-    total_output_tokens: int = 0
+    tool_return_generated_positions: list[int | None] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     has_migrated: bool = False
 
@@ -392,7 +392,7 @@ class CMLFQScheduler(BaseScheduler):
             with self._lock:
                 self._decrement_active(handle)
 
-    def finish_request(self, request_id: str, total_output_tokens: int):
+    def finish_request(self, request_id: str, total_output_tokens: int, *, generated_tokens: int | None = None):
         """Finish request."""
         req_state = self._request_states.pop(request_id, None)
         if req_state is None:
@@ -403,19 +403,26 @@ class CMLFQScheduler(BaseScheduler):
             with self._lock:
                 self._decrement_active(handle)
 
-        req_state.total_output_tokens = max(0, total_output_tokens)
         if not req_state.collected_return_states:
             return
 
+        generated_positions = req_state.tool_return_generated_positions
+        pure_output = (generated_tokens is not None
+                       and len(generated_positions) == len(req_state.collected_return_states)
+                       and all(position is not None for position in generated_positions))
+        positions = (req_state.tool_return_generated_positions if pure_output
+                     else req_state.tool_return_token_positions)
+        total_length = max(0, generated_tokens if pure_output else total_output_tokens)
         remaining_lengths = [
-            max(0, total_output_tokens - position)
-            for position in req_state.tool_return_token_positions
+            max(0, total_length - position)
+            for position in positions
         ]
         trajectory = Trajectory(
             prompt_id=req_state.prompt_id,
             return_states=list(req_state.collected_return_states),
             total_remaining_lengths=remaining_lengths,
-            total_length=total_output_tokens,
+            total_length=total_length,
+            remaining_unit="model_generated_tokens" if pure_output else "context_tokens",
         )
         self.prefix_tree.insert(trajectory)
         self._recent_trajectories.append(trajectory)
@@ -563,12 +570,13 @@ class CMLFQScheduler(BaseScheduler):
         self,
         tp_preferences: list[int],
         global_counts: dict[str, int] | None = None,
+        *, eligible=None,
     ) -> Optional[InstanceHandle]:
         """Try select."""
         for tp_degree in tp_preferences:
             candidates = [
                 h for h in self._instances_by_tp.get(tp_degree, [])
-                if h.is_ready
+                if h.is_ready and (eligible is None or eligible(h))
             ]
             if not candidates:
                 continue

@@ -163,6 +163,22 @@ If your platform has a compatible vLLM wheel, you can simplify installation by
 using that wheel instead of a source build. On clusters, install inside the same
 environment that Slurm jobs will activate.
 
+## Qwen3-14B elastic R2E run on 16 GPUs
+
+This example runs 100 updates with the corrected learner and the training settings from job 1938329. A group contains four responses, and each update consumes 96 responses. The Core uses four GPUs with tensor parallelism of four. The other three four-GPU nodes start with the observed rollout layout (one TP4, two TP2 and four TP1 services). The scheduler can lend GPUs to a four-GPU Hybrid replica during training. [Experiment configuration](configs/r2e_qwen3_14b_16gpu.yaml)
+
+Use a shared checkout, a shared GPU Python environment with Megatron-Core and vLLM, and a local copy of Qwen3-14B accessible on all four nodes. Prepare the task index from the directory containing the 13 R2E-Gym V1 Parquet shards. The example uses seed 42 to choose 800 training tasks and a separate held-out cohort. It scores the same 20 held-out tasks before training and every 20 updates. [R2E-Gym V1 dataset](https://huggingface.co/datasets/R2E-Gym/R2E-Gym-V1)
+
+```bash
+python data/prepare_r2e_gym.py /shared/data/R2E-Gym-V1/data
+sbatch scripts/submit_r2e_qwen3_14b_16gpu.slurm \
+  --source "$PWD" --model /shared/models/Qwen3-14B \
+  --tasks /shared/data/R2E-Gym-V1/data/index.jsonl \
+  --run-dir /shared/runs/r2e-14b-001
+```
+
+Use a new run directory visible to every node. It contains `planned.yaml` with the physical layout, `train.log`, and `logs/eval/heldout-step-*.json` with per-task rewards and their mean. The original job used an earlier gradient implementation and its own frozen task split.
+
 ## Testing
 
 Run CPU-friendly tests first:

@@ -30,37 +30,20 @@ def _run_operation(engine, command, trainer=None):
             raise RuntimeError("collective publication requires the live trainer")
         target = dict(command["target"])
         ids = [instance["instance_id"] for instance in target["instances"]]
-        if target.get("scope") == "returned_subset":
-            # An extension rollback only republishes its new incarnations.
-            # Existing Hybrid loans and the full trainer configuration survive.
-            missing = object()
-            previous_targets = getattr(trainer, "_publication_target_ids", missing)
-            previous_pending = getattr(trainer, "_restored_rollouts_pending_publication", missing)
-            trainer._publication_target_ids = set(ids)
-            trainer._restored_rollouts_pending_publication = set(ids)
-            try:
-                from .rollout_lifecycle import publish_with_consensus
-                revision = int(engine.optimizer_revision)
-                publish_with_consensus(trainer, revision)
-            finally:
-                for name, previous in (
-                    ("_publication_target_ids", previous_targets),
-                    ("_restored_rollouts_pending_publication", previous_pending),
-                ):
-                    if previous is missing:
-                        delattr(trainer, name)
-                    else:
-                        setattr(trainer, name, previous)
-            return {"optimizer_revision": revision, "acknowledged": True}
-        target["unavailable_rollout_ids"] = ids
-        trainer._restored_rollouts_pending_publication = set(ids)
-        trainer._apply_runtime_reconfiguration_state(target)
         revision = int(engine.optimizer_revision)
         from .rollout_lifecycle import publish_with_consensus
-        publish_with_consensus(trainer, revision)
+        if target.get("scope") == "returned_subset":
+            if not ids:
+                raise ValueError("Rollout restore publication needs at least one service")
+            publish_with_consensus(trainer, revision, instance_ids=ids, reopen_restored=False)
+            return {"optimizer_revision": revision, "acknowledged": True}
+        target["unavailable_rollout_ids"] = ids
+        target["restored_rollout_ids"] = ids
+        trainer._apply_runtime_reconfiguration_state(target, rebind=False)
+        publish_with_consensus(trainer, revision, reopen_restored=False)
         engine.set_version(revision)
-        trainer._reopen_restored_rollouts()
         trainer._rebind_rollout_engine_from_config(reason="core_boundary_publication")
+        trainer._reopen_restored_rollouts()
         return {"optimizer_revision": revision, "acknowledged": True}
     raise ValueError(f"unknown collective core operation: {operation}")
 

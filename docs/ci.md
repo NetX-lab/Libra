@@ -4,10 +4,11 @@ Pushes to any branch and pull requests targeting `main` run `.github/workflows/c
 The workflow can also be started manually from GitHub Actions.
 
 The CPU regression suite runs on Python 3.10 and 3.12 with PyTorch 2.7.0 CPU.
-It covers configuration, asynchronous execution, phase tracing, reload control,
-legacy and cost-aware CMLFQ, rollout clients, and CPU-offload backend orchestration.
-The explicit test list lives in `scripts/test_cpu_ci.sh`; add new CPU-safe tests there.
-This is a selected regression suite, not the entire repository test suite.
+It covers configuration, asynchronous execution, reload control, C-MLFQ and
+cost-aware scheduling, Global Resource Planner and preflight simulation,
+Elastic Hybrid Pool and runtime boundary integration, serving protocol, GRPO
+grouping, Megatron-Core adapter checks, and R2E-Gym workflow checks.
+`scripts/test_cpu_ci.sh` runs the entire consolidated test suite under `tests/`.
 
 To reproduce in a clean Python 3.10–3.12 virtual environment:
 
@@ -31,7 +32,6 @@ still merges manually after checks pass. GitHub branch protection is repository
 configuration, separate from this workflow file; changing YAML alone does not
 activate it. This setup does not publish packages or deploy training services.
 
-CUDA kernel, vLLM connector, multi-GPU KV migration, and full RL throughput
-validation remain manual cluster tests using `scripts/validate_cpu_offload.slurm`
-and `scripts/benchmark_scheduler_rl.slurm`. CPU CI does not certify GPU correctness
-or performance. Public PR code is not automatically executed on HPC-GMC.
+CUDA kernel, vLLM connector, multi-GPU KV migration, and full RL end-to-end
+validation remain GPU cluster runs. CPU CI does not certify GPU correctness or
+performance.

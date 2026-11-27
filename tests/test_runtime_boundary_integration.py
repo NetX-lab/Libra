@@ -2,8 +2,7 @@
 
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +10,13 @@ import torch
 
 from RL_Framework.config import AsyncRLConfig
 from RL_Framework.engine.megatron_core_train_engine import MegatronCoreTrainEngine
+from RL_Framework.engine.heterogeneous_engine import HeterogeneousRolloutEngine
+from RL_Framework.infra.cost_model.global_resource_planner import PlannerDecision
+from RL_Framework.infra.execution.async_runner import AsyncTaskRunner
+from RL_Framework.infra.execution.batch_dispatcher import BatchTaskDispatcher, TaskInput
+from RL_Framework.infra.scheduling.cmlfq_prefix_tree import CausalPrefixTree
+from RL_Framework.infra.scheduling.cmlfq_tool_state import DefaultToolStateExtractor
+from RL_Framework.infra.sync.staleness import StalenessManager
 from RL_Framework.infra.elastic.hybrid_pool import (
     ElasticHybridPool,
     InterReplicaGradientDomain,
@@ -25,6 +31,155 @@ from RL_Framework.infra.elastic.runtime_executor import RuntimeElasticExecutor
 from RL_Framework.infra.elastic import runtime_executor as runtime_module
 from RL_Framework.infra.sync import nccl_weight_sync
 from RL_Framework.trainer.async_rl_trainer import AsyncRLTrainer
+
+
+@pytest.fixture
+def membership_boundary(tmp_path, monkeypatch):
+    """Keep transaction, dispatcher and CMLFQ real; replace GPU work."""
+    config = make_config(tmp_path)
+    cfg = config.global_resource_planner
+    cfg.runtime_reconfigure_training = True
+    cfg.runtime_training_pool_plan_only = False
+    cfg.hybrid_worker_launch_enabled = True
+    cfg.runtime_coordinate_reconfiguration_ranks = False
+    config.heterogeneous_rollout.instances = []
+    sched = config.heterogeneous_rollout.scheduling
+    sched.scheduler_type = "cmlfq_cost"
+    sched.cmlfq_buckets = {"short": {"tp_degrees": [1], "max_tokens": 5000}}
+    sched.cmlfq_tree_path = ""
+    trainer = AsyncRLTrainer(config)
+    trainer._use_heterogeneous = True
+    trainer.train_engine = SimpleNamespace(get_version=lambda: 0)
+    trainer.rollout_engine = HeterogeneousRolloutEngine.from_config(config)
+    trainer.staleness_manager = StalenessManager(trainer.train_engine, 1, 1, 1)
+    runner = AsyncTaskRunner()
+    trainer.dispatcher = BatchTaskDispatcher(
+        runner, trainer.staleness_manager, trainer._create_rollout_task,
+    )
+    executor = RuntimeElasticExecutor(
+        config=config, planner=SimpleNamespace(), train_engine=trainer.train_engine,
+        rollout_engine=trainer.rollout_engine, dispatcher=trainer.dispatcher,
+    )
+    executor.trainer = trainer
+    trainer.runtime_elastic_executor = executor
+    plan = SimpleNamespace(
+        train_config=SimpleNamespace(tp=1, ep=1, pp=1, dp=1),
+        train_gpus=1, rollout_tp_list=[], t_global=1.0, expected_gain_s=0.0,
+        to_dict=lambda: {},
+    )
+    decision = PlannerDecision(
+        step=1, should_reconfigure=True, reason="membership", current_plan=plan,
+        candidate_plan=plan, resource_should_reconfigure=False,
+    )
+    monkeypatch.setattr(executor, "_ensure_elastic_pool", lambda: None)
+    monkeypatch.setattr(executor, "_desired_hybrid_workers", lambda *args: 0)
+    monkeypatch.setattr(executor, "_reconfigure_training_pool", lambda *args: [])
+    from RL_Framework.infra.elastic import rollout_lending
+    monkeypatch.setattr(rollout_lending, "return_rollout", lambda owner: [])
+    monkeypatch.setattr(executor, "_publish_current_rollout_weights",
+                        lambda: pytest.fail("membership must defer publication to the common step boundary"))
+    drains = []
+    wait = trainer.dispatcher.wait_until_idle
+
+    def drain(**kwargs):
+        drains.append(1)
+        return wait(**kwargs)
+
+    monkeypatch.setattr(trainer.dispatcher, "wait_until_idle", drain)
+    yield SimpleNamespace(
+        trainer=trainer, executor=executor, decision=decision, runner=runner, drains=drains,
+    )
+    trainer.dispatcher.destroy()
+    executor.close()
+
+
+def test_membership_keeps_live_scheduler_groups_and_survivor_work(
+    membership_boundary, monkeypatch,
+):
+    h = membership_boundary
+    trainer = h.trainer
+    engine, scheduler = trainer.rollout_engine, trainer.rollout_engine.scheduler
+    pending_group = [{"grpo_group_id": "accepted", "grpo_rollout_index": 0}]
+    trainer._pending_grpo_groups = {"accepted": pending_group}
+    entered, finish = threading.Event(), threading.Event()
+
+    def resource_action(*args):
+        entered.set()
+        assert finish.wait(3), "test did not finish the local resource action"
+        return []
+
+    monkeypatch.setattr(h.executor, "_reconfigure_training_pool", resource_action)
+    monkeypatch.setattr(trainer, "_rebind_rollout_engine_from_config",
+                        lambda **kwargs: pytest.fail("membership replaced the live rollout client"))
+    with ThreadPoolExecutor(max_workers=1) as threads:
+        applying = threads.submit(trainer._apply_global_resource_planner_decision, 1, h.decision, {})
+        try:
+            assert entered.wait(3)
+            assert not trainer.dispatcher.is_paused()
+            scheduler.register_instance(0, "short", 1)
+            event = {"tool_type": "search", "output": "ok", "payload_tokens": 2}
+            state = DefaultToolStateExtractor().extract(event)
+            request = engine.begin_cmlfq_request("survivor-trace", 100)
+            engine.route_cmlfq_tool_return(request, event, 100)
+            engine.finish_cmlfq_request(request, 1000)
+        finally:
+            finish.set()
+        applying.result(timeout=3)
+    assert trainer.rollout_engine is engine
+    assert trainer.rollout_engine.scheduler is scheduler
+    assert trainer._pending_grpo_groups["accepted"] is pending_group
+    assert scheduler.prefix_tree.lookup("survivor-trace", [state]) is not None
+    assert scheduler._tree_update_count == 1
+    assert h.drains == []
+
+
+@pytest.mark.parametrize("direct", [False, True], ids=["trainer", "executor"])
+@pytest.mark.parametrize("already_paused", [False, True], ids=["open", "parent-paused"])
+def test_membership_boundary_preserves_pause_owner_without_draining(
+    membership_boundary, direct, already_paused,
+):
+    h = membership_boundary
+    if already_paused:
+        h.trainer.dispatcher.pause()
+    prepared = h.executor.prepare_transaction(h.decision)
+    assert not prepared.drain_required
+    assert not prepared.should_pause_dispatcher
+    if direct:
+        assert h.executor.execute(h.decision).applied
+    else:
+        h.trainer._apply_global_resource_planner_decision(1, h.decision, {})
+    assert h.trainer.dispatcher.is_paused() is already_paused
+    assert h.drains == []
+
+
+@pytest.mark.parametrize("already_paused", [False, True], ids=["open", "parent-paused"])
+def test_membership_activation_failure_preserves_survivor_and_pause_owner(
+    membership_boundary, monkeypatch, already_paused,
+):
+    h = membership_boundary
+    engine = h.trainer.rollout_engine
+    if already_paused:
+        h.trainer.dispatcher.pause()
+    def fail_activation():
+        raise RuntimeError("state installation failed")
+    monkeypatch.setattr(h.executor, "_finish_pending_activations", fail_activation)
+    with pytest.raises(RuntimeError, match="state installation failed"):
+        h.trainer._apply_global_resource_planner_decision(1, h.decision, {})
+    assert h.trainer.rollout_engine is engine
+    assert h.trainer.dispatcher.is_paused() is already_paused
+    assert h.drains == []
+
+
+@pytest.mark.parametrize("noop", ["maintenance", "disabled"])
+def test_nonexecuting_membership_boundary_does_not_pause_or_drain(membership_boundary, noop):
+    h = membership_boundary
+    if noop == "maintenance":
+        h.decision.should_reconfigure = False
+    else:
+        h.trainer.config.global_resource_planner.runtime_dynamic_reconfiguration_enabled = False
+    h.trainer._apply_global_resource_planner_decision(1, h.decision, {})
+    assert not h.trainer.dispatcher.is_paused()
+    assert h.drains == []
 
 
 class NoReconfigurationDecision:
@@ -217,18 +372,60 @@ def test_final_boundary_waits_for_leader_close_before_follower_teardown(tmp_path
     assert follower._elastic_gradient_server is None
 
 
-def test_cleanup_releases_cached_rollout_weight_communicators(tmp_path, monkeypatch):
+def test_cleanup_releases_cached_rollout_weight_communicators(tmp_path):
     """Catch interpreter-shutdown aborts from lingering TCPStore owners."""
     leader, _follower = make_cleanup_trainers(tmp_path)
     cache_key = ("127.0.0.1", 29620, 2, 0, "cuda:0")
-    communicator = SimpleNamespace(comm=None, disabled=False, available=True, group=object())
-    monkeypatch.setitem(nccl_weight_sync._COMMUNICATOR_CACHE, cache_key, communicator)
+    nccl_weight_sync._COMMUNICATOR_CACHE[cache_key] = SimpleNamespace(comm=None, disabled=False)
 
     leader._cleanup()
 
     assert nccl_weight_sync._COMMUNICATOR_CACHE == {}
-    assert communicator.disabled and not communicator.available
-    assert communicator.group is None
+
+
+def test_lending_transaction_drains_peer_source_before_reporting_ready(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    leader, follower = make_cleanup_trainers(tmp_path)
+    config = leader.config
+    config.global_resource_planner.runtime_reconfigure_training = True
+    config.global_resource_planner.runtime_training_pool_plan_only = False
+    config.global_resource_planner.hybrid_worker_launch_enabled = True
+    plan = SimpleNamespace(train_gpus=1, to_dict=lambda: {})
+    signal = {"desired_replicas": 1, "loan_instance_ids": ["borrowed"]}
+    executor = RuntimeElasticExecutor(config=config, planner=None)
+    executor.runtime_run_id = "integration-run"
+    prepared = executor.prepare_transaction(PlannerDecision(
+        step=0, should_reconfigure=True, reason="borrow", current_plan=plan,
+        candidate_plan=plan, resource_should_reconfigure=False, elastic_hybrid_signal=signal,
+    ))
+    executor.publish_peer_rank_drain_request(prepared)
+    leader._runtime_boundary_protocol.publish(0, "post", coord_id=prepared.coord_id, drain_required=True)
+    root = leader._runtime_reconfiguration_coord_dir()
+    ran = threading.Event()
+    release = threading.Event()
+    follower.dispatcher = BatchTaskDispatcher(AsyncTaskRunner(), SimpleNamespace(), lambda task: None)
+    drain = follower.dispatcher.wait_until_idle
+
+    def wait_until_idle(*, timeout):
+        ran.set()
+        assert release.wait(2)
+        drain(timeout=timeout)
+
+    follower.dispatcher.wait_until_idle = wait_until_idle
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        following = threads.submit(follower._runtime_reconfiguration_boundary, 0, "post")
+        try:
+            assert ran.wait(1)
+            assert follower.dispatcher.is_paused()
+            assert not (root / "ready/rank_1.json").exists()
+        finally:
+            release.set()
+            write_record(root / "applied.json", {
+                "run_id": "integration-run", "coord_id": prepared.coord_id, "job_id": "",
+            })
+        following.result(timeout=2)
+    assert not follower.dispatcher.is_paused()
 
 
 def test_final_draining_transaction_reaches_terminal_then_done(tmp_path):
@@ -289,6 +486,26 @@ def test_close_failure_publishes_failed_runtime_done(tmp_path):
     record = read_record(leader._runtime_boundary_protocol.runtime_done_path())
     assert record["status"] == "failed"
     with pytest.raises(RuntimeError, match="shutdown failed on rank0"):
+        follower._cleanup()
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, TimeoutError])
+def test_final_hybrid_task_failure_still_closes_executor_and_notifies_followers(tmp_path, failure_type):
+    leader, follower = make_cleanup_trainers(tmp_path)
+    failure = failure_type("last Hybrid task failed")
+    executor = CloseRecorder()
+
+    def wait_for_tasks():
+        raise failure
+
+    executor.wait_for_hybrid_training_tasks = wait_for_tasks
+    leader.runtime_elastic_executor = executor
+    with pytest.raises(failure_type) as caught:
+        leader._cleanup(wait_for_hybrid_tasks=True)
+    assert caught.value is failure
+    assert executor.closed
+    assert read_record(leader._runtime_boundary_protocol.runtime_done_path())["status"] == "failed"
+    with pytest.raises(RuntimeError, match="last Hybrid task failed"):
         follower._cleanup()
 
 

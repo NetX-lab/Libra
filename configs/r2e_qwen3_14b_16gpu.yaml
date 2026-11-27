@@ -1,0 +1,217 @@
+# Job 1938329 training and scheduling parameters for the corrected learner.
+# The Slurm launcher binds model paths, rollout services and GPU IDs at startup.
+base_config: base.yaml
+hardware_config: hardware_config/a100_80g.yaml
+model_arch_config: model_arch_config/qwen3-14b.yaml
+model_path: Qwen/Qwen3-14B
+tokenizer_path: Qwen/Qwen3-14B
+train_backend: megatron_core
+rollout_backend: vllm
+train_gpus: 4
+rollout_gpus: 12
+n_total_gpus: 16
+num_nodes: 4
+gpus_per_node_override: 4
+train_gpus_per_node: 4
+rollout_gpus_per_node: 4
+hardware:
+  gpus_per_node: 4
+
+train_tp_size: 4
+train_pp_size: 1
+train_dp_size: 1
+train_cp_size: 1
+train_ep_size: 1
+expert_tensor_parallel_size: 1
+sequence_parallel: true
+use_distributed_optimizer: true
+megatron_grad_reduce_in_fp32: false
+megatron_use_precision_aware_optimizer: false
+megatron_optimizer_cpu_offload: false
+megatron_optimizer_offload_fraction: 0.0
+megatron_use_transformer_engine: false
+megatron_use_cpu_initialization: false
+megatron_recompute_num_layers: 1
+megatron_streaming_export: true
+
+batch_size: 96
+grpo_objective: decoupled
+n_samples: 4
+micro_batch_size: 1
+recompute_logprobs: true
+recompute_micro_batch_size: 1
+learning_rate: 1.0e-06
+ppo_epochs: 1
+clip_epsilon: 0.2
+kl_coef: 0.001
+gamma: 1.0
+seed: 42
+total_steps: 100
+eval_interval: 20
+save_interval: 0
+dataset_name: R2E-Gym/R2E-Gym-V1
+dataset_split: train
+max_seq_length: 8192
+max_new_tokens: 2048
+r2e_max_turns: 6
+r2e_max_prompt_tokens: 2048
+r2e_stop_reward: 0.5
+temperature: 0.8
+top_p: 0.95
+max_concurrent_rollouts: 96
+max_head_offpolicyness: 1
+dispatch_budget_window: null
+queue_size: 256
+admission_mode: 'off'
+enable_rollout_tracing: false
+
+vllm_tp_size: 2
+vllm_num_instances: 2
+vllm_endpoints: ''
+sync_interval: 1
+weight_sync_mode: nccl
+rollout_weight_sync_mode: nccl
+rollout_weight_reload_strategy: parallel
+rollout_weight_sync_export_only: true
+rollout_weight_sync_timeout_s: 3600
+require_rollout_weight_sync: true
+rollout_nccl_host: ''
+rollout_nccl_chunk_mb: 256
+rollout_nccl_rate_limit_gbps: 0.0
+rollout_weight_sync_poll_interval_s: 0.05
+log_dir: logs
+sync_path: weights
+rollout_weight_sync_control_dir: control
+phase_trace_enabled: true
+phase_trace_dir: phase_trace
+enable_history_collection: true
+wandb_project: ''
+wandb_run_name: r2e-qwen3-14b-16gpu
+
+heterogeneous_rollout:
+  enabled: true
+  total_gpus: 12
+  vllm_host: 127.0.0.1
+  vllm_base_port: 8000
+  max_model_len: 8192
+  gpu_memory_utilization: 0.9
+  instances: []
+  scheduling:
+    scheduler_type: cmlfq_cost
+    cmlfq_kv_backend: recompute
+    request_timeout: 3600
+    max_queue_length: 100
+    enable_fallback: true
+    cmlfq_rebuild_interval: 5
+    cmlfq_tree_path: cmlfq/tree.json
+    cmlfq_shared_load_dir: cmlfq/load
+    cmlfq_payload_small_threshold: 77
+    cmlfq_payload_large_threshold: 80
+    cmlfq_buckets:
+      long:
+        max_tokens: 8192
+        tp_degrees: [4]
+      medium:
+        max_tokens: 728
+        tp_degrees: [2]
+      short:
+        max_tokens: 32
+        tp_degrees: [1]
+
+global_resource_planner:
+  enabled: true
+  initial_allocation_strategy: configured
+  fixed_train_gpus: 0
+  allocation_granularity_gpus: 4
+  min_train_gpus: 4
+  min_rollout_gpus: 12
+  allowed_train_tp: [4]
+  allowed_train_pp: [1]
+  allowed_rollout_tp: [1, 2, 4]
+  rollout_node_tp_pattern: []
+  require_heterogeneous_rollout_tp: false
+  micro_batch_sizes: [1]
+  plan_interval: 5
+  warmup_steps: 1
+  min_history_size: 8
+  min_gain_ratio: 0.05
+  reconfiguration_cost_s: 15.0
+  startup_profile_enabled: true
+  startup_profile_allow_synthetic_fallback: false
+  apply_to_runtime: true
+  runtime_async_planning: true
+  runtime_dynamic_reconfiguration_enabled: true
+  runtime_online_replanning: true
+  runtime_manage_rollout_processes: true
+  runtime_length_profile_enabled: true
+  runtime_drain_before_reconfigure: true
+  runtime_reconfigure_training: true
+  runtime_training_pool_only: true
+  runtime_training_pool_plan_only: false
+  elastic_hybrid_planning_enabled: true
+  hybrid_worker_launch_enabled: true
+  elastic_hybrid_require_planner_signal: true
+  decouple_communication_domains: true
+  elastic_hybrid_require_isolated_ccl: true
+  elastic_hybrid_replica_size_gpus: 4
+  elastic_hybrid_min_rollout_gpus: 4
+  hybrid_worker_task_dir: resource/elastic-tasks
+  hybrid_worker_remote_control_enabled: true
+  hybrid_worker_remote_control_dir: resource/elastic-tasks
+  gradient_transport_backend: tcp
+  runtime_peer_request_wait_s: 3600
+  runtime_rollout_log_dir: resource/rollout-logs
+  runtime_rollout_manifest_path: resource/rollout-manifest.json
+  runtime_rollout_pid_registry_path: resource/rollout-pids.json
+  runtime_length_profile_jsonl: resource/length-profile.jsonl
+  gradient_server_host: 0.0.0.0
+  runtime_wait_rollout_process_start_ready: true
+  vllm_ready_timeout_s: 1800
+  train_backend: analytic
+  rollout_backend: analytic
+  hybrid_worker_mode: megatron_core
+  elastic_hybrid_join_timeout_s: 180
+  hybrid_worker_ready_timeout_s: 300
+history_flush_interval: 10
+
+# Cost measurements used by job 1938329.
+profiling:
+  calibration:
+    calls_per_trace: 4.770833333333333
+    error_margin_s: 30.0
+    group_tail_s: 21.391342165137758
+    group_tool_s: 0.0228578214882873
+    horizon_updates: 20
+    lifecycle:
+      activate_s: 168.82357374596177
+      borrow_coordination_s: 0.5108682300196961
+      borrow_snapshot_s: 93.51920134900138
+      borrow_stop_s: 5.6903421159950085
+      hybrid_publish_inflight_progress_s: 15.514095864025876
+      hybrid_publish_s: 8.919014867045917
+      load_s: 108.31573095201747
+      publish_inflight_progress_s: 0.0
+      publish_s: 3.9460073900118005
+      return_frontend_s: 95.49290284997551
+    rollout:
+      '1':
+        decode_scale: 1.592157551547438
+        prefill_scale: 0.755604037834369
+      '2':
+        decode_scale: 2.204978684608673
+        prefill_scale: 1.484902994169496
+      '4':
+        decode_scale: 3.4100156161555444
+        prefill_scale: 1.644428823166528
+    training:
+      anchor_scale: 29.645866482276734
+      compute_scale: 46.545942887265326
+      hybrid_gradient_s: 8.803481031019764
+      optimizer_s: 0.3053981509874575
+      sequence_lengths: [2790, 2854, 2865, 2948, 2364, 2396, 2459, 2793, 2814, 3689, 3790, 4345,
+        2819, 2870, 2871, 4338, 2394, 2403, 2425, 2576, 2398, 2428, 3602, 4055, 2840, 3923, 4108,
+        4128, 2841, 2868, 3777, 3971, 2847, 3838, 3898, 4041, 2850, 2882, 3817, 4009, 2439, 2866,
+        2871, 4472, 2873, 2679, 2716, 4265, 2457, 4141, 4190, 4303, 2894, 2972, 3044, 3176, 2467,
+        2513, 3005, 4711, 2942, 4809, 4999, 8176, 2941, 3543, 4257, 4563, 2318, 2339, 2339, 2389,
+        2420, 2463, 2498, 4609, 2798, 2807, 3653, 3889, 2851, 2863, 2872, 4057, 2874, 4033, 4069,
+        4210, 2454, 2510, 2560, 4374, 2954, 4342, 4337, 4398]

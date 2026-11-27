@@ -20,6 +20,7 @@ class TaskResult(Generic[T]):
     task_id: int
     create_time: float
     complete_time: float
+    error: Exception | None = None
 
 
 class AsyncTaskRunner(Generic[T]):
@@ -183,11 +184,13 @@ class AsyncTaskRunner(Generic[T]):
         input_event.set()
 
         running_tasks: dict[str, dict[str, Any]] = {}
+        self._running_tasks = running_tasks
 
         try:
             while not exit_event.is_set():
-                # Explicit drain starts accepted inputs. Ordinary pause keeps
-                # them available for cancel_queued().
+                # pause() leaves queued work available for cancel_queued().
+                # An explicit drain instead runs every previously accepted
+                # task to completion while admission remains closed.
                 if not pause_event.is_set() or self._draining.is_set():
                     self._drain_pending_inputs(running_tasks, input_queue)
 
@@ -217,13 +220,14 @@ class AsyncTaskRunner(Generic[T]):
                     tid = async_task.get_name()
                     task_obj = running_tasks.pop(tid)
 
+                    error = None
                     try:
                         result = await async_task
                     except asyncio.CancelledError:
                         result = None
                     except Exception as e:
-                        print(f"ERROR: task {tid} execution failed: {e}")
                         result = None
+                        error = e
 
 
                     try:
@@ -236,6 +240,7 @@ class AsyncTaskRunner(Generic[T]):
                             task_id=task_obj["task_id"],
                             create_time=task_obj["create_time"],
                             complete_time=time.monotonic_ns(),
+                            error=error,
                         )
                         output_queue.put_nowait(task_result)
 
@@ -396,6 +401,33 @@ class AsyncTaskRunner(Generic[T]):
         with self._admission_lock:
             self.paused.clear()
         self._signal_new_input()
+
+    def cancel_tasks(self, task_ids: set[int], timeout: float = 2.0) -> None:
+        """Release a terminated group's actual coroutine work before refilling."""
+        async def cancel() -> None:
+            retained = []
+            while True:
+                try:
+                    item = self.input_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item["task_id"] in task_ids:
+                    with self._active_task_ids_lock:
+                        self._active_task_ids.discard(item["task_id"])
+                else:
+                    retained.append(item)
+            for item in retained:
+                self.input_queue.put_nowait(item)
+            targets = [task["task"] for task in getattr(self, "_running_tasks", {}).values()
+                       if task["task_id"] in task_ids]
+            for task in targets:
+                task.cancel()
+            if targets:
+                await asyncio.gather(*targets, return_exceptions=True)
+
+        if self._loop is not None:
+            future = asyncio.run_coroutine_threadsafe(cancel(), self._loop)
+            future.result(timeout=timeout)
 
     def cancel_queued(self, timeout: float = 2.0) -> list[int]:
         """Cancel accepted tasks that have not yet started their coroutine."""

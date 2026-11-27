@@ -5,11 +5,13 @@ from __future__ import annotations
 import os
 import ctypes
 import ipaddress
+import logging
 import math
 import threading
 import time
 from dataclasses import dataclass
 from datetime import timedelta
+from contextlib import nullcontext
 from typing import Callable, Iterable, Iterator
 
 import torch
@@ -24,6 +26,7 @@ _PIPELINE_DEPTH = 2
 # timedelta.max are unsafe. A century represents the application's unbounded
 # wait while staying below signed int64 even after conversion to nanoseconds.
 _UNBOUNDED_STORE_TIMEOUT_S = 100 * 365 * 24 * 60 * 60
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,29 @@ def _group(spec: NcclReloadSpec):
     return group
 
 
+def _log_initialization_failure(spec, stage, error):
+    """Best-effort failure evidence; never synchronize or allocate CUDA memory."""
+    route = dict(host=spec.host, port=spec.port, session_id=spec.session_id,
+                 world_size=spec.world_size, rank=spec.rank, device=str(spec.device))
+    cuda = {}
+
+    def probe(name, read):
+        try:
+            cuda[name] = read()
+        except Exception as exc:
+            cuda[name + '_error'] = repr(exc)
+
+    probe('available', torch.cuda.is_available)
+    if torch.device(spec.device).type == 'cuda' and cuda.get('available'):
+        probe('current_device', torch.cuda.current_device)
+        probe('current_stream_device', lambda: str(torch.cuda.current_stream().device))
+        probe('allocated_bytes', lambda: torch.cuda.memory_allocated(spec.device))
+        probe('reserved_bytes', lambda: torch.cuda.memory_reserved(spec.device))
+        probe('free_total_bytes', lambda: torch.cuda.mem_get_info(spec.device))
+    _LOGGER.error('NCCL communicator initialization failed stage=%s route=%r cuda=%r',
+                  stage, route, cuda, exc_info=(type(error), error, error.__traceback__))
+
+
 def _communicator(spec: NcclReloadSpec):
     # vLLM 0.9.x disables cuMem for its worker communicators. All ranks in
     # this independent communicator must use the same transport mode.
@@ -135,21 +161,28 @@ def _communicator(spec: NcclReloadSpec):
             # Bind the CUDA context before creating this independent NCCL
             # communicator; otherwise DeepSeek's first warm-up collective can
             # execute on a stale device and report an asynchronous launch error.
-            if device.type == "cuda" and torch.cuda.is_available():
-                with torch.cuda.device(device):
-                    torch.cuda.synchronize(device)
-                    communicator = _BroadcastCommunicator(
-                        _group(spec), device=device
-                    )
-            else:
-                communicator = _BroadcastCommunicator(_group(spec), device=device)
+            stage = 'cuda_context'
+            try:
+                use_cuda = device.type == "cuda" and torch.cuda.is_available()
+                with torch.cuda.device(device) if use_cuda else nullcontext():
+                    if use_cuda:
+                        stage = 'cuda_synchronize'
+                        torch.cuda.synchronize(device)
+                    stage = 'stateless_group'
+                    group = _group(spec)
+                    stage = 'pynccl_initialize_and_warmup'
+                    communicator = _BroadcastCommunicator(group, device=device)
+            except Exception as exc:
+                try:
+                    _log_initialization_failure(spec, stage, exc)
+                except Exception:
+                    pass  # Diagnostic failures must preserve the transport error.
+                raise
             communicator._constructor_warmup_output = None
             _COMMUNICATOR_CACHE[key] = communicator
-        # The new group has completed NCCL initialization/warm-up. World size
-        # and local rank describe membership, not route ownership: repartition
-        # can change a surviving worker's rank without changing its CUDA device.
-        # Owners serialize each host/port/device route and drain old transfers
-        # first, so superseded sessions can be aborted without departed peers.
+        # A loan can change world size and a surviving receiver's rank. They
+        # describe membership, not ownership of this host/port/device route.
+        # Retire superseded sessions only after the new group warmed up.
         if spec.session_id:
             for previous in list(_COMMUNICATOR_CACHE):
                 if (previous != key and previous[:2] == key[:2]
@@ -161,6 +194,8 @@ def _communicator(spec: NcclReloadSpec):
 
 def _abort_communicator(communicator) -> None:
     """Release a local NCCL handle without waiting for an exited member."""
+    if getattr(communicator, "_libra_retired", False):
+        return
     handle = getattr(communicator, "comm", None)
     if handle is not None:
         nccl = communicator.nccl
@@ -180,16 +215,26 @@ def _abort_communicator(communicator) -> None:
     communicator.disabled = True
     communicator.available = False
     communicator.group = None
+    communicator._libra_retired = True
 
 
-def clear_communicator_cache() -> None:
-    """Release owned NCCL groups before dropping their shared TCPStore listener."""
+def clear_communicator_cache(*, keys=None) -> None:
+    """Abort owned communicators; optionally invalidate selected route prefixes.
+
+    Five-field keys remain compatible with engine-local publication callers.
+    Targeted cleanup retains base stores for subsequent incarnations; whole
+    shutdown aborts all communicators before releasing their TCPStore ownership.
+    Failed aborts propagate and retain ownership so cleanup can be retried.
+    """
+    prefixes = None if keys is None else [tuple(key) for key in keys]
     with _COMMUNICATOR_CACHE_LOCK:
         for key in list(_COMMUNICATOR_CACHE):
-            _abort_communicator(_COMMUNICATOR_CACHE[key])
-            del _COMMUNICATOR_CACHE[key]
-        with _BASE_STORE_CACHE_LOCK:
-            _BASE_STORE_CACHE.clear()
+            if prefixes is None or any(key[:len(prefix)] == prefix for prefix in prefixes):
+                _abort_communicator(_COMMUNICATOR_CACHE[key])
+                del _COMMUNICATOR_CACHE[key]
+        if prefixes is None:
+            with _BASE_STORE_CACHE_LOCK:
+                _BASE_STORE_CACHE.clear()
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
@@ -251,8 +296,7 @@ def send_weights(
             tensor = tensor.to(device=spec.device, non_blocking=True)
         tensor = tensor.contiguous()
         if stream is not None:
-            # Bridge export, nonblocking copies and contiguous() produce on
-            # the current stream; PyNcclCommunicator does not fence that work.
+            # Export and nonblocking copies run on the producer stream.
             stream.wait_stream(torch.cuda.current_stream(device=torch.device(spec.device)))
         chunk_numel = max(1, int(spec.chunk_bytes) // tensor.element_size())
         metadata = {
@@ -310,8 +354,7 @@ def receive_weights(spec: NcclReloadSpec) -> Iterator[tuple[str, torch.Tensor]]:
             device=spec.device,
         )
         if stream is not None:
-            # The allocator may reuse memory still owned by work on its
-            # allocation stream, even though the NCCL receive only writes it.
+            # The allocator can reuse memory with work pending on this stream.
             stream.wait_stream(torch.cuda.current_stream(device=torch.device(spec.device)))
         flat = tensor.view(-1)
         chunk_numel = max(1, int(metadata["chunk_numel"]))
