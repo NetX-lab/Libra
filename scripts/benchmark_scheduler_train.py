@@ -49,7 +49,12 @@ class MeasuredEngine:
 class MeasuredWorkflow(DAPOMathWorkflow):
     async def run_episode(self, engine, data, version=0, rollout_index=0):
         started = time.time()
-        result = await super().run_episode(MeasuredEngine(engine), data, version)
+        result = await super().run_episode(
+            MeasuredEngine(engine),
+            data,
+            version,
+            rollout_index=rollout_index,
+        )
         append('episodes.jsonl', dict(start=started, end=time.time(), version=version,
             prompt_id=result['prompt_id'], input_tokens=result['input_len'],
             generated_tokens=result['output_len'], turns=result['n_turns'],
@@ -58,8 +63,8 @@ class MeasuredWorkflow(DAPOMathWorkflow):
 
 
 class MeasuredTrainer(AsyncRLTrainer):
-    def _record_history_step(self, step, batch, stats, *args):
-        super()._record_history_step(step, batch, stats, *args)
+    def _record_history_step(self, step, batch, stats, *args, **kwargs):
+        super()._record_history_step(step, batch, stats, *args, **kwargs)
         append('steps.jsonl', dict(step=step, timestamp=time.time(), stats=stats,
             generated_tokens=sum(int(t['loss_mask'].sum()) for t in batch),
             sequence_tokens=sum(int(t['input_ids'].numel()) for t in batch),

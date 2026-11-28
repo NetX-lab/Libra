@@ -469,13 +469,15 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 ))
                 raise TimeoutError(f"active batch collection timed out: {len(results)}/{batch_size}")
 
-            with self._input_cv:
+            with self._input_cv, self._result_cv:
                 pending_inputs = len(self._pending_inputs)
+                in_flight = len(self._active_task_ids)
             capacity = min(
                 self.staleness_manager.get_pending_limit() - pending_inputs,
                 self.runner.max_queue_size - self.runner.input_queue.qsize(),
             )
-            for _ in range(min(batch_size - len(results), capacity)):
+            needed_to_submit = max(0, batch_size - len(results) - in_flight)
+            for _ in range(min(needed_to_submit, max(0, capacity))):
                 try:
                     self.submit_task_input(next(input_generator))
                 except StopIteration:

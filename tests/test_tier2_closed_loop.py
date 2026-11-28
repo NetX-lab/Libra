@@ -1,4 +1,4 @@
-"""CPU-safe unit and dry-run tests for Tier 2 (4-GPU closed loop & Google Colab)."""
+"""CPU-safe unit and dry-run tests for Tier 2 (8-GPU / 4-GPU closed loop & Google Colab)."""
 
 import asyncio
 import importlib.util
@@ -29,12 +29,17 @@ from RL_Framework.infra.scheduling.load_balance import LoadBalanceScheduler
 SAMPLE_DATASET = (
     REPO_ROOT / "repro/tier2_four_gpu_closed_loop/sample_data/dapo_math_mini.jsonl"
 )
+COST_PROFILE = (
+    REPO_ROOT / "repro/tier2_four_gpu_closed_loop/sample_data/dapo_cost_profile.json"
+)
+CONFIG_8GPU = REPO_ROOT / "repro/tier2_four_gpu_closed_loop/config_8gpu_qwen3_4b.yaml"
 CONFIG_4GPU = REPO_ROOT / "repro/tier2_four_gpu_closed_loop/config_4gpu_qwen3_4b.yaml"
 CONFIG_COLAB = REPO_ROOT / "repro/tier2_four_gpu_closed_loop/config_colab_1gpu.yaml"
 COLAB_NOTEBOOK = (
     REPO_ROOT / "repro/tier2_four_gpu_closed_loop/colab_quickstart.ipynb"
 )
 LAUNCH_SCRIPT = REPO_ROOT / "repro/tier2_four_gpu_closed_loop/launch_4gpu.py"
+RUN_8GPU_SH = REPO_ROOT / "repro/tier2_four_gpu_closed_loop/run_8gpu.sh"
 
 
 def test_dapo_math_mini_dataset():
@@ -358,203 +363,203 @@ def test_dapo_math_workflow_populates_cmlfq_cost_distribution(
     assert recorder.route_infos[3]["estimated_decode_seconds"] > 0.0
 
 
-def test_rollout_benchmark_topology_and_schedulers(tmp_path: Path):
-    from repro.tier2_four_gpu_closed_loop import benchmark_rollout_scheduling as bench
-
-    instances = bench.parse_topology("1,1,1,1,4")
-    assert [inst["instance_id"] for inst in instances] == [
-        "tp1_0", "tp1_1", "tp1_2", "tp1_3", "tp4_0"
+def test_static_tier2_8gpu_yaml_and_cost_profile():
+    assert COST_PROFILE.is_file()
+    cfg_8gpu = AsyncRLConfig.from_yaml(str(CONFIG_8GPU))
+    assert cfg_8gpu.train_gpus == 1
+    assert cfg_8gpu.rollout_gpus == 7
+    assert cfg_8gpu.rollout_weight_reload_method == "inplace"
+    instances_8gpu = cfg_8gpu.heterogeneous_rollout.instances
+    assert [(i.tp, i.port) for i in instances_8gpu] == [
+        (1, 18920),
+        (2, 18921),
+        (4, 18922),
     ]
-    assert instances[0]["gpus"] == [0]
-    assert instances[4]["gpus"] == [4, 5, 6, 7]
-    assert [inst["port"] for inst in instances] == [19001, 19002, 19003, 19004, 19005]
-
-    with pytest.raises(ValueError, match="exactly 2 distinct TP tiers"):
-        bench.parse_topology("1,2,4")
-    with pytest.raises(ValueError, match="requires 8 GPUs"):
-        bench.parse_topology("1,1,1,1,4", gpus=[0, 1, 2, 3])
-
-    buckets, thresholds = bench.make_buckets_and_thresholds(instances)
-    assert buckets == {
-        "short": {"tp_degrees": [1], "max_tokens": 5000},
-        "long": {"tp_degrees": [4], "max_tokens": 24576},
-    }
-    assert thresholds == {"short": 5000, "medium": 12000, "long": 24576}
-
-    profile_path = tmp_path / "profile.json"
-    profile_path.write_text(
-        json.dumps({
-            "decode_ms": {},
-            "migrations": [
-                {
-                    "source_tp": 1,
-                    "target_tp": 4,
-                    "source_host": "127.0.0.1",
-                    "target_host": "127.0.0.1",
-                    "seq_len": 2048,
-                    "recompute_ms": 128.9,
-                },
-                {
-                    "source_tp": 4,
-                    "target_tp": 1,
-                    "source_host": "127.0.0.1",
-                    "target_host": "127.0.0.1",
-                    "seq_len": 2048,
-                    "recompute_ms": 430.4,
-                },
-            ],
-        }),
-        encoding="utf-8",
+    sched_8gpu = SchedulerFactory.create(
+        cfg_8gpu.heterogeneous_rollout.scheduling.scheduler_type,
+        cfg_8gpu.heterogeneous_rollout,
     )
-    cal = {
-        "1": {"prefill_scale": 0.6722, "decode_scale": 1.4631},
-        "4": {"prefill_scale": 0.7828, "decode_scale": 2.6475},
-    }
-    for policy in bench.POLICIES_FORWARD:
-        eng = bench._make_bare_engine(
-            policy,
-            instances,
-            model_path="Qwen/Qwen3-14B",
-            hw_cfg_path=bench.DEFAULT_HW_CFG,
-            arch_cfg_path=bench.DEFAULT_ARCH_CFG,
-            out_dir=tmp_path,
-            cost_profile_path=str(profile_path),
-            rollout_calibration=cal,
-        )
-        if policy == "cmlfq_cost":
-            assert isinstance(eng.scheduler, CMLFQCostScheduler)
-            assert eng.scheduler.routing_costs.decode_ms == {}
-            assert eng.scheduler.routing_costs.rollout_model.calibration == cal
-            assert len(eng.scheduler.routing_costs.migrations) == 2
+    assert isinstance(sched_8gpu, CMLFQCostScheduler)
+    assert set(sched_8gpu._bucket_thresholds.keys()) == {"short", "medium", "long"}
 
 
-def test_rollout_benchmark_calibration_fit_and_interp():
-    from repro.tier2_four_gpu_closed_loop import benchmark_rollout_scheduling as bench
+def test_launch_8gpu_dry_run_and_seeded_trees(tmp_path: Path):
+    subprocess.run(["bash", "-n", str(RUN_8GPU_SH)], check=True)
 
-    prefill_specs = [2048, 4096, 8192, 16384]
-    decode_specs = [("ctx2048_g1024", 2048, 1024), ("ctx6144_g1024", 6144, 1024)]
-    prefill_ms = {
-        "1": {2048: 430.4, 4096: 864.2, 8192: 1790.3, 16384: 3970.8},
-        "4": {2048: 128.9, 4096: 251.5, 8192: 513.9, 16384: 1128.6},
-    }
-    raw_decode_ms = {
-        "1": {
-            "ctx2048_g1024": {"b1_total_ms": 10809.0, "b8_wall_ms": 15940.0},
-            "ctx6144_g1024": {"b1_total_ms": 12069.0, "b8_wall_ms": 26381.0},
-        },
-        "4": {
-            "ctx2048_g1024": {"b1_total_ms": 5950.0, "b8_wall_ms": 7485.0},
-            "ctx6144_g1024": {"b1_total_ms": 6283.0, "b8_wall_ms": 11185.0},
-        },
-    }
-
-    assert bench._interp_pf(prefill_ms["1"], 2048) == pytest.approx(430.4)
-    assert bench._interp_pf(prefill_ms["1"], 6144) == pytest.approx(0.5 * (864.2 + 1790.3))
-
-    fitted = bench.fit_rollout_calibration(
-        prefill_ms,
-        raw_decode_ms,
-        prefill_specs,
-        decode_specs,
-        bench.DEFAULT_HW_CFG,
-        bench.DEFAULT_ARCH_CFG,
-        "Qwen/Qwen3-14B",
+    env = dict(os.environ)
+    env.pop("SLURM_JOB_ID", None)
+    out_dir = tmp_path / "ab_8gpu"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(LAUNCH_SCRIPT),
+            "--mode",
+            "8gpu",
+            "--policy",
+            "all",
+            "--gpus",
+            "0,1,2,3,4,5,6,7",
+            "--output-dir",
+            str(out_dir),
+            "--dry-run",
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
     )
-    assert fitted["1"]["prefill_scale"] == pytest.approx(0.6722, abs=1e-3)
-    assert fitted["1"]["decode_scale"] == pytest.approx(1.4631, abs=1e-3)
-    assert fitted["4"]["prefill_scale"] == pytest.approx(0.7828, abs=1e-3)
-    assert fitted["4"]["decode_scale"] == pytest.approx(2.6475, abs=1e-3)
+    assert "Mode: `8gpu`" in proc.stdout
+
+    for expected_dir in (
+        "round_robin_42",
+        "least_connections_42",
+        "cmlfq_42",
+        "cmlfq_cost_42",
+    ):
+        run_dir = out_dir / expected_dir
+        assert (run_dir / "config.yaml").is_file()
+        assert (run_dir / "launch_plan.json").is_file()
+        loaded = AsyncRLConfig.from_yaml(str(run_dir / "config.yaml"))
+        assert loaded.train_gpus == 1
+        assert loaded.rollout_gpus == 7
+        assert loaded.micro_batch_size == 1
+
+        plan = json.loads((run_dir / "launch_plan.json").read_text(encoding="utf-8"))
+        assert plan["train_spec"]["cuda_visible_devices"] == "0"
+        assert [s["cuda_visible_devices"] for s in plan["rollout_specs"]] == [
+            "1",
+            "2,3",
+            "4,5,6,7",
+        ]
+        assert [s["port"] for s in plan["rollout_specs"]] == [18920, 18921, 18922]
+        assert "--enable-prefix-caching" in plan["rollout_specs"][0]["command"]
+        assert "--enforce-eager" not in plan["rollout_specs"][0]["command"]
+
+    cmlfq_tree = json.loads((out_dir / "cmlfq_42" / "tree.json").read_text(encoding="utf-8"))
+    assert cmlfq_tree["remaining_unit"] == "context_tokens"
+    cost_tree = json.loads(
+        (out_dir / "cmlfq_cost_42" / "tree.json").read_text(encoding="utf-8")
+    )
+    assert cost_tree["remaining_unit"] == "model_generated_tokens"
 
 
-def test_rollout_benchmark_workload_and_session_isolation():
-    from collections import Counter
-    from repro.tier2_four_gpu_closed_loop import benchmark_rollout_scheduling as bench
+def test_8gpu_three_tier_routing_with_seeded_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    if importlib.util.find_spec("latex2sympy2") is None:
+        fake_l2s = types.ModuleType("latex2sympy2")
+        fake_l2s.latex2sympy = lambda expr: expr  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "latex2sympy2", fake_l2s)
+    if importlib.util.find_spec("word2number") is None:
+        fake_w2n_pkg = types.ModuleType("word2number")
+        fake_w2n = types.ModuleType("word2number.w2n")
+        fake_w2n.word_to_num = lambda text: int(text)  # type: ignore[attr-defined]
+        fake_w2n_pkg.w2n = fake_w2n  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "word2number", fake_w2n_pkg)
+        monkeypatch.setitem(sys.modules, "word2number.w2n", fake_w2n)
 
-    class _WordTokenizer:
-        def __init__(self):
-            self._tok2id: dict[str, int] = {}
-            self._id2tok: list[str] = []
+    from RL_Framework.engine.heterogeneous_engine import HeterogeneousRolloutEngine
+    from RL_Framework.workflow.dapo_math import DAPOMathWorkflow
 
+    class _CharTokenizer:
         def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
             del add_special_tokens
-            ids = []
-            for tok in text.split():
-                if tok not in self._tok2id:
-                    self._tok2id[tok] = len(self._id2tok)
-                    self._id2tok.append(tok)
-                ids.append(self._tok2id[tok])
-            return ids
+            return [ord(ch) for ch in text]
 
-        def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
+        def decode(self, tokens: list[int], skip_special_tokens: bool = True) -> str:
             del skip_special_tokens
-            return " ".join(self._id2tok[i] for i in ids)
+            return "".join(chr(tok) for tok in tokens)
 
-        def apply_chat_template(
-            self, messages, tokenize: bool = False, add_generation_prompt: bool = True
-        ) -> str:
-            del tokenize, add_generation_prompt
-            return " ".join(msg["content"] for msg in messages)
+        def apply_chat_template(self, messages, **kwargs) -> str:
+            del kwargs
+            return "\n".join(msg["content"] for msg in messages)
 
-    tok = _WordTokenizer()
-    warmup = bench.build_workload(tok, "W01", is_warmup=True)
-    eval_a = bench.build_workload(tok, "E01", is_warmup=False)
-    eval_b = bench.build_workload(tok, "E02", is_warmup=False)
+    class _FixedMockVLLM:
+        def __init__(self, tokenizer: _CharTokenizer):
+            self.base_url = "http://127.0.0.1:0"
+            self._tokenizer = tokenizer
 
-    assert len(warmup) == 13
-    assert Counter(it["kind"] for it in warmup) == {
-        "short": 6,
-        "quick_fix": 4,
-        "deep_fail": 2,
-        "deep_timeout": 1,
+        async def generate(self, **kwargs):
+            text = "Reasoning without box yet."
+            toks = self._tokenizer.encode(text)
+            return {
+                "text": text,
+                "tokens": toks,
+                "logprobs": [-0.1] * len(toks),
+                "finish_reason": "length",
+            }
+
+    class _RecordingEngine:
+        def __init__(self, inner: HeterogeneousRolloutEngine):
+            self._inner = inner
+            self.route_infos: list[dict] = []
+
+        def __getattr__(self, name: str):
+            return getattr(self._inner, name)
+
+        async def generate(self, **kwargs):
+            out = await self._inner.generate(**kwargs)
+            self.route_infos.append(dict(out.get("_schedule_info", {})))
+            return out
+
+    rows_by_arch: dict[str, dict] = {}
+    for raw in SAMPLE_DATASET.read_text(encoding="utf-8").splitlines():
+        row = json.loads(raw)
+        rows_by_arch.setdefault(row["archetype"], row)
+    assert set(rows_by_arch) == {
+        "short_clean",
+        "short_recover",
+        "medium",
+        "long_unambig",
+        "long_cascading",
     }
-    assert len(eval_a) == 60
-    assert Counter(it["kind"] for it in eval_a) == {
-        "short": 48,
-        "quick_fix": 10,
-        "deep_fail": 1,
-        "deep_timeout": 1,
-    }
 
-    expected_turns = {"short": 1, "quick_fix": 2, "deep_fail": 11, "deep_timeout": 11}
-    for it_a, it_b in zip(eval_a, eval_b):
-        assert it_a["prompt_id"] == it_b["prompt_id"]
-        assert it_a["input_tokens0"] == 1024
-        assert it_b["input_tokens0"] == 1024
-        assert it_a["prompt0"].startswith("[session=E01] ")
-        assert it_b["prompt0"].startswith("[session=E02] ")
-        assert len(it_a["turns"]) == expected_turns[it_a["kind"]]
-
-
-def test_rollout_benchmark_dry_run_and_shell_syntax():
-    bench_py = (
-        REPO_ROOT / "repro/tier2_four_gpu_closed_loop/benchmark_rollout_scheduling.py"
+    tok = _CharTokenizer()
+    workflow = DAPOMathWorkflow(
+        tokenizer=tok,
+        max_turns=3,
+        max_new_tokens=1792,
+        max_seq_length=6144,
+        max_prompt_tokens=512,
     )
-    bench_sh = REPO_ROOT / "repro/tier2_four_gpu_closed_loop/run_rollout_ab.sh"
 
-    proc_py = subprocess.run(
-        [sys.executable, str(bench_py), "--dry-run"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    parsed = json.loads(proc_py.stdout)
-    assert parsed["dry_run"] is True
-    assert list(parsed["policies"].keys()) == [
-        "round_robin",
-        "least_connections",
-        "length_aware",
-        "la_mlfq",
-        "cmlfq",
-        "cmlfq_cost",
-    ]
+    tp_routes_by_policy: dict[str, dict[str, list[int]]] = {}
+    for policy in ("cmlfq", "cmlfq_cost"):
+        plan = build_run_plan(
+            mode="8gpu",
+            policy=policy,
+            gpus=list(range(8)),
+            output_dir=tmp_path / policy,
+            dataset_path=SAMPLE_DATASET,
+        )
+        materialize_run_plan(plan)
+        cfg = AsyncRLConfig.from_yaml(plan["config_path"])
+        hetero = HeterogeneousRolloutEngine.from_config(cfg)
+        hetero.engines = [_FixedMockVLLM(tok) for _ in range(3)]
+        rec = _RecordingEngine(hetero)
 
-    subprocess.run(["bash", "-n", str(bench_sh)], check=True)
-    proc_sh = subprocess.run(
-        ["bash", str(bench_sh), "--dry-run", "--python", sys.executable],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert "[tp1_0] CUDA_VISIBLE_DEVICES=0" in proc_sh.stdout
-    assert "[tp4_0] CUDA_VISIBLE_DEVICES=4,5,6,7" in proc_sh.stdout
-    assert "--enable-prefix-caching" in proc_sh.stdout
+        tp_routes: dict[str, list[int]] = {}
+        for arch in (
+            "short_clean",
+            "short_recover",
+            "medium",
+            "long_unambig",
+            "long_cascading",
+        ):
+            before = len(rec.route_infos)
+            asyncio.run(workflow.run_episode(rec, rows_by_arch[arch], version=0))
+            tp_routes[arch] = [r["tp_degree"] for r in rec.route_infos[before:]]
+        tp_routes_by_policy[policy] = tp_routes
+
+    assert tp_routes_by_policy["cmlfq"]["short_clean"] == [1]
+    assert tp_routes_by_policy["cmlfq"]["short_recover"] == [1, 1, 1]
+    assert tp_routes_by_policy["cmlfq"]["medium"] == [1, 2]
+    assert tp_routes_by_policy["cmlfq"]["long_unambig"] == [1, 4, 4]
+    assert tp_routes_by_policy["cmlfq"]["long_cascading"] == [1, 1, 4]
+
+    assert tp_routes_by_policy["cmlfq_cost"]["short_clean"] == [1]
+    assert tp_routes_by_policy["cmlfq_cost"]["short_recover"] == [1, 1, 1]
+    assert tp_routes_by_policy["cmlfq_cost"]["medium"] == [1, 2]
+    assert tp_routes_by_policy["cmlfq_cost"]["long_unambig"] == [1, 4, 4]
+    assert tp_routes_by_policy["cmlfq_cost"]["long_cascading"] == [1, 4, 4]

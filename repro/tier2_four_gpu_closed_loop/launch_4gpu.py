@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Slurm-free Tier 2 launcher for 4-GPU heterogeneous and 1-GPU Colab closed-loop RL."""
+"""Slurm-free Tier 2 launcher for 8-GPU / 4-GPU heterogeneous and 1-GPU Colab closed-loop RL."""
 
 from __future__ import annotations
 
@@ -56,13 +56,23 @@ def _ensure_rl_framework_importable() -> Path:
 REPO_ROOT = _ensure_rl_framework_importable()
 
 from RL_Framework.config import AsyncRLConfig  # noqa: E402
+from RL_Framework.infra.scheduling.cmlfq_prefix_tree import CausalPrefixTree, Trajectory  # noqa: E402
+from RL_Framework.infra.scheduling.cmlfq_tool_state import (  # noqa: E402
+    ExecutionStatus,
+    PayloadSizeClass,
+    ToolReturnState,
+)
 from RL_Framework.scripts.summarize_scheduler_rl import summarize  # noqa: E402
 
 
 DEFAULT_DATASET = (
     REPO_ROOT / "repro/tier2_four_gpu_closed_loop/sample_data/dapo_math_mini.jsonl"
 )
+DEFAULT_COST_PROFILE = (
+    REPO_ROOT / "repro/tier2_four_gpu_closed_loop/sample_data/dapo_cost_profile.json"
+)
 
+EIGHT_GPU_POLICIES = ("round_robin", "least_connections", "cmlfq", "cmlfq_cost")
 FOUR_GPU_POLICIES = ("round_robin", "least_connections", "cmlfq", "cmlfq_cost")
 COLAB_POLICIES = ("round_robin", "least_connections")
 
@@ -137,14 +147,18 @@ def detect_colab_tier() -> str:
 
 def parse_gpu_list(raw: str | None, *, mode: str) -> list[int]:
     """Parse GPU indices from --gpus or CUDA_VISIBLE_DEVICES."""
-    default_str = "0,1,2,3" if mode == "4gpu" else "0"
+    default_str = {
+        "8gpu": "0,1,2,3,4,5,6,7",
+        "4gpu": "0,1,2,3",
+        "colab-1gpu": "0",
+    }[mode]
     source = (
         raw
         if raw is not None
         else (os.environ.get("CUDA_VISIBLE_DEVICES") or default_str)
     )
     gpus = [int(item.strip()) for item in source.split(",") if item.strip()]
-    min_gpus = 4 if mode == "4gpu" else 1
+    min_gpus = {"8gpu": 8, "4gpu": 4, "colab-1gpu": 1}[mode]
     if len(gpus) < min_gpus:
         raise ValueError(
             f"Mode {mode!r} requires at least {min_gpus} GPU(s), got {gpus}"
@@ -154,6 +168,17 @@ def parse_gpu_list(raw: str | None, *, mode: str) -> list[int]:
 
 def resolve_policies(policy: str, mode: str) -> list[str]:
     """Resolve CLI --policy string into an ordered list of policies to run."""
+    if mode == "8gpu":
+        if policy == "auto":
+            return ["cmlfq_cost"]
+        if policy == "all":
+            return ["round_robin", "least_connections", "cmlfq", "cmlfq_cost"]
+        if policy not in EIGHT_GPU_POLICIES:
+            raise ValueError(
+                f"Unsupported policy {policy!r} for 8gpu; choose from {EIGHT_GPU_POLICIES} or 'all'"
+            )
+        return [policy]
+
     if mode == "4gpu":
         if policy == "auto":
             return ["cmlfq_cost"]
@@ -194,7 +219,27 @@ def _scheduling_block(
         }
 
     is_causal = policy in ("cmlfq", "cmlfq_cost")
-    return {
+    if mode == "8gpu":
+        buckets = {
+            "short": {"tp_degrees": [1], "max_tokens": 400},
+            "medium": {"tp_degrees": [2], "max_tokens": 1200},
+            "long": {"tp_degrees": [4], "max_tokens": max(6144, max_model_len)},
+        }
+        transfer_pairs = (
+            [[1, 2], [2, 1], [1, 4], [4, 1], [2, 4], [4, 2]]
+            if (is_causal and kv_backend == "cpu_offload")
+            else []
+        )
+    else:
+        buckets = {
+            "short": {"tp_degrees": [1], "max_tokens": 512},
+            "long": {"tp_degrees": [2], "max_tokens": max(2048, max_model_len)},
+        }
+        transfer_pairs = (
+            [[1, 2], [2, 1]] if (is_causal and kv_backend == "cpu_offload") else []
+        )
+
+    block: dict[str, Any] = {
         "scheduler_type": policy if is_causal else "load_balance",
         "load_balance_strategy": (
             "round_robin" if policy == "round_robin" else "least_connections"
@@ -204,14 +249,12 @@ def _scheduling_block(
         "cmlfq_kv_backend": kv_backend if is_causal else "recompute",
         "cmlfq_tree_path": str(run_dir / "tree.json"),
         "cmlfq_rebuild_interval": 8,
-        "cmlfq_kv_transfer_tp_pairs": (
-            [[1, 2], [2, 1]] if (is_causal and kv_backend == "cpu_offload") else []
-        ),
-        "cmlfq_buckets": {
-            "short": {"tp_degrees": [1], "max_tokens": 512},
-            "long": {"tp_degrees": [2], "max_tokens": max(2048, max_model_len)},
-        },
+        "cmlfq_kv_transfer_tp_pairs": transfer_pairs,
+        "cmlfq_buckets": buckets,
     }
+    if policy == "cmlfq_cost" and DEFAULT_COST_PROFILE.is_file():
+        block["cmlfq_cost_profile_path"] = str(DEFAULT_COST_PROFILE.resolve())
+    return block
 
 
 def _vllm_supervisor_command(
@@ -229,6 +272,7 @@ def _vllm_supervisor_command(
     max_num_seqs: int,
     seed: int,
     kv_storage_dir: Path | None,
+    enable_cuda_graphs: bool = False,
 ) -> list[str]:
     vllm_cmd = [
         python_bin,
@@ -249,14 +293,21 @@ def _vllm_supervisor_command(
         str(gpu_memory_utilization),
         "--max-num-seqs",
         str(max_num_seqs),
-        "--enforce-eager",
-        "--disable-log-requests",
-        "--no-enable-prefix-caching",
-        "--seed",
-        str(seed),
-        "--worker-extension-cls",
-        "RL_Framework.vllm_hot_reload.InplaceReloadWorkerExtension",
     ]
+    if enable_cuda_graphs and kv_storage_dir is None:
+        vllm_cmd.extend(["--disable-log-requests", "--enable-prefix-caching"])
+    else:
+        vllm_cmd.extend(
+            ["--enforce-eager", "--disable-log-requests", "--no-enable-prefix-caching"]
+        )
+    vllm_cmd.extend(
+        [
+            "--seed",
+            str(seed),
+            "--worker-extension-cls",
+            "RL_Framework.vllm_hot_reload.InplaceReloadWorkerExtension",
+        ]
+    )
     if kv_storage_dir is not None:
         vllm_cmd.extend(
             [
@@ -310,19 +361,22 @@ def build_run_plan(
     gpu_memory_utilization: float | None = None,
     max_model_len: int | None = None,
     max_new_tokens: int | None = None,
-    max_turns: int = 2,
+    max_turns: int | None = None,
     python_bin: str = sys.executable,
 ) -> dict[str, Any]:
     """Build a complete Slurm-free launch plan for one trial run."""
     run_dir = (output_dir / f"{policy}_{seed}").resolve()
     control_dir = run_dir / "control"
     resolved_tier: str | None = None
+    resolved_turns = max_turns if max_turns is not None else (3 if mode == "8gpu" else 2)
+    enable_cuda_graphs = mode in ("8gpu", "4gpu") and kv_backend == "recompute"
 
     if mode == "colab-1gpu":
         resolved_tier = detect_colab_tier() if colab_tier == "auto" else colab_tier
         preset = COLAB_TIER_PRESETS[resolved_tier]
         resolved_model = model_path or preset["model"]
         arch_yaml = preset["model_arch_yaml"]
+        hw_yaml = "a800_80g.yaml"
         vllm_dtype = preset["vllm_dtype"]
         fsdp_dtype = preset["fsdp_dtype"]
         gpu_util = (
@@ -333,6 +387,7 @@ def build_run_plan(
         resolved_max_len = max_model_len or preset["max_model_len"]
         resolved_max_new = max_new_tokens or preset["max_new_tokens"]
         resolved_batch = batch_size or preset["batch_size"]
+        resolved_micro_batch = 1
         resolved_steps = steps or 4
         resolved_sync = sync_interval or preset["sync_interval"]
         max_num_seqs = preset["max_num_seqs"]
@@ -341,15 +396,46 @@ def build_run_plan(
         rollout_layout = [("tp1", 1, [gpus[0]], base_port)]
         rollout_gpus = 1
         kv_storage_dir = None
+    elif mode == "8gpu":
+        resolved_model = model_path or "Qwen/Qwen3-4B"
+        arch_yaml = "qwen3-4b.yaml"
+        h20_cfg = REPO_ROOT / "configs/hardware_config/h20_3e_141g.yaml"
+        hw_yaml = "h20_3e_141g.yaml" if h20_cfg.is_file() else "a800_80g.yaml"
+        vllm_dtype = "bfloat16"
+        fsdp_dtype = "bfloat16"
+        gpu_util = gpu_memory_utilization if gpu_memory_utilization is not None else 0.75
+        resolved_max_len = max_model_len or 6144
+        resolved_max_new = max_new_tokens or 1792
+        resolved_batch = batch_size or 16
+        resolved_micro_batch = 1
+        resolved_steps = steps or 4
+        resolved_sync = sync_interval or 4
+        max_num_seqs = 16
+        max_concurrent = max(32, resolved_batch * 2)
+        train_gpu = gpus[0]
+        rollout_layout = [
+            ("tp1", 1, [gpus[1]], base_port),
+            ("tp2", 2, [gpus[2], gpus[3]], base_port + 1),
+            ("tp4", 4, [gpus[4], gpus[5], gpus[6], gpus[7]], base_port + 2),
+        ]
+        rollout_gpus = 7
+        kv_base = Path("/dev/shm") if Path("/dev/shm").is_dir() else run_dir
+        kv_storage_dir = (
+            kv_base / f"libra-tier2-{os.getpid()}-{policy}-s{seed}"
+            if (kv_backend == "cpu_offload" and policy in ("cmlfq", "cmlfq_cost"))
+            else None
+        )
     else:
         resolved_model = model_path or "Qwen/Qwen3-4B"
         arch_yaml = "qwen3-4b.yaml"
+        hw_yaml = "a800_80g.yaml"
         vllm_dtype = "bfloat16"
         fsdp_dtype = "bfloat16"
         gpu_util = gpu_memory_utilization if gpu_memory_utilization is not None else 0.65
         resolved_max_len = max_model_len or 2048
         resolved_max_new = max_new_tokens or 512
         resolved_batch = batch_size or 8
+        resolved_micro_batch = 1
         resolved_steps = steps or 8
         resolved_sync = sync_interval or 4
         max_num_seqs = 16
@@ -380,7 +466,7 @@ def build_run_plan(
 
     config_dict: dict[str, Any] = {
         "hardware_config": str(
-            (REPO_ROOT / "configs/hardware_config/a800_80g.yaml").resolve()
+            (REPO_ROOT / "configs/hardware_config" / hw_yaml).resolve()
         ),
         "model_arch_config": str(
             (REPO_ROOT / "configs/model_arch_config" / arch_yaml).resolve()
@@ -395,7 +481,8 @@ def build_run_plan(
         "train_pp_size": 1,
         "train_dp_size": 1,
         "batch_size": resolved_batch,
-        "micro_batch_size": 1,
+        "micro_batch_size": resolved_micro_batch,
+        "recompute_micro_batch_size": resolved_micro_batch,
         "total_steps": resolved_steps,
         "n_samples": n_samples,
         "max_concurrent_rollouts": max_concurrent,
@@ -408,7 +495,7 @@ def build_run_plan(
         "learning_rate": 1.0e-6,
         "ppo_epochs": 1,
         "seed": seed,
-        "recompute_logprobs": True,
+        "recompute_logprobs": False if mode == "8gpu" else True,
         "sync_interval": resolved_sync,
         "rollout_sync_drain_lead_steps": 1,
         "weight_sync_mode": "disk",
@@ -447,12 +534,12 @@ def build_run_plan(
         "OMP_NUM_THREADS": "4",
         "TOKENIZERS_PARALLELISM": "false",
         "WANDB_MODE": "disabled",
-        "FSDP_GRADIENT_CHECKPOINTING": "1",
+        "FSDP_GRADIENT_CHECKPOINTING": "0" if mode == "8gpu" else "1",
         "FSDP_DTYPE": fsdp_dtype,
         "FSDP_PROGRESS_DIR": str(run_dir / "progress"),
         "BENCH_RUN_DIR": str(run_dir),
         "DAPO_MATH_PATH": str(dataset_path.resolve()),
-        "DAPO_MAX_TURNS": str(max_turns),
+        "DAPO_MAX_TURNS": str(resolved_turns),
         "DAPO_MAX_PROMPT_TOKENS": "384" if resolved_max_len <= 1024 else "512",
         "NO_PROXY": "localhost,127.0.0.1",
         "no_proxy": "localhost,127.0.0.1",
@@ -467,6 +554,11 @@ def build_run_plan(
     rollout_specs = []
     for inst_id, tp, inst_gpus, port in rollout_layout:
         health_url = f"http://127.0.0.1:{port}/health"
+        inst_max_num_seqs = (
+            {1: 1, 2: 2, 4: 16}.get(tp, max_num_seqs)
+            if mode == "8gpu"
+            else max_num_seqs
+        )
         rollout_specs.append(
             {
                 "instance_id": inst_id,
@@ -487,9 +579,10 @@ def build_run_plan(
                     vllm_dtype=vllm_dtype,
                     max_model_len=resolved_max_len,
                     gpu_memory_utilization=gpu_util,
-                    max_num_seqs=max_num_seqs,
+                    max_num_seqs=inst_max_num_seqs,
                     seed=seed,
                     kv_storage_dir=kv_storage_dir,
+                    enable_cuda_graphs=enable_cuda_graphs,
                 ),
             }
         )
@@ -529,6 +622,76 @@ def build_run_plan(
     }
 
 
+def _seed_warmup_tree_file(tree_path: Path, mode: str, policy: str) -> None:
+    """Seed causal warmup trajectories into ``tree_path`` for ``cmlfq`` / ``cmlfq_cost``."""
+    unit = "model_generated_tokens" if policy == "cmlfq_cost" else "context_tokens"
+    tree = CausalPrefixTree()
+
+    small_fail = ToolReturnState(
+        "dapo_math_validator", PayloadSizeClass.SizeSmall, ExecutionStatus.ToolFailure
+    )
+    small_succ = ToolReturnState(
+        "dapo_math_validator", PayloadSizeClass.SizeSmall, ExecutionStatus.ToolSuccess
+    )
+    small_timeout = ToolReturnState(
+        "dapo_math_validator", PayloadSizeClass.SizeSmall, ExecutionStatus.ToolTimeout
+    )
+    med_fail = ToolReturnState(
+        "dapo_math_validator", PayloadSizeClass.SizeMedium, ExecutionStatus.ToolFailure
+    )
+    med_succ = ToolReturnState(
+        "dapo_math_validator", PayloadSizeClass.SizeMedium, ExecutionStatus.ToolSuccess
+    )
+    large_fail = ToolReturnState(
+        "dapo_math_validator", PayloadSizeClass.SizeLarge, ExecutionStatus.ToolFailure
+    )
+    large_succ = ToolReturnState(
+        "dapo_math_validator", PayloadSizeClass.SizeLarge, ExecutionStatus.ToolSuccess
+    )
+
+    if mode == "8gpu":
+        # Preserves bimodal Turn-1 signal on small:failure (mean in medium <= 1200,
+        # p90 in long > 1200) across Steps 0..3 so cmlfq waits until Turn 2 while
+        # cmlfq_cost eagerly promotes via residual_distribution + dapo_cost_profile.json.
+        specs = [
+            (3, [large_fail, large_fail], [3584.0, 1792.0], 3616.0),
+            (1, [large_fail, large_succ], [3584.0, 1792.0], 3616.0),
+            (3, [med_fail], [1120.0], 1152.0),
+            (1, [med_succ], [1120.0], 1152.0),
+            (6, [small_timeout, small_timeout], [320.0, 160.0], 352.0),
+            (18, [small_fail], [96.0], 128.0),
+            (2, [small_fail, small_fail], [3584.0, 1792.0], 3616.0),
+            (1, [small_fail, small_succ], [3584.0, 1792.0], 3616.0),
+        ]
+    else:
+        specs = [
+            (2, [large_fail, large_fail], [1536.0, 768.0], 1664.0),
+            (1, [large_fail, large_succ], [1536.0, 768.0], 1664.0),
+            (4, [small_fail], [96.0], 224.0),
+            (1, [small_fail, small_fail], [1536.0, 768.0], 1664.0),
+        ]
+
+    idx = 0
+    for count, states, rem, total_len in specs:
+        for _ in range(count):
+            tree.insert(
+                Trajectory(
+                    prompt_id=f"__warmup_{idx}",
+                    return_states=list(states),
+                    total_remaining_lengths=list(rem),
+                    total_length=total_len,
+                    remaining_unit=unit,
+                )
+            )
+            idx += 1
+
+    suffix = tree_path.suffix or ".json"
+    stem = tree_path.name[: -len(tree_path.suffix)] if tree_path.suffix else tree_path.name
+    for stale in tree_path.parent.glob(f"{stem}.rank_*{suffix}"):
+        stale.unlink(missing_ok=True)
+    tree.save(str(tree_path))
+
+
 def materialize_run_plan(plan: dict[str, Any]) -> None:
     """Write config.yaml + launch_plan.json and validate with AsyncRLConfig.from_yaml."""
     run_dir = Path(plan["run_dir"])
@@ -538,6 +701,12 @@ def materialize_run_plan(plan: dict[str, Any]) -> None:
     )
     if plan["kv_storage_dir"]:
         Path(plan["kv_storage_dir"]).mkdir(parents=True, exist_ok=True)
+
+    sched_cfg = plan["config"]["heterogeneous_rollout"]["scheduling"]
+    if plan["policy"] in ("cmlfq", "cmlfq_cost") and plan["mode"] in ("8gpu", "4gpu"):
+        tree_path_str = sched_cfg.get("cmlfq_tree_path")
+        if tree_path_str:
+            _seed_warmup_tree_file(Path(tree_path_str), plan["mode"], plan["policy"])
 
     config_path = Path(plan["config_path"])
     config_path.write_text(
@@ -612,15 +781,27 @@ def execute_run_plan(plan: dict[str, Any], timeout_s: float = 2400.0) -> None:
     env = dict(os.environ, **plan["env_overrides"])
     processes: list[subprocess.Popen[Any]] = []
     log_handles = []
+    cache_dirs: list[Path] = []
 
     try:
         health_urls = []
         for spec in plan["rollout_specs"]:
+            inst_cache = Path(plan["run_dir"]) / f"cache_{spec['instance_id']}"
+            for sub in ("vllm", "inductor", "triton"):
+                (inst_cache / sub).mkdir(parents=True, exist_ok=True)
+            cache_dirs.append(inst_cache)
+            inst_env = dict(
+                env,
+                CUDA_VISIBLE_DEVICES=spec["cuda_visible_devices"],
+                VLLM_CACHE_ROOT=str(inst_cache / "vllm"),
+                TORCHINDUCTOR_CACHE_DIR=str(inst_cache / "inductor"),
+                TRITON_CACHE_DIR=str(inst_cache / "triton"),
+            )
             log_file = Path(spec["log_path"]).open("w", encoding="utf-8")
             log_handles.append(log_file)
             proc = subprocess.Popen(
                 spec["command"],
-                env=dict(env, CUDA_VISIBLE_DEVICES=spec["cuda_visible_devices"]),
+                env=inst_env,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -672,6 +853,8 @@ def execute_run_plan(plan: dict[str, Any], timeout_s: float = 2400.0) -> None:
             _stop_process(proc)
         for handle in log_handles:
             handle.close()
+        for cdir in cache_dirs:
+            shutil.rmtree(cdir, ignore_errors=True)
         if plan["kv_storage_dir"]:
             shutil.rmtree(plan["kv_storage_dir"], ignore_errors=True)
 
@@ -699,18 +882,18 @@ def _print_dry_run_summary(plans: list[dict[str, Any]]) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Tier 2 Slurm-free launcher for 4-GPU closed loop and 1-GPU Google Colab"
+        description="Tier 2 Slurm-free launcher for 8-GPU / 4-GPU closed loop and 1-GPU Google Colab"
     )
     parser.add_argument(
         "--mode",
-        choices=("4gpu", "colab-1gpu"),
+        choices=("8gpu", "4gpu", "colab-1gpu"),
         default="4gpu",
-        help="4gpu: 1 Train + 3 heterogeneous Rollout; colab-1gpu: single co-located GPU",
+        help="8gpu: 1 Train + 7 Rollout [TP=1,2,4]; 4gpu: 1 Train + 3 Rollout [TP=1,2]; colab-1gpu: co-located GPU",
     )
     parser.add_argument(
         "--policy",
         default="auto",
-        help="Scheduling policy (4gpu: round_robin/least_connections/cmlfq/cmlfq_cost/all; colab-1gpu: least_connections/round_robin/all)",
+        help="Scheduling policy (8gpu/4gpu: round_robin/least_connections/cmlfq/cmlfq_cost/all; colab-1gpu: least_connections/round_robin/all)",
     )
     parser.add_argument(
         "--colab-tier",
@@ -728,7 +911,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gpus",
         default=None,
-        help="Comma-separated GPU IDs (defaults to CUDA_VISIBLE_DEVICES or 0,1,2,3 / 0)",
+        help="Comma-separated GPU IDs (defaults to CUDA_VISIBLE_DEVICES or 0..7 / 0..3 / 0)",
     )
     parser.add_argument(
         "--output-dir",
@@ -737,7 +920,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Directory for run configs, checkpoints, history, and summary.json",
     )
     parser.add_argument("--steps", type=int, default=None, help="Training steps")
-    parser.add_argument("--batch-size", type=int, default=None, help="Prompts per RL step")
+    parser.add_argument("--batch-size", type=int, default=None, help="Trajectories per RL step")
     parser.add_argument("--n-samples", type=int, default=2, help="Rollouts per prompt")
     parser.add_argument("--sync-interval", type=int, default=None, help="Weight reload interval")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -751,7 +934,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-memory-utilization", type=float, default=None)
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=None)
-    parser.add_argument("--max-turns", type=int, default=2, help="Max rollout turns per episode")
+    parser.add_argument("--max-turns", type=int, default=None, help="Max rollout turns per episode")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -816,9 +999,10 @@ def main(argv: list[str] | None = None) -> int:
 
     history_glob = next(args.output_dir.glob("*/history/*.jsonl"), None)
     if history_glob is not None:
+        tp_arg = "1,2,4" if args.mode == "8gpu" else "1,2"
         print(
             "\nReplay collected rollout trace on CPU (Tier 1):\n"
-            f"  python repro/tier1_zero_gpu_replay/run_replay.py --trace {history_glob} --tp-layout 1,2"
+            f"  python repro/tier1_zero_gpu_replay/run_replay.py --trace {history_glob} --tp-layout {tp_arg}"
         )
     return 0
 

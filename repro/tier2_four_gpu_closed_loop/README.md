@@ -1,74 +1,63 @@
-# Tier 2 — Small-Scale Heterogeneous Benchmarks, Closed-Loop RL & Google Colab Quickstart
+# Tier 2 — 8-GPU & 4-GPU Heterogeneous Closed-Loop RL & Google Colab Quickstart
 
-Tier 2 provides **Slurm-free** GPU entry points covering:
+Tier 2 provides **Slurm-free** real-GPU **end-to-end closed-loop RL** entry points (`AsyncRLTrainer` + `FSDPTrainEngine` + `DAPOMathWorkflow` + supervised `vllm_hot_reload_api_server.py` with confirmed in-place weight reloads):
 
-1. **Mode A — Controlled Multi-Turn Heterogeneous Rollout Scheduling Benchmark (`4×TP=1 + 1×TP=4`)**: End-to-end 6-policy comparison (`round_robin`, `least_connections`, `length_aware`, `la_mlfq`, `cmlfq`, `cmlfq_cost`) against live `vLLM` servers with CUDA graphs, Automatic Prefix Caching (`--enable-prefix-caching`), and online H20-3e cold calibration.
-2. **Mode B — 4-GPU Heterogeneous Closed Loop (`1 Train + 3 Rollout`)**: Slurm-free `AsyncRLTrainer` (`FSDPTrainEngine` + `DAPOMathWorkflow` + supervised `vllm_hot_reload_api_server.py` with confirmed in-place weight reloads) across `TP=1` + `TP=2`.
-3. **Mode C — Google Colab 1-GPU Co-Located Startup**: Single-GPU closed-loop verification with automatic VRAM/SM tier detection (`T4 16GB`, `L4 24GB`, `A100 40GB`, `A100 80GB`).
+1. **8-GPU Heterogeneous Closed Loop (`1 Train + 7 Rollout [TP=1, TP=2, TP=4]`)**: Real end-to-end GRPO closed-loop training across three heterogeneous serving tiers (`TP=1` on GPU 1, `TP=2` on GPUs 2–3, `TP=4` on GPUs 4–7) comparing `round_robin`, `least_connections`, `cmlfq`, and `cmlfq_cost`.
+2. **4-GPU Heterogeneous Closed Loop (`1 Train + 3 Rollout [TP=1, TP=2]`)**: Smaller 4-GPU heterogeneous closed-loop setup (`TP=1` on GPU 1, `TP=2` on GPUs 2–3).
+3. **Google Colab 1-GPU Co-Located Startup**: Single-GPU closed-loop verification with automatic VRAM/SM tier detection (`T4 16GB`, `L4 24GB`, `A100 40GB`, `A100 80GB`).
+
+> Looking for pure rollout scheduling comparison (without FSDP training updates or weight sync)? See Tier 1 Pathway 2 (`Real-GPU Live vLLM Judge`) in [../tier1_zero_gpu_replay/README.md](../tier1_zero_gpu_replay/README.md).
 
 ---
 
-## Mode A: Controlled Multi-Turn Heterogeneous Rollout Scheduling Benchmark
+## Mode 1: 8-GPU Heterogeneous Closed Loop (`1 Train + TP=1, 2, 4`)
 
-Reproduce the controlled heterogeneous rollout comparison cleanly on an 8-GPU node (`4×TP=1 + 1×TP=4` by default, configurable via `--topology`):
+Reproduce the 8-GPU end-to-end closed-loop RL comparison without Slurm:
 
 ```bash
-# Dry-run: validate topology, unified thresholds, CostModel wiring, and launch commands without GPUs
-bash repro/tier2_four_gpu_closed_loop/run_rollout_ab.sh --dry-run
-
-# Full real-GPU 6-policy, 2-round counterbalanced benchmark on 8x H20-3e (Qwen3-14B)
-bash repro/tier2_four_gpu_closed_loop/run_rollout_ab.sh \
-  --model Qwen/Qwen3-14B \
+# Dry-run: validate topology, CostModel profile, seeded trees, and commands without GPUs
+python3 repro/tier2_four_gpu_closed_loop/launch_4gpu.py \
+  --mode 8gpu \
+  --policy all \
   --gpus 0,1,2,3,4,5,6,7 \
-  --topology 1,1,1,1,4 \
-  --output-dir ./logs/tier2_rollout_scheduling
+  --dry-run
+
+# Full 4-policy real-GPU end-to-end closed-loop RL sweep on 8x H20-3e
+bash repro/tier2_four_gpu_closed_loop/run_8gpu.sh \
+  --policy all \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --model Qwen/Qwen3-4B \
+  --output-dir ./logs/tier2_8gpu_ab
 ```
 
-### Experimental Setup
+### Experimental Setup (`8 × NVIDIA H20-3e`, `Qwen/Qwen3-4B`)
 
-- **Hardware & Topology**: Single node `8 × NVIDIA H20-3e (141 GiB)`, `Qwen/Qwen3-14B` (`bfloat16`), deployed as **`4 × TP=1` (GPUs 0–3) + `1 × TP=4` (GPUs 4–7)**.
-- **vLLM Serving Configuration**: `vLLM 0.9.2` V1 engine with CUDA graphs and `--enable-prefix-caching`, `max_model_len=24576`, `gpu_memory_utilization=0.85`, `max_num_seqs=32`, and per-instance cache isolation (`VLLM_CACHE_ROOT`, `TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR`).
-- **Fair Isolation & Unified Thresholds**:
-  - Each `(round, policy, phase)` prepends a fixed-width session tag (`W01..W12` / `E01..E12`) at token 0 and fits `prompt0` to `1024` tokens, eliminating cross-policy/cross-round KV cache leakage while preserving real intra-trajectory multi-turn vLLM prefix caching.
-  - All bucketed/length-aware schedulers share Libra's default boundary `short = 5000` (`BUCKETS_2`: `short -> TP=1 <= 5000`, `long -> TP=4 <= 24576`; `length_thresholds = {short: 5000, medium: 12000, long: 24576}`).
-- **Phase 1 Cold Calibration & Cost Model**: Unique token-0 trial prefixes measure cold prefill (`2048, 4096, 8192, 16384`) and decode (`b=1` / `b=8` at `ctx=2048, 6144`, `gen=1024`) on `TP=1` and `TP=4`, autofitting `CostModel` scales (`prefill_scale`, `decode_scale`) alongside measured `recompute_ms` migration costs (`decode_ms={}` uses continuous-batching makespan estimation).
-- **Heavy-Tailed Multi-Turn Workload**: Warmup `13` trajectories (`6 short / 4 quick_fix / 2 deep_fail / 1 deep_timeout`) and Eval `60` trajectories (`48 short / 10 quick_fix / 1 deep_fail / 1 deep_timeout`), 100% randomly shuffled, submitted at full-batch concurrency (`60`) with `temperature=0.0` and natural EOS over 2 counterbalanced rounds (Forward + Reverse):
-  - `short`: 1 turn (`max_new_tokens=256`).
-  - `quick_fix`: Turn 0 (`96`) -> `test_runner:medium:failure` (`1000`-tok log) -> Turn 1 (`192`).
-  - `deep_fail` / `deep_timeout`: Turn 0 (`96`) -> 10 turns of `1000`-tok `test_runner` logs + `640` generated tokens/turn (peak context ~`17.5K`).
+- **Hardware & Topology**: Single node `8 × NVIDIA H20-3e (141 GiB)`:
+  - **Training**: `1 × FSDPTrainEngine` on GPU `0` (`bfloat16`, `batch_size=16`, `micro_batch_size=1`, `recompute_logprobs=false`, `FSDP_GRADIENT_CHECKPOINTING=0`, `n_samples=2`, `ppo_epochs=1`, `sync_interval=4`).
+  - **Heterogeneous Rollout (`7` GPUs)**: `tp1` (`TP=1`, GPU `1`, `max_num_seqs=1`, port `18920`), `tp2` (`TP=2`, GPUs `2,3`, `max_num_seqs=2`, port `18921`), and `tp4` (`TP=4`, GPUs `4,5,6,7`, `max_num_seqs=16`, port `18922`).
+- **vLLM Serving & Weight Reload**: `vLLM 0.9.2` V1 engine with CUDA graphs enabled, `--enable-prefix-caching`, `max_model_len=6144`, `gpu_memory_utilization=0.75`, per-instance isolated compile/KV caches, and verified parallel in-place disk weight reload (`rollout_weight_reload_method=inplace`, confirmed via `ack_tp1_4.json`, `ack_tp2_4.json`, `ack_tp4_4.json`).
+- **Scheduling Policies & Calibration**:
+  - Baselines: `load_balance` (`round_robin`, `least_connections`).
+  - Causal schedulers: `cmlfq` and `cmlfq_cost` with unified three-tier buckets (`short -> TP=1 <= 400`, `medium -> TP=2 <= 1200`, `long -> TP=4 <= 6144`), pre-seeded `CausalPrefixTree` (`tree.json`), and empirical tier latency table (`sample_data/dapo_cost_profile.json`).
+- **Multi-Turn Closed-Loop Workload (`sample_data/dapo_math_mini.jsonl`)**: `4` RL steps $\times$ `8` prompts/step $\times$ `2` rollouts (`64` trajectories total, `64` FSDP optimizer updates per policy), mixing `short_recover` (`3` turns `[32, 160, 160]`, `small:timeout`), `medium` (`2` turns `[32, 1120]`, `medium:failure`), `long_unambig` (`rollout 0` `[32, 1792, 1792]` + `rollout 1` `[32]`, `large:failure`), and `long_cascading` (Step 0 bimodal causal signal on `small:failure`, where `cmlfq` defers migration at Turn 1 due to `mean_p90_disagree` while `cmlfq_cost` eagerly promotes at Turn 1 via residual distribution + cost model).
 
-### Verified Real-GPU Results (`8 × NVIDIA H20-3e`, `Qwen3-14B`)
+### Verified Real-GPU Closed-Loop Results (`8 × NVIDIA H20-3e`, `Qwen/Qwen3-4B`)
 
-**Phase 1 Cold Micro-Calibration**:
+All 4 policies completed 4 RL steps (`64` samples, `64` FSDP optimizer updates, `152` generation calls, `3/3` confirmed in-place weight reload acks):
 
-| Metric | `TP=1` | `TP=4` | `TP=4` Speedup |
-| :--- | ---: | ---: | ---: |
-| Prefill `ctx=2048` median | `430.4 ms` | `128.9 ms` | `3.34x` |
-| Prefill `ctx=4096` median | `864.2 ms` | `251.5 ms` | `3.44x` |
-| Prefill `ctx=8192` median | `1790.3 ms` | `513.9 ms` | `3.48x` |
-| Prefill `ctx=16384` median | `3970.8 ms` | `1128.6 ms` | `3.52x` |
-| Decode `ctx=2048, gen=1024` (`b=1` / `b=8`) | `10.81s` / `15.94s` | `5.95s` / `7.49s` | `1.82x` / `2.13x` |
-| Decode `ctx=6144, gen=1024` (`b=1` / `b=8`) | `12.07s` / `26.38s` | `6.28s` / `11.19s` | `1.92x` / `2.36x` |
+| Policy | End-to-End `loop_seconds` | `rollout_wait_seconds` | `train_seconds` | `sync_seconds` | `samples/s` | vs `round_robin` (`samples/s`) | `gen_tokens/s` | vs `round_robin` (`tok/s`) | Route Calls (`TP=1 / 2 / 4`) |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| `round_robin` | `168.60s` | `122.45s` | `29.94s` | `16.20s` | `0.3796` | `+0.0%` (`1.00x`) | `413.23` | `+0.0%` (`1.00x`) | `51 / 51 / 50` |
+| `least_connections` | `121.69s` | `76.02s` | `29.40s` | `16.26s` | `0.5259` | `+38.5%` (`1.39x`) | `574.93` | `+39.1%` (`1.39x`) | `45 / 52 / 55` |
+| `cmlfq` | `119.99s` | `73.57s` | `30.24s` | `16.15s` | `0.5334` | `+40.5%` (`1.41x`) | `580.13` | `+40.4%` (`1.40x`) | `113 / 16 / 23` |
+| **`cmlfq_cost`** | **`115.38s`** | **`69.98s`** | **`29.35s`** | **`16.02s`** | **`0.5547`** | **`+46.1%` (`1.46x`)** | **`607.22`** | **`+46.9%` (`1.47x`)** | **`100 / 17 / 35`** |
 
-Auto-fitted analytical `CostModel` scales: `TP=1: {prefill_scale: 0.6722, decode_scale: 1.4631}`, `TP=4: {prefill_scale: 0.7828, decode_scale: 2.6475}`.
-
-**Phase 2 Six-Policy Counterbalanced Results (Mean Across Forward Round 1 & Reverse Round 2)**:
-
-| Policy | Mean Makespan (R1 / R2) | Throughput (tok/s) | vs `round_robin` (tok/s) | Makespan Reduction | `deep_fail` / `deep_timeout` | Migrations | `TP=1 / TP=4` Calls |
-| :--- | --- | ---: | ---: | ---: | --- | ---: | ---: |
-| `la_mlfq` | `81.14s` (`81.09` / `81.18`) | `347.1` | `-4.0%` (`0.96x`) | `-4.2%` | `81.05s` / `81.13s` | `0` | `90 / 0` |
-| `round_robin` | `77.88s` (`77.43` / `78.33`) | `361.6` | `+0.0%` (`1.00x`) | `+0.0%` | `77.78s` / `77.88s` | `0` | `72 / 18` |
-| `least_connections` | `73.79s` (`73.48` / `74.09`) | `376.3` | `+4.1%` (`1.06x`) | `+5.3%` | `73.30s` / `70.02s` | `0` | `63 / 27` |
-| `cmlfq` | `58.42s` (`58.66` / `58.18`) | `472.7` | `+30.7%` (`1.33x`) | `+25.0%` | `58.42s` / `53.83s` | `14` | `66 / 24` |
-| `length_aware` | `52.61s` (`53.19` / `52.03`) | `532.6` | `+47.3%` (`1.48x`) | `+32.4%` | `52.60s` / `51.68s` | `0` | `74 / 16` |
-| **`cmlfq_cost`** | **`45.08s`** (`45.09` / `45.08`) | **`624.6`** | **`+72.7%` (`1.73x`)** | **`+42.1%`** | **`45.08s` / `45.08s`** | **`15`** | **`60 / 30`** |
-
-- **`cmlfq_cost` net speedups**: **`+72.7%` tok/s vs `round_robin`** (`1.73x`), **`+66.0%` vs `least_connections`**, **`+32.1%` vs `cmlfq`**, and **`+17.3%` vs `length_aware`**.
-- **Routing verification**: Across both rounds, `cmlfq_cost` generated all `28,160` expected tokens (`short=256`, `quick_fix=288`, `deep_fail=6496`, `deep_timeout=6496`), placed short requests cleanly across `4×TP=1` (`13,440` tokens), migrated deep bimodal/timeout tails proactively at Turn 1 to `TP=4` (`reasons={resume: 60, distribution_cost: 30}`, `paths={stay: 78, recompute: 12}`), and retained intra-episode vLLM APC residency (`tp_tokens={1: 13440, 4: 14720}`).
+- **`cmlfq_cost` net end-to-end closed-loop RL speedups**: **`+46.1%` (`1.46x`) `samples/s`** and **`+46.9%` (`1.47x`) `generated_tokens/s`** vs `round_robin` (`1.75x` faster rollout collection), **`+5.5%` `samples/s` / `+5.6%` `tok/s`** vs `least_connections`, and **`+4.0%` `samples/s` / `+4.7%` `tok/s`** vs `cmlfq`.
+- **Per-step stability & tier placement**: `cmlfq_cost` held steady rollout times across all 4 steps (`[16.97s, 17.73s, 17.62s, 17.66s]`), promoting all long trajectories at Turn 1 to `TP=4` (`35` calls, including Step 0 `long_cascading`), isolating `medium` on `TP=2` (`17` calls), and keeping short turns on `TP=1` (`100` calls), whereas `round_robin` stalled `tp1` with long/medium head-of-line queueing (`36.52s -> 24.93s` per step).
 
 ---
 
-## Mode B: 4-GPU Heterogeneous Closed Loop (No Slurm Required)
+## Mode 2: 4-GPU Heterogeneous Closed Loop (No Slurm Required)
 
 Runs 1 FSDP trainer on GPU 0 and 2 heterogeneous vLLM rollout instances on GPUs `1` (`TP=1`) and `2,3` (`TP=2`):
 
@@ -78,7 +67,7 @@ bash repro/tier2_four_gpu_closed_loop/run_4gpu.sh \
   --model Qwen/Qwen3-4B \
   --gpus 0,1,2,3
 
-# Full policy sweep across round_robin, least_connections, cmlfq, and cmlfq_cost
+# Full policy sweep across round_robin, least_connections, and cmlfq_cost
 bash repro/tier2_four_gpu_closed_loop/run_4gpu.sh \
   --model Qwen/Qwen3-4B \
   --policy all \
@@ -100,7 +89,7 @@ python3 repro/tier2_four_gpu_closed_loop/launch_4gpu.py --dry-run
 
 ---
 
-## Mode C: Google Colab 1-GPU Co-Located Startup
+## Mode 3: Google Colab 1-GPU Co-Located Startup
 
 Open [colab_quickstart.ipynb](colab_quickstart.ipynb) directly in Google Colab:
 
@@ -130,10 +119,11 @@ python3 repro/tier2_four_gpu_closed_loop/launch_4gpu.py \
 
 ## Bundled Sample Data, Scripts & Templates
 
-- [benchmark_rollout_scheduling.py](benchmark_rollout_scheduling.py) & [run_rollout_ab.sh](run_rollout_ab.sh): Controlled 6-policy multi-turn rollout benchmark with Phase 1 cold calibration, session-isolated vLLM APC, and unified `short=5000` thresholds.
-- [launch_4gpu.py](launch_4gpu.py) & [run_4gpu.sh](run_4gpu.sh): Slurm-free 4-GPU closed-loop RL and 1-GPU Colab launcher.
+- [launch_4gpu.py](launch_4gpu.py), [run_8gpu.sh](run_8gpu.sh), & [run_4gpu.sh](run_4gpu.sh): Slurm-free 8-GPU (`--mode 8gpu`) and 4-GPU (`--mode 4gpu`) closed-loop RL and 1-GPU Colab (`--mode colab-1gpu`) launcher.
 - [colab_quickstart.ipynb](colab_quickstart.ipynb): End-to-end Google Colab notebook (Tier 1 replay + Tier 2 closed-loop RL).
-- [sample_data/dapo_math_mini.jsonl](sample_data/dapo_math_mini.jsonl): 64 deterministic math verification problems (works offline out of the box; pass `--dataset /path/to/dapo-math-17k.parquet` for full DAPO-Math-17K).
+- [sample_data/dapo_math_mini.jsonl](sample_data/dapo_math_mini.jsonl): 64 deterministic math verification problems with multi-turn rollout profiles (works offline out of the box; pass `--dataset /path/to/dapo-math-17k.parquet` for full DAPO-Math-17K).
+- [sample_data/dapo_cost_profile.json](sample_data/dapo_cost_profile.json): Empirical H20-3e tier latency profile for `cmlfq_cost` in 8-GPU closed-loop evaluation.
+- [config_8gpu_qwen3_4b.yaml](config_8gpu_qwen3_4b.yaml): Static 8-GPU configuration template (`1 Train + TP=1 + TP=2 + TP=4`).
 - [config_4gpu_qwen3_4b.yaml](config_4gpu_qwen3_4b.yaml): Static 4-GPU configuration template (`1 Train + TP=1 + TP=2`).
 - [config_colab_1gpu.yaml](config_colab_1gpu.yaml): Static 1-GPU Colab co-located configuration template.
 - **Runtime dependencies**: In addition to CPU CI deps, GPU execution requires `vllm`, `transformers`, `datasets`, `sympy`, `regex`, `latex2sympy2`, and `word2number` (pre-installed by Colab notebook Cell 1).
