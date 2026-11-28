@@ -1,0 +1,77 @@
+# Tier 2 Colab: 1-GPU Co-Located Closed Loop (1 vLLM Rollout + 1 FSDP Trainer sharing GPU 0)
+# Default preset sized for Colab Free T4 16GB (launch_4gpu.py scales automatically on L4 / A100).
+hardware_config: ../../configs/hardware_config/a800_80g.yaml
+model_arch_config: ../../configs/model_arch_config/qwen2.5-3b.yaml
+
+model_path: "Qwen/Qwen2.5-0.5B-Instruct"
+tokenizer_path: "Qwen/Qwen2.5-0.5B-Instruct"
+
+train_backend: "fsdp"
+train_gpus: 1
+rollout_gpus: 1
+tp_size: 1
+train_tp_size: 1
+train_pp_size: 1
+train_dp_size: 1
+
+batch_size: 4
+micro_batch_size: 1
+total_steps: 4
+learning_rate: 1.0e-6
+ppo_epochs: 1
+kl_coef: 0.001
+clip_epsilon: 0.2
+gamma: 1.0
+recompute_logprobs: true
+
+max_concurrent_rollouts: 4
+max_head_offpolicyness: 4
+queue_size: 16
+max_new_tokens: 256
+max_seq_length: 1024
+n_samples: 2
+temperature: 0.8
+top_p: 0.95
+
+sync_interval: 2
+rollout_sync_drain_lead_steps: 1
+weight_sync_mode: "disk"
+sync_path: "./logs/tier2_colab/weights"
+rollout_weight_sync_mode: "restart"
+rollout_weight_reload_method: "inplace"
+rollout_weight_reload_strategy: "parallel"
+rollout_weight_sync_control_dir: "./logs/tier2_colab/control"
+rollout_weight_sync_timeout_s: 1200
+require_rollout_weight_sync: true
+
+eval_interval: 0
+save_interval: 0
+log_dir: "./logs/tier2_colab"
+seed: 42
+
+enable_history_collection: true
+history_output_dir: "./logs/tier2_colab/history"
+history_save_raw_lengths: true
+history_flush_interval: 1
+history_experiment_name: "tier2_colab_dapo_math"
+
+heterogeneous_rollout:
+  enabled: true
+  total_gpus: 1
+  vllm_host: "127.0.0.1"
+  vllm_base_port: 18920
+  max_model_len: 1024
+  gpu_memory_utilization: 0.30
+
+  instances:
+    - instance_id: "tp1"
+      tp: 1
+      gpus: [0]
+      host: "127.0.0.1"
+      port: 18920
+
+  scheduling:
+    scheduler_type: "load_balance"
+    load_balance_strategy: "least_connections"
+    max_queue_length: 8
+    enable_fallback: true

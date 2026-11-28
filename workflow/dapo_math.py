@@ -125,7 +125,13 @@ class DAPOMathWorkflow:
             return tokens, logprobs
         return tokens[:remaining], logprobs[:remaining]
 
-    async def run_episode(self, engine: Any, data: dict[str, Any], version: int = 0) -> dict[str, torch.Tensor]:
+    async def run_episode(
+        self,
+        engine: Any,
+        data: dict[str, Any],
+        version: int = 0,
+        rollout_index: int = 0,
+    ) -> dict[str, torch.Tensor]:
         prompt_text = self._build_prompt(data)
         prompt_tokens = self._encode(prompt_text)
         answer = self._extract_answer(data)
@@ -135,15 +141,45 @@ class DAPOMathWorkflow:
 
         begin_cmlfq = getattr(engine, "begin_cmlfq_request", None)
         cmlfq_request_id = begin_cmlfq(prompt_id, len(prompt_tokens)) if callable(begin_cmlfq) else ""
+        use_rollout1 = int(rollout_index) == 1 and isinstance(data.get("rollout1_turn_max_tokens"), list) and bool(data.get("rollout1_turn_max_tokens"))
+        raw_turn_budgets = (
+            data.get("rollout1_turn_max_tokens")
+            if use_rollout1
+            else data.get("turn_max_tokens")
+        )
+        row_turn_budgets = (
+            [max(1, int(toks)) for toks in raw_turn_budgets]
+            if isinstance(raw_turn_budgets, list) and raw_turn_budgets
+            else None
+        )
+        raw_max_turns = data.get("rollout1_max_turns") if use_rollout1 else data.get("max_turns")
+        if raw_max_turns is None:
+            raw_max_turns = len(row_turn_budgets) if row_turn_budgets is not None else self.max_turns
+        episode_max_turns = max(1, int(raw_max_turns))
+        force_ignore_eos = bool(data.get("ignore_eos"))
+        validator_hint = str(data.get("validator_hint") or "").strip()
+        payload_size_spec = (
+            data.get("rollout1_payload_size_class")
+            if use_rollout1 and "rollout1_payload_size_class" in data
+            else data.get("payload_size_class")
+        )
+        raw_tool_status = (
+            data.get("rollout1_tool_status")
+            if use_rollout1 and "rollout1_tool_status" in data
+            else data.get("tool_status")
+        )
+        tool_status_override = str(raw_tool_status or "").strip()
         current_text = prompt_text
         final_completion = ""
         final_turn = 0
         try:
-            for turn in range(self.max_turns):
+            for turn in range(episode_max_turns):
                 final_turn = turn
                 used = sum(len(toks) for toks, _, _ in segments)
                 generation_prompt, prompt_len = self._fit_generation_prompt(current_text)
                 max_tokens = self._generation_budget(prompt_len, used, turn)
+                if row_turn_budgets is not None and turn < len(row_turn_budgets):
+                    max_tokens = min(max_tokens, row_turn_budgets[turn])
                 kwargs = {
                     "prompt_id": prompt_id,
                     "prompt": generation_prompt,
@@ -155,6 +191,8 @@ class DAPOMathWorkflow:
                     # passing it skips the engine-side estimation encode.
                     "input_tokens": prompt_len,
                 }
+                if force_ignore_eos or (row_turn_budgets is not None and turn < episode_max_turns - 1):
+                    kwargs["ignore_eos"] = True
                 if cmlfq_request_id:
                     kwargs.update({"request_id": cmlfq_request_id, "prompt_id": prompt_id})
                 response = await engine.generate(**kwargs)
@@ -170,10 +208,15 @@ class DAPOMathWorkflow:
                     segments.append((output_tokens, output_logprobs, 1))
 
                 metrics = evaluate_math_completion(output_text, answer)
-                if turn >= self.max_turns - 1 or metrics["accuracy"] >= 1.0:
+                if row_turn_budgets is not None and len(row_turn_budgets) > 1:
+                    if turn >= episode_max_turns - 1:
+                        break
+                elif turn >= episode_max_turns - 1 or metrics["accuracy"] >= 1.0:
                     break
 
                 feedback = format_math_validator_feedback(metrics)
+                if validator_hint:
+                    feedback = f"{feedback}\n{validator_hint}"
                 feedback_tokens = self._encode(feedback)
                 used_after_output = sum(len(toks) for toks, _, _ in segments)
                 feedback_tokens, feedback_logprobs = self._clip(
@@ -184,19 +227,34 @@ class DAPOMathWorkflow:
                 feedback = self.tokenizer.decode(feedback_tokens, skip_special_tokens=True)
                 segments.append((feedback_tokens, feedback_logprobs, 0))
                 generated_tokens = sum(len(toks) for toks, _, _ in segments[1:])
+                pure_generated_tokens = sum(len(toks) for toks, _, mask in segments if mask == 1)
+                resolved_status = (
+                    tool_status_override
+                    if tool_status_override in ("success", "failure", "timeout")
+                    else ("success" if metrics["accuracy"] >= 1.0 else "failure")
+                )
                 tool_event = {
                     "tool_type": "dapo_math_validator",
                     "output": feedback,
-                    "status": "success" if metrics["accuracy"] >= 1.0 else "failure",
+                    "status": resolved_status,
                     "payload_tokens": len(feedback_tokens),
                     "token_position": generated_tokens,
+                    "generated_token_position": pure_generated_tokens,
                     "turn": turn,
                     "reward": metrics["reward"],
                     "accuracy": metrics["accuracy"],
                 }
+                if isinstance(payload_size_spec, list):
+                    if turn < len(payload_size_spec) and payload_size_spec[turn]:
+                        tool_event["payload_size_class"] = str(payload_size_spec[turn])
+                elif payload_size_spec:
+                    tool_event["payload_size_class"] = str(payload_size_spec)
                 tool_returns.append(tool_event)
+                record_tool_return = getattr(engine, "record_cmlfq_tool_return", None)
                 route_tool_return = getattr(engine, "route_cmlfq_tool_return", None)
-                if cmlfq_request_id and callable(route_tool_return):
+                if cmlfq_request_id and callable(record_tool_return):
+                    record_tool_return(cmlfq_request_id, tool_event, generated_tokens)
+                elif cmlfq_request_id and callable(route_tool_return):
                     route_tool_return(cmlfq_request_id, tool_event, generated_tokens)
                 current_text += output_text + "\n" + feedback + "\n"
         except BaseException:
@@ -226,7 +284,10 @@ class DAPOMathWorkflow:
             tr["remaining_length"] = max(0, total_output_tokens - pos)
         finish_cmlfq = getattr(engine, "finish_cmlfq_request", None)
         if cmlfq_request_id and callable(finish_cmlfq):
-            finish_cmlfq(cmlfq_request_id, total_output_tokens)
+            try:
+                finish_cmlfq(cmlfq_request_id, total_output_tokens, generated_tokens=output_len)
+            except TypeError:
+                finish_cmlfq(cmlfq_request_id, total_output_tokens)
         reward = self.reward_fn(prompt=prompt_text, completion=final_completion, ground_truth=answer, answer=answer)
         seq = torch.tensor(input_ids, dtype=torch.long)
         return {
